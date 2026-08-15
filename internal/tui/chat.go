@@ -313,7 +313,7 @@ func (c *chatModel) View(width, height int) string {
 
 	main := lipgloss.JoinVertical(lipgloss.Left, c.viewport.View(), bottom)
 	if c.statusErr != nil {
-		main = lipgloss.JoinVertical(lipgloss.Left, main, errorStyle.Render("error: "+c.statusErr.Error()))
+		main = lipgloss.JoinVertical(lipgloss.Left, main, errorStyle.Render(c.renderStatusErrLine()))
 	}
 
 	return lipgloss.JoinHorizontal(lipgloss.Top, sidebar, main)
@@ -356,4 +356,42 @@ func (c *chatModel) renderApprovalPrompt() string {
 		"Tool approval requested: %s\n[y] approve once   [a] always allow this tool   [n] deny",
 		c.pendingApprovalTool,
 	))
+}
+
+// renderStatusErrLine formats c.statusErr as a single display line, clamped
+// to the chat screen's main-column width.
+//
+// Without this, View's layout budget (resize reserves exactly height-4 rows
+// for the viewport/composer, with no row set aside for an error line at all)
+// silently breaks for any error whose text is wider than the terminal or
+// contains embedded newlines (a real provider error, e.g. a JSON error body
+// from a real API failure, routinely has both): lipgloss.Render doesn't wrap
+// or clip on its own, so the raw string is handed straight to the terminal,
+// which wraps a too-wide line or renders embedded newlines as genuinely
+// separate rows — pushing the total rendered height past what the terminal
+// can show in one screen and scrolling the sidebar/mode-indicator/transcript
+// above it out of view, exactly the secondary layout bug this task flagged.
+// Collapsing embedded newlines to spaces and truncating to one line's worth
+// of the main column's width keeps the error's footprint to the single row
+// View's layout already visually allots it next to the composer/approval
+// prompt.
+func (c *chatModel) renderStatusErrLine() string {
+	text := "error: " + strings.ReplaceAll(strings.ReplaceAll(c.statusErr.Error(), "\r\n", " "), "\n", " ")
+
+	maxWidth := c.width - sidebarWidth
+	if maxWidth < 10 {
+		maxWidth = c.width
+	}
+	if maxWidth <= 0 {
+		return text
+	}
+
+	runes := []rune(text)
+	if len(runes) <= maxWidth {
+		return text
+	}
+	if maxWidth == 1 {
+		return string(runes[:1])
+	}
+	return string(runes[:maxWidth-1]) + "…"
 }

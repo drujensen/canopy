@@ -21,6 +21,7 @@ import (
 	"github.com/drujensen/canopy/internal/impl/agentsource"
 	"github.com/drujensen/canopy/internal/impl/config"
 	"github.com/drujensen/canopy/internal/impl/logging"
+	"github.com/drujensen/canopy/internal/impl/mcpclient"
 	"github.com/drujensen/canopy/internal/impl/mcpsource"
 	"github.com/drujensen/canopy/internal/impl/projectcontext"
 	jsonrepo "github.com/drujensen/canopy/internal/impl/repositories/json"
@@ -170,6 +171,30 @@ func run() error {
 	defer func() { _ = zapLogger.Sync() }()
 	slogLogger := logging.NewSlogLogger(zapLogger)
 
+	ctx := context.Background()
+
+	// --- MCP client connections (Design §3.11, Requirements FR6/FR18) ---
+	//
+	// Connecting to every configured MCP server has to happen here, eagerly,
+	// before AgentService is constructed — mcpclient's own doc comment
+	// ("Connection lifecycle: eager, not lazy") explains why this I/O can't
+	// live inside NewAgentService itself. A server that fails to connect is
+	// not fatal to startup (Requirements §7: Canopy must still start and
+	// function with its core tools even if one configured MCP server is
+	// broken) — every failure is already logged to the log file by
+	// ConnectAll via slogLogger, and additionally surfaced here as a
+	// non-fatal warning directly on stderr, which only works while stderr is
+	// still the terminal — i.e. strictly before tea.WithAltScreen's program
+	// takes it over below. mcpRegistry.Close is deferred immediately so a
+	// connected server's subprocess/connection can never outlive this
+	// process, however run() returns (including an early error return before
+	// program.Run is ever reached).
+	mcpRegistry, mcpErrs := mcpclient.ConnectAll(ctx, mcpServers, slogLogger)
+	defer func() { _ = mcpRegistry.Close() }()
+	for _, mcpErr := range mcpErrs {
+		fmt.Fprintln(os.Stderr, "canopy: warning:", mcpErr)
+	}
+
 	svc := services.NewAgentService(services.AgentServiceConfig{
 		Definitions: services.Definitions{
 			Agents:              agents,
@@ -181,6 +206,7 @@ func run() error {
 		Models:       providersFile.Models,
 		DefaultModel: defaultModel,
 		Repository:   repo,
+		MCPTools:     mcpRegistry.Tools(),
 		Tools: services.ToolsConfig{
 			WorkingRoot: projectRoot,
 			BashTimeout: 2 * time.Minute,
@@ -196,7 +222,6 @@ func run() error {
 		Logger: slogLogger,
 	})
 
-	ctx := context.Background()
 	program := tea.NewProgram(tui.NewModel(ctx, svc, agents), tea.WithAltScreen())
 	if _, err := program.Run(); err != nil {
 		return fmt.Errorf("running the TUI: %w", err)

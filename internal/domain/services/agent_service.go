@@ -30,6 +30,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"sort"
 	"time"
 
 	"github.com/microsoft/agent-framework-go/agent"
@@ -54,6 +55,19 @@ import (
 // AgentDefinition with no explicit Tools allowlist) deterministically and to
 // validate an AgentDefinition's explicit allowlist.
 var coreToolNames = []string{"Bash", "FileRead", "FileWrite", "FileSearch", "DirectoryList", "WebFetch", "WebSearch"}
+
+// isCoreToolName reports whether name is one of the seven core built-in tool
+// names, used at NewAgentService construction time to keep a same-named MCP
+// tool from shadowing a core tool (see AgentServiceConfig.MCPTools' doc
+// comment).
+func isCoreToolName(name string) bool {
+	for _, coreName := range coreToolNames {
+		if coreName == name {
+			return true
+		}
+	}
+	return false
+}
 
 // planMode is the agentmode name (Design §3.8, Requirements FR12) under
 // which mutating tools are withheld from every agent's tool list — see
@@ -100,10 +114,21 @@ var planModeMutatingTools = map[string]struct{}{
 }
 
 // isPlanModeRestricted reports whether toolName should be omitted from the
-// assembled tool list because mode is planMode.
-func isPlanModeRestricted(mode, toolName string) bool {
+// assembled tool list because mode is planMode. isMCP additionally withholds
+// every MCP-provided tool outright while planning, regardless of its name:
+// mcpclient.Connect's own doc comment already commits to wrapping every
+// MCP-provided tool with tool.ApprovalRequiredFunc, but that alone doesn't
+// satisfy plan mode's stronger guarantee (see planModeMutatingTools' doc
+// comment on "omit, not just approval-force") — an MCP tool is already
+// approval-gated in every mode, so leaving it present-but-gated during
+// planning would be the status quo with no real restriction, exactly the
+// reasoning that already applies to Bash/FileWrite.
+func isPlanModeRestricted(mode, toolName string, isMCP bool) bool {
 	if mode != planMode {
 		return false
+	}
+	if isMCP {
+		return true
 	}
 	_, restricted := planModeMutatingTools[toolName]
 	return restricted
@@ -162,6 +187,23 @@ type AgentServiceConfig struct {
 	Repository interfaces.ChatRepository
 	Tools      ToolsConfig
 	Logger     *slog.Logger
+
+	// MCPTools are the tools exposed by every successfully-connected MCP
+	// server (Design §3.11, Requirements FR6/FR18), keyed by tool name —
+	// typically the map a *mcpclient.Registry's Tools() method returns,
+	// built via mcpclient.ConnectAll before AgentServiceConfig is
+	// constructed. NewAgentService performs no I/O itself (see its own doc
+	// comment), so connecting to MCP servers has to already be done by the
+	// caller (cmd/canopy) before this config is built; AgentService only
+	// reads this map at construction time and does not own the underlying
+	// Registry's lifetime — the caller must still call Registry.Close
+	// itself during shutdown. Nil or empty means no MCP tools are available
+	// to any agent. A tool name colliding with one of Canopy's own core
+	// tool names (coreToolNames) is dropped in favor of the core tool and
+	// logged via Logger, since domain/services — not mcpclient — is where
+	// that merge is meant to happen (see mcpclient.ConnectAll's own doc
+	// comment).
+	MCPTools map[string]tool.Tool
 }
 
 // AgentService ties agentsource-loaded agent definitions, provider/model
@@ -190,6 +232,16 @@ type AgentService struct {
 	// same-configuration instance reads/writes the same data.
 	todoProvider *todo.Provider
 	modeProvider *agentmode.Provider
+
+	// mcpTools and mcpToolNames are AgentServiceConfig.MCPTools, filtered at
+	// construction time to drop any name colliding with coreToolNames (see
+	// AgentServiceConfig.MCPTools' doc comment) and, for mcpToolNames, sorted
+	// once so buildTools appends MCP tools to an "inherit everything" list in
+	// a deterministic order rather than Go's randomized map iteration order —
+	// the same determinism concern mcpclient.ConnectAll's own doc comment
+	// raises for its Registry.
+	mcpTools     map[string]tool.Tool
+	mcpToolNames []string
 }
 
 // NewAgentService constructs an AgentService from already-loaded
@@ -205,6 +257,21 @@ func NewAgentService(cfg AgentServiceConfig) *AgentService {
 	for _, m := range cfg.Models {
 		modelIndex[m.Name] = m
 	}
+
+	mcpTools := make(map[string]tool.Tool, len(cfg.MCPTools))
+	mcpToolNames := make([]string, 0, len(cfg.MCPTools))
+	for name, t := range cfg.MCPTools {
+		if isCoreToolName(name) {
+			if cfg.Logger != nil {
+				cfg.Logger.Warn("mcp tool name collides with a core built-in tool name; the core tool wins", "tool", name)
+			}
+			continue
+		}
+		mcpTools[name] = t
+		mcpToolNames = append(mcpToolNames, name)
+	}
+	sort.Strings(mcpToolNames)
+
 	return &AgentService{
 		defs:         cfg.Definitions,
 		providers:    providerIndex,
@@ -213,6 +280,8 @@ func NewAgentService(cfg AgentServiceConfig) *AgentService {
 		repository:   cfg.Repository,
 		toolsCfg:     cfg.Tools,
 		logger:       cfg.Logger,
+		mcpTools:     mcpTools,
+		mcpToolNames: mcpToolNames,
 		todoProvider: todo.New(nil),
 		// DefaultMode is "execute", not agentmode's own package default of
 		// "plan" (defaultModes[0]): a brand-new chat should be immediately
@@ -336,6 +405,13 @@ func (s *AgentService) RunMessages(ctx context.Context, chatID string, msgs []*m
 		return nil, err
 	}
 
+	var chatPatched bool
+	msgs, chatPatched = withReconstructedApprovalFunctionCalls(chat, msgs)
+	if chatPatched {
+		if err := s.repository.Update(ctx, chat); err != nil {
+			return nil, fmt.Errorf("agent service: persisting reconciled approval call IDs for chat %q: %w", chatID, err)
+		}
+	}
 	resp, err := a.Run(ctx, msgs, agent.WithSession(session)).Collect()
 	if err != nil {
 		return nil, fmt.Errorf("agent service: running chat %q: %w", chatID, err)
@@ -433,6 +509,12 @@ func (s *AgentService) RunMessagesStream(ctx context.Context, chatID string, msg
 		return nil, nil, err
 	}
 
+	msgs, chatPatched := withReconstructedApprovalFunctionCalls(chat, msgs)
+	if chatPatched {
+		if err := s.repository.Update(ctx, chat); err != nil {
+			return nil, nil, fmt.Errorf("agent service: persisting reconciled approval call IDs for chat %q: %w", chatID, err)
+		}
+	}
 	inner := a.Run(ctx, msgs, agent.WithSession(session))
 	state := &streamRunState{}
 
@@ -480,6 +562,177 @@ func (s *AgentService) RunMessagesStream(ctx context.Context, chatID string, msg
 	}
 
 	return stream, finalize, nil
+}
+
+// withReconstructedApprovalFunctionCalls works around a confirmed bug in
+// agent-framework-go's agent/harness/toolautocall package: when a turn's new
+// msgs carry a *message.ToolApprovalResponseContent or
+// *message.AlwaysApproveToolApprovalResponseContent (i.e. this is a
+// follow-up turn answering an approval request surfaced by a *previous*
+// RunMessages/RunMessagesStream call — Design §3.6), toolautocall.Run
+// reconstructs a *message.FunctionResultContent for the approved/rejected
+// call and appends it to the messages sent to the underlying provider, but
+// never re-adds a matching *message.FunctionCallContent alongside it — see
+// toolautocall.go's processToolApprovalResponses/invokeApprovedToolApprovalResponses:
+// the reconstructed assistant message (built by convertToToolCallContentMessages)
+// is only used for preDownstreamCallHistory (yielded to the caller for
+// display) and is never merged back into the messages slice actually passed
+// to next() (the provider). This was confirmed empirically by dumping the
+// raw HTTP request body a real approval-then-continue turn produces: for
+// both the OpenAI and Gemini providers, the second turn's request contains a
+// "tool" role message with the function's result but no preceding
+// "assistant" message naming the function call it answers — a malformed
+// request by both APIs' own contract (a tool-result message must follow a
+// matching assistant tool-call message).
+//
+// OpenAI's/Anthropic's own client libraries are lenient enough (or Canopy's
+// test doubles didn't validate strictly enough) that this went unnoticed;
+// google.golang.org/genai's provider does its own client-side validation
+// before ever making a network call (provider/geminiprovider/agent.go's
+// buildRequestParts scans history for a *message.FunctionCallContent whose
+// CallID matches each *message.FunctionResultContent, since Gemini's
+// FunctionResponse wire format requires the function *name*, which
+// FunctionResultContent alone doesn't carry) — so with Gemini specifically,
+// every approval-gated tool call (every MCP tool, unconditionally, since
+// mcpclient.Connect wraps all of them with tool.ApprovalRequiredFunc; Bash
+// and FileWrite too) fails immediately with "geminiprovider: missing
+// function name for result with call ID ..." the moment a pending approval
+// is answered, whether by an explicit user decision or by a standing
+// "always approve" rule auto-replaying it on a later turn.
+//
+// The fix: before handing msgs to a.Run, scan them for any approval-response
+// content and, for each one whose snapshotted ToolCall is a
+// *message.FunctionCallContent, synthesize a plain assistant message
+// carrying that FunctionCallContent (marked InformationalOnly since it's
+// replayed context, not a new call to invoke) and prepend it. This new
+// message is not itself a ToolApprovalRequestContent/ResponseContent, so
+// toolautocall's own extraction leaves it untouched (its default case just
+// keeps unrecognized content types as-is) — it simply becomes ordinary
+// history a downstream provider's own callID/name reconciliation (Gemini's
+// callIDToName scan, in particular) can find, restoring the assistant
+// tool-call message every provider's wire protocol expects to precede a
+// tool-result message.
+//
+// A *message.ToolApprovalResponseContent already snapshots its originating
+// *message.FunctionCallContent onto its own ToolCall field at creation time
+// (see ToolApprovalRequestContent.CreateResponse in agent-framework-go's
+// message/content.go), so this reconstruction needs no separate lookup
+// against chat history — the data is already on the response content itself.
+//
+// # A second, real-Gemini-specific wrinkle: empty CallIDs
+//
+// google.golang.org/genai's FunctionCall.ID is documented Optional, and the
+// real Gemini API routinely omits it entirely — unlike OpenAI's
+// tool_call_id, which is always present, and unlike every fake-Gemini-server
+// fixture in this package's tests (before this fix), which always hand-set a
+// fake "id" real traffic never actually sends. agent-framework-go's
+// geminiprovider parses that missing field as
+// *message.FunctionCallContent.CallID == "", and its own buildRequestParts
+// unconditionally errors on a *message.FunctionResultContent whose CallID is
+// "" — captured live: a real canopy binary, talking to the real Gemini API,
+// through a real stdio MCP server, the moment a pending MCP tool approval
+// was answered ("geminiprovider: missing function name for result with call
+// ID \"\""; see TestGeminiEmptyCallID_ApproveThenContinue for the fast,
+// deterministic repro this evidence produced). Not MCP-specific — any
+// approval-gated tool (Bash/FileWrite too) hits the same error the moment a
+// real Gemini response omits the call ID.
+//
+// Naively minting a synthetic CallID only for the *response* side here (an
+// earlier version of this fix did exactly that) doesn't work: toolautocall's
+// own request/response reconciliation
+// (extractAndRemoveToolApprovalRequestsAndResponses in agent-framework-go)
+// separately compares the *ToolApprovalRequestContent* from turn N-1
+// (already persisted to chat history with CallID == "" by the time turn N
+// runs — chat storage round-trips through JSON, so there is no shared Go
+// object to mutate in place across turns) against turn N's response, and
+// fails loudly ("ToolApprovalRequestContent found with ToolCall.CallID(s)
+// ” that have no matching ToolApprovalResponseContent") the instant the two
+// sides disagree — empirically confirmed against
+// TestGeminiEmptyCallID_ApproveThenContinue. So the empty CallID has to be
+// repaired on *both* sides, in lockstep: this turn's response AND the
+// matching historical request sitting in chat.Messages. chat's
+// ToolApprovalRequestContent entries are matched to this turn's responses by
+// RequestID (a plain string, stable across the JSON round-trip, unlike
+// CallID-based identity) rather than object identity, and are mutated
+// in-place on the *entities.Chat the caller already loaded — the caller
+// (RunMessages/RunMessagesStream) must persist chat via
+// interfaces.ChatRepository.Update *before* calling a.Run when this function
+// reports chatPatched, so ChatHistoryProvider.Invoking's own independent
+// reload of the chat sees the repaired CallID rather than a stale
+// still-empty one.
+func withReconstructedApprovalFunctionCalls(chat *entities.Chat, msgs []*message.Message) (out []*message.Message, chatPatched bool) {
+	historicalRequestsByID := make(map[string]*message.FunctionCallContent)
+	if chat != nil {
+		for _, m := range chat.Messages {
+			if m == nil {
+				continue
+			}
+			for _, c := range m.Contents {
+				req, ok := c.(*message.ToolApprovalRequestContent)
+				if !ok || req == nil {
+					continue
+				}
+				if fcc, ok := req.ToolCall.(*message.FunctionCallContent); ok && fcc != nil {
+					historicalRequestsByID[req.RequestID] = fcc
+				}
+			}
+		}
+	}
+
+	var calls []message.Content
+	seen := make(map[*message.FunctionCallContent]bool)
+	var syntheticCallIDCounter int
+	addCall := func(toolCall message.ToolCallContent, requestID string) {
+		fcc, ok := toolCall.(*message.FunctionCallContent)
+		if !ok || fcc == nil || seen[fcc] {
+			return
+		}
+		seen[fcc] = true
+		if fcc.CallID == "" {
+			// Real Gemini traffic: mint one synthetic ID and apply it to both
+			// this response's own snapshot and the matching historical
+			// request's snapshot in chat.Messages (if found), so
+			// toolautocall's request/response reconciliation still agrees —
+			// see this function's doc comment for why both sides need it.
+			if hist, found := historicalRequestsByID[requestID]; found && hist.CallID != "" {
+				fcc.CallID = hist.CallID
+			} else {
+				syntheticCallIDCounter++
+				fcc.CallID = fmt.Sprintf("canopy-synth-%d", syntheticCallIDCounter)
+				if found {
+					hist.CallID = fcc.CallID
+					chatPatched = true
+				}
+			}
+		}
+		clone := *fcc
+		clone.InformationalOnly = true
+		calls = append(calls, &clone)
+	}
+
+	for _, m := range msgs {
+		if m == nil {
+			continue
+		}
+		for _, c := range m.Contents {
+			switch resp := c.(type) {
+			case *message.ToolApprovalResponseContent:
+				if resp != nil {
+					addCall(resp.ToolCall, resp.RequestID)
+				}
+			case *message.AlwaysApproveToolApprovalResponseContent:
+				if resp != nil && resp.InnerResponse != nil {
+					addCall(resp.InnerResponse.ToolCall, resp.InnerResponse.RequestID)
+				}
+			}
+		}
+	}
+
+	if len(calls) == 0 {
+		return msgs, chatPatched
+	}
+	synthetic := &message.Message{Role: message.RoleAssistant, Contents: calls}
+	return append([]*message.Message{synthetic}, msgs...), chatPatched
 }
 
 // streamRunState carries RunMessagesStream's post-run outcome from its
@@ -721,28 +974,42 @@ func (s *AgentService) buildInstructions(def agentsource.AgentDefinition) string
 }
 
 // buildTools assembles def's tool list from the core built-in set (Design
-// §3.2): every core tool when def.Tools is empty ("tools" frontmatter
+// §3.2) plus every connected MCP server's tools (Design §3.11, Requirements
+// FR6/FR18, s.mcpTools — populated at NewAgentService construction time from
+// AgentServiceConfig.MCPTools, itself built by the caller via
+// mcpclient.ConnectAll before construction; see that field's doc comment):
+// every core and MCP tool when def.Tools is empty ("tools" frontmatter
 // omitted means inherit everything, per agentsource's doc comment), or
-// exactly the named subset otherwise.
+// exactly the named subset otherwise — an MCP tool's plain name (as its
+// server documents it, not namespaced; see mcpclient.ConnectAll's doc
+// comment) is a valid allowlist entry exactly like a core tool's name.
 //
-// TODO(Design §3.11/PLAN.md Phase 4 scope note): MCP-provided tools
-// (tool/mcptool, against s.defs.MCPServers) are deliberately not
-// constructed here. mcpsource already parses .mcp.json (Phase 3.5), but
-// constructing actual MCP clients from that config is explicitly deferred —
-// Design §3.11 defers it in its own phase note, and PLAN.md Phase 4's task
-// list only asks for "an empty/no-op path for MCP-provided tools" this
-// phase. s.defs.MCPServers is threaded through Definitions so a later phase
-// has it ready to use without re-plumbing.
+// Plan mode (isPlanModeRestricted) withholds every MCP tool outright, the
+// same "omit, not just approval-force" treatment Bash/FileWrite get — see
+// isPlanModeRestricted's doc comment for why approval-gating alone (which
+// every MCP tool already has, per mcpclient.Connect) doesn't satisfy plan
+// mode's stronger guarantee.
 func (s *AgentService) buildTools(def agentsource.AgentDefinition, mode string) ([]tool.Tool, error) {
 	available, err := s.coreTools()
 	if err != nil {
 		return nil, err
 	}
+	for name, t := range s.mcpTools {
+		available[name] = t
+	}
 
 	if len(def.Tools) == 0 {
-		result := make([]tool.Tool, 0, len(coreToolNames))
+		result := make([]tool.Tool, 0, len(coreToolNames)+len(s.mcpToolNames))
 		for _, name := range coreToolNames {
-			if isPlanModeRestricted(mode, name) {
+			if isPlanModeRestricted(mode, name, false) {
+				continue
+			}
+			if t, ok := available[name]; ok {
+				result = append(result, t)
+			}
+		}
+		for _, name := range s.mcpToolNames {
+			if isPlanModeRestricted(mode, name, true) {
 				continue
 			}
 			if t, ok := available[name]; ok {
@@ -754,7 +1021,8 @@ func (s *AgentService) buildTools(def agentsource.AgentDefinition, mode string) 
 
 	result := make([]tool.Tool, 0, len(def.Tools))
 	for _, name := range def.Tools {
-		if isPlanModeRestricted(mode, name) {
+		_, isMCP := s.mcpTools[name]
+		if isPlanModeRestricted(mode, name, isMCP) {
 			continue
 		}
 		t, ok := available[name]

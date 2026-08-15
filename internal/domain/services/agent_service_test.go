@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"testing"
 
+	"github.com/microsoft/agent-framework-go/tool"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -15,6 +16,19 @@ import (
 	jsonrepo "github.com/drujensen/canopy/internal/impl/repositories/json"
 	"github.com/drujensen/canopy/internal/impl/tools"
 )
+
+// fakeMCPTool is a minimal tool.Tool stand-in for a tool an MCP server would
+// expose, used to test AgentService's MCP-tool assembly policy
+// (TestAgentService_BuildTools_MCPTools) without needing a real
+// mcpclient.Client/Registry — that round trip is already covered end-to-end
+// by internal/impl/mcpclient's own tests. Deliberately does not implement
+// tool.FuncTool/tool.ApprovalRequiredTool since buildTools never calls or
+// introspects a tool beyond Name(); mcpclient.Connect's own tests cover the
+// ApprovalRequiredFunc-wrapping guarantee.
+type fakeMCPTool struct{ name string }
+
+func (f fakeMCPTool) Name() string        { return f.name }
+func (f fakeMCPTool) Description() string { return "a fake MCP-provided tool for tests" }
 
 // chatCompletionResponse builds a minimal, valid OpenAI Chat Completions
 // response body carrying the given assistant text, mirroring
@@ -176,6 +190,86 @@ func TestAgentService_BuildTools(t *testing.T) {
 			assert.Len(t, got, tt.wantToolCount)
 		})
 	}
+}
+
+// TestAgentService_BuildTools_MCPTools covers the MCP-tool assembly policy
+// this phase adds to buildTools (Design §3.11, Requirements FR6/FR18): MCP
+// tools follow the exact same allowlist/plan-mode rules buildTools already
+// applies to core tools — an empty allowlist inherits every MCP tool
+// alongside every core tool, a non-empty allowlist requires an MCP tool to
+// be named explicitly by its plain (server-documented) name, and plan mode
+// withholds every MCP tool outright regardless of the allowlist, the same
+// "omit, not just approval-force" treatment Bash/FileWrite get (see
+// isPlanModeRestricted's doc comment). containsToolName is defined in
+// phase5_test.go.
+func TestAgentService_BuildTools_MCPTools(t *testing.T) {
+	newSvc := func(t *testing.T) *AgentService {
+		t.Helper()
+		return NewAgentService(AgentServiceConfig{
+			Tools:    ToolsConfig{WorkingRoot: t.TempDir()},
+			MCPTools: map[string]tool.Tool{"search_docs": fakeMCPTool{name: "search_docs"}},
+		})
+	}
+
+	t.Run("no explicit allowlist inherits the MCP tool alongside core tools", func(t *testing.T) {
+		svc := newSvc(t)
+		got, err := svc.buildTools(agentsource.AgentDefinition{Name: "assistant"}, "")
+		require.NoError(t, err)
+		// 6 core tools (no WebSearchBackend configured, so WebSearch is
+		// omitted, matching TestAgentService_BuildTools' own count for that
+		// case) + 1 MCP tool.
+		assert.Len(t, got, 7)
+		assert.True(t, containsToolName(got, "search_docs"))
+	})
+
+	t.Run("explicit allowlist not naming the MCP tool omits it", func(t *testing.T) {
+		svc := newSvc(t)
+		got, err := svc.buildTools(agentsource.AgentDefinition{Name: "assistant", Tools: []string{"FileRead"}}, "")
+		require.NoError(t, err)
+		assert.Len(t, got, 1)
+		assert.False(t, containsToolName(got, "search_docs"))
+	})
+
+	t.Run("explicit allowlist naming the MCP tool includes it", func(t *testing.T) {
+		svc := newSvc(t)
+		got, err := svc.buildTools(agentsource.AgentDefinition{Name: "assistant", Tools: []string{"FileRead", "search_docs"}}, "")
+		require.NoError(t, err)
+		assert.Len(t, got, 2)
+		assert.True(t, containsToolName(got, "search_docs"))
+	})
+
+	t.Run("plan mode withholds the MCP tool from the default (no-allowlist) list", func(t *testing.T) {
+		svc := newSvc(t)
+		got, err := svc.buildTools(agentsource.AgentDefinition{Name: "assistant"}, "plan")
+		require.NoError(t, err)
+		assert.False(t, containsToolName(got, "search_docs"), "plan mode must withhold MCP tools the same way it withholds Bash/FileWrite")
+	})
+
+	t.Run("plan mode withholds the MCP tool even when explicitly allowlisted", func(t *testing.T) {
+		svc := newSvc(t)
+		got, err := svc.buildTools(agentsource.AgentDefinition{Name: "assistant", Tools: []string{"search_docs"}}, "plan")
+		require.NoError(t, err)
+		assert.Empty(t, got)
+	})
+}
+
+// TestAgentService_BuildTools_MCPToolCollidesWithCoreToolName asserts a
+// same-named MCP tool doesn't shadow a core built-in tool (see
+// AgentServiceConfig.MCPTools' doc comment): the core tool wins, and
+// buildTools' behavior for that name is unaffected by the colliding MCP
+// entry.
+func TestAgentService_BuildTools_MCPToolCollidesWithCoreToolName(t *testing.T) {
+	svc := NewAgentService(AgentServiceConfig{
+		Tools:    ToolsConfig{WorkingRoot: t.TempDir()},
+		MCPTools: map[string]tool.Tool{"Bash": fakeMCPTool{name: "Bash"}},
+	})
+
+	got, err := svc.buildTools(agentsource.AgentDefinition{Name: "assistant"}, "")
+	require.NoError(t, err)
+	// 6 core tools (no WebSearchBackend) and no extra entry for the
+	// colliding "Bash" MCP tool — it must not be double-counted or replace
+	// the real Bash tool.
+	assert.Len(t, got, 6)
 }
 
 type stubBackend struct{}

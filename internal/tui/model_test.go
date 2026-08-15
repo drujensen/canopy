@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync/atomic"
 	"testing"
 
@@ -108,6 +109,30 @@ func TestChatModel_ApprovalPromptAppears(t *testing.T) {
 	assert.Contains(t, view, "Tool approval requested: run_shell")
 	assert.Contains(t, view, "approve once")
 	assert.Contains(t, view, "always allow this tool")
+}
+
+// TestChatModel_View_LongMultilineError_StaysOneLineAndKeepsSidebarVisible
+// guards against the secondary layout bug this task flagged: a long,
+// multi-line statusErr (e.g. a real provider's JSON error body, which
+// commonly contains embedded newlines and exceeds the terminal's width) used
+// to be handed straight to lipgloss.Render with no wrapping/clipping,
+// growing the rendered view taller than resize's fixed viewport/composer
+// budget accounts for and, in a real terminal, scrolling the
+// sidebar/mode-indicator/transcript above it out of view. Asserts the
+// rendered view's error line is clamped to the chat's main-column width (so
+// it can't add unbudgeted rows) and that the sidebar's mode indicator is
+// still present in the same render.
+func TestChatModel_View_LongMultilineError_StaysOneLineAndKeepsSidebarVisible(t *testing.T) {
+	c := newChatModel("chat-1", "assistant", nil, "execute", 80, 24)
+	c.statusErr = fmt.Errorf("error: POST \"https://api.example.com/v1/chat/completions\": 429 Too Many Requests {\n  \"error\": {\n    \"message\": \"You exceeded your current quota, please check your plan and billing details. For more information on this error, see: https://platform.openai.com/docs/guides/error-codes/api-errors.\",\n    \"type\": \"insufficient_quota\",\n    \"param\": null,\n    \"code\": \"insufficient_quota\"\n  }\n}")
+
+	view := c.View(80, 24)
+
+	assert.NotContains(t, view, "\n\n\n", "a clamped single-line error must not introduce extra blank rows into the rendered view")
+	for _, line := range strings.Split(view, "\n") {
+		assert.LessOrEqual(t, len([]rune(line)), 80, "no rendered line (including the error line) should exceed the requested width")
+	}
+	assert.Contains(t, view, "Mode: execute", "the sidebar's mode indicator must still render alongside a long status error")
 }
 
 // TestModel_ModeIndicatorReflectsSwitch drives the top-level Model with a
