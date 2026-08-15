@@ -188,6 +188,17 @@ type AgentServiceConfig struct {
 	Tools      ToolsConfig
 	Logger     *slog.Logger
 
+	// Middlewares are appended to every constructed agent's
+	// agent.Config.Middlewares — both the top-level, chat-bound agent
+	// (buildTopLevelAgent) and every dynamically-dispatched subagent
+	// (buildSubagentAgent). Nil/empty (the default) means no extra
+	// middleware is attached, matching Design §3.10's "not required for v1
+	// usage": AgentService has no opinion on what a middleware here does,
+	// but the motivating case is cmd/canopy wiring in the optional
+	// impl/tracing.Setup OpenTelemetry middleware (Plan Phase 7) only when
+	// a caller has actually asked for tracing.
+	Middlewares []agent.Middleware
+
 	// MCPTools are the tools exposed by every successfully-connected MCP
 	// server (Design §3.11, Requirements FR6/FR18), keyed by tool name —
 	// typically the map a *mcpclient.Registry's Tools() method returns,
@@ -242,6 +253,10 @@ type AgentService struct {
 	// raises for its Registry.
 	mcpTools     map[string]tool.Tool
 	mcpToolNames []string
+
+	// middlewares is AgentServiceConfig.Middlewares, attached to every
+	// constructed agent.Config.Middlewares — see that field's doc comment.
+	middlewares []agent.Middleware
 }
 
 // NewAgentService constructs an AgentService from already-loaded
@@ -280,6 +295,7 @@ func NewAgentService(cfg AgentServiceConfig) *AgentService {
 		repository:   cfg.Repository,
 		toolsCfg:     cfg.Tools,
 		logger:       cfg.Logger,
+		middlewares:  cfg.Middlewares,
 		mcpTools:     mcpTools,
 		mcpToolNames: mcpToolNames,
 		todoProvider: todo.New(nil),
@@ -862,6 +878,7 @@ func (s *AgentService) buildTopLevelAgent(ctx context.Context, chat *entities.Ch
 		Tools:       toolList,
 		RunOptions:  []agent.Option{agent.WithInstructions(s.buildInstructions(def))},
 		Logger:      s.logger,
+		Middlewares: s.middlewares,
 	}
 
 	return harness.Build(ctx, harness.BuildParams{
@@ -931,6 +948,7 @@ func (s *AgentService) buildSubagentAgent(ctx context.Context, def agentsource.A
 		Tools:       toolList,
 		RunOptions:  []agent.Option{agent.WithInstructions(s.buildInstructions(def))},
 		Logger:      s.logger,
+		Middlewares: s.middlewares,
 	}
 	return providers.New(ctx, provider, model, cfg)
 }

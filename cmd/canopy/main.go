@@ -15,6 +15,7 @@ import (
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/microsoft/agent-framework-go/agent"
 	"go.uber.org/zap"
 
 	"github.com/drujensen/canopy/internal/domain/services"
@@ -26,13 +27,17 @@ import (
 	"github.com/drujensen/canopy/internal/impl/projectcontext"
 	jsonrepo "github.com/drujensen/canopy/internal/impl/repositories/json"
 	"github.com/drujensen/canopy/internal/impl/skillsource"
+	"github.com/drujensen/canopy/internal/impl/tracing"
 	"github.com/drujensen/canopy/internal/tui"
 )
 
 // version is Canopy's own version string (Requirements FR15's --version
-// flag). Bumped at release time (Plan Phase 8) — not tied to any dependency
-// version.
-const version = "0.1.0-dev"
+// flag). A package-level var, not a const, so a release build can override
+// it at link time via `-ldflags="-X main.version=..."` (Go's -X flag only
+// rewrites string variables, not constants) without editing source — see
+// the Makefile's `build`/`build-all`/`install` targets (Plan Phase 7).
+// Bumped at release time; unset (this default) means a dev build.
+var version = "0.1.0-dev"
 
 func main() {
 	if err := run(); err != nil {
@@ -46,11 +51,13 @@ func run() error {
 		global      bool
 		storage     string
 		showVersion bool
+		enableOTel  bool
 	)
 	flag.BoolVar(&global, "global", false, "use ~/.canopy config/storage instead of a project-local .canopy directory")
 	flag.BoolVar(&global, "g", false, "shorthand for --global")
 	flag.StringVar(&storage, "storage", "file", `storage backend; "file" is the only supported value in v1 (Requirements FR15)`)
 	flag.BoolVar(&showVersion, "version", false, "print the version and exit")
+	flag.BoolVar(&enableOTel, "otel", false, "enable optional OpenTelemetry tracing (Design §3.10); also enabled implicitly when OTEL_EXPORTER_OTLP_ENDPOINT or OTEL_EXPORTER_OTLP_TRACES_ENDPOINT is set")
 	flag.Parse()
 
 	if showVersion {
@@ -173,6 +180,37 @@ func run() error {
 
 	ctx := context.Background()
 
+	// --- Optional OpenTelemetry tracing (Design §3.10, Plan Phase 7) ---
+	//
+	// Off by default: otelEnabled is false unless -otel was passed or the
+	// standard OTel SDK endpoint env vars are set, in which case
+	// tracing.Setup is a no-op that returns a nil middleware and a
+	// no-op shutdown (see its doc comment) — zero overhead, zero new
+	// behavior, matching Design §3.10's "not required for v1 usage."
+	// A failure to build the exporter (e.g. a malformed endpoint) is
+	// treated as non-fatal, exactly like an MCP server that fails to
+	// connect above: tracing is optional, so a misconfigured collector
+	// must not stop Canopy from starting.
+	otelEnabled := enableOTel || os.Getenv("OTEL_EXPORTER_OTLP_ENDPOINT") != "" || os.Getenv("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT") != ""
+	otelMiddleware, otelShutdown, err := tracing.Setup(ctx, tracing.Config{Enabled: otelEnabled, ServiceName: "canopy"})
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "canopy: warning: OpenTelemetry tracing disabled:", err)
+		otelMiddleware, otelShutdown = nil, func(context.Context) error { return nil }
+	}
+	defer func() {
+		// Bounded, not context.Background(): otelShutdown flushes
+		// in-flight spans over the network, and an unreachable collector
+		// must not hang process shutdown (see tracing.Setup's doc
+		// comment).
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		_ = otelShutdown(shutdownCtx)
+	}()
+	var middlewares []agent.Middleware
+	if otelMiddleware != nil {
+		middlewares = append(middlewares, otelMiddleware)
+	}
+
 	// --- MCP client connections (Design §3.11, Requirements FR6/FR18) ---
 	//
 	// Connecting to every configured MCP server has to happen here, eagerly,
@@ -219,7 +257,8 @@ func run() error {
 			// field — a real gap, not an oversight, and flagged as such
 			// rather than silently wired to nothing.
 		},
-		Logger: slogLogger,
+		Logger:      slogLogger,
+		Middlewares: middlewares,
 	})
 
 	program := tea.NewProgram(tui.NewModel(ctx, svc, agents), tea.WithAltScreen())

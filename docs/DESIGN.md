@@ -35,7 +35,9 @@ agentworkflow`, or `workflow/checkpoint` either (no graph engine — REQUIREMENT
 Packages Canopy imports from MAF-Go: `agent`, `tool`, `message`, `agent/compaction`,
 `agent/harness/{loop,toolautocall,toolapproval,todo,agentmode}`,
 `provider/{openaiprovider,anthropicprovider,geminiprovider}`,
-`tool/{mcptool,shelltool,functool,agenttool}`.
+`tool/{mcptool,shelltool,functool,agenttool}`, `provider/otelprovider` (Plan Phase 7, §3.10 —
+optional OTel tracing middleware; only reached when a caller explicitly enables tracing, see
+`internal/impl/tracing`).
 
 ## 2. Layering
 

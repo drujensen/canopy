@@ -50,9 +50,15 @@ If any step fails, fix it before moving on — don't leave a phase "done" with a
 ## Project Structure
 
 - `cmd/hello/`: Phase-0 spike proving the framework dependency works; not a real entry point.
+- `cmd/canopy/`: the real entry point (Plan Phase 6/7) — flag parsing, config/loader wiring,
+  logging, optional OTel tracing setup, and launching the TUI.
 - `internal/domain/`: entities, repository/source interfaces, orchestration services.
-- `internal/impl/`: providers, tools, harness wiring, file-format loaders (`agentsource`,
-  `mcpsource`, `skillsource`, `projectcontext`), JSON repositories, config.
+- `internal/impl/`: `providers` (per-provider `agent.Agent` construction, Design §4), `tools`
+  (core built-in tool set, Design §3.2), `harness` (wires `agent/harness/*` and
+  `agent/compaction`), file-format loaders (`agentsource`, `mcpsource`, `skillsource`,
+  `projectcontext`, Design §3.11), `mcpclient` (MCP server connection lifecycle), `repositories`
+  (JSON `ChatRepository`), `config` (provider/model JSON config), `logging` (zap↔slog bridge),
+  `tracing` (optional OpenTelemetry wiring, Plan Phase 7).
 - `internal/tui/`: Bubble Tea frontend.
 - `docs/`: requirements, design, plan — the source of truth for *why*, read before changing *what*.
 
