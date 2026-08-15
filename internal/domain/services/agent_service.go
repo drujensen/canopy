@@ -352,6 +352,148 @@ func (s *AgentService) RunMessages(ctx context.Context, chatID string, msgs []*m
 	}, nil
 }
 
+// RunTextStream is RunText's streaming counterpart — a thin wrapper around
+// RunMessagesStream for the common "one new user text message" case. See
+// RunMessagesStream's doc comment for the full streaming contract.
+func (s *AgentService) RunTextStream(ctx context.Context, chatID, msg string) (agent.ResponseStream, func() (*RunResult, error), error) {
+	return s.RunMessagesStream(ctx, chatID, []*message.Message{message.NewText(msg)})
+}
+
+// RunMessagesStream is RunMessages' streaming counterpart (Requirements FR8,
+// Design §5): instead of blocking until the turn is over and handing back a
+// fully-materialized *RunResult, it hands the caller (Plan Phase 6's TUI) the
+// underlying agent.ResponseStream itself, so *agent.ResponseUpdate values can
+// be rendered incrementally as they arrive — while still performing exactly
+// the same post-run session persistence RunMessages does (persistSession,
+// unchanged and shared, not reimplemented — see RunMessages' own doc comment
+// for why that persistence has to be a deliberate second write) and still
+// making the same final Todos/Mode/Response available once the turn is over.
+//
+// # Why this returns a (stream, finalize) pair instead of just a stream
+//
+// RunMessages can return *RunResult synchronously because
+// a.Run(...).Collect() already blocks until the whole run — including
+// persistSession's own network/disk I/O, since that happens after Collect
+// returns — is complete. A streaming caller can't have that: the entire
+// point is that the caller drives when updates get consumed, by ranging over
+// the returned agent.ResponseStream itself (`for update, err := range
+// stream`). Because agent.ResponseStream is a push-style iter.Seq2 (Design
+// §3.1 — Go's range-over-func compiles that loop into a single call to the
+// stream function, passing it the loop body as a callback), everything the
+// wrapping stream function below does — including forwarding each update
+// and, once the underlying provider run is exhausted, calling
+// persistSession — runs synchronously nested inside the caller's own range
+// loop, on the caller's own goroutine. There is no separate goroutine here
+// for a second return value to block on; the *RunResult a full turn produces
+// simply doesn't exist yet at the moment RunMessagesStream returns. So:
+//
+//   - stream: forwards every (*agent.ResponseUpdate, error) pair from
+//     a.Run(...) to the caller completely unchanged, while also folding each
+//     one into a local *agent.Response using that type's own exported
+//     Update method — the same method agent.ResponseStream.Collect() itself
+//     calls per update (see agent/response.go). This is not a reimplemented,
+//     divergent copy of Collect's accumulation logic; it's the identical
+//     Update/Coalesce calls Collect makes, just interleaved with forwarding
+//     to the caller instead of hidden entirely inside Collect. Once the
+//     inner stream is exhausted (the underlying range loop ends with no
+//     error), it Coalesce()s the accumulated Response and calls
+//     s.persistSession — the exact function RunMessages calls, so both
+//     entry points persist session state identically and neither can drift
+//     from the other.
+//   - finalize: a func the caller calls once, after fully draining stream
+//     (a `for range` that runs to completion rather than breaking early),
+//     which returns the same *RunResult shape RunMessages returns. Calling
+//     finalize before stream has been fully drained returns an error rather
+//     than blocking, since — again — there's no background goroutine to
+//     wait on; the result plainly doesn't exist yet.
+//
+// If the caller's range loop exits early — either because an update carried
+// a non-nil error and the caller stopped, or because the caller simply
+// `break`s out for its own reasons — persistSession is never reached, and
+// finalize returns an error. This mirrors RunMessages, which likewise never
+// reaches persistSession if a.Run(...).Collect() itself returns an error.
+// The one new edge case streaming introduces is a caller-initiated early
+// break for a reason *other* than an error (e.g. a cancelled turn): that
+// silently skips persistence too, so a caller that wants a partial turn's
+// tool-approval/todo/mode state persisted must still drain the stream fully
+// rather than abandoning it partway through.
+func (s *AgentService) RunMessagesStream(ctx context.Context, chatID string, msgs []*message.Message) (agent.ResponseStream, func() (*RunResult, error), error) {
+	chat, err := s.repository.Get(ctx, chatID)
+	if err != nil {
+		return nil, nil, fmt.Errorf("agent service: loading chat %q: %w", chatID, err)
+	}
+
+	session, err := harness.LoadSession(chat)
+	if err != nil {
+		return nil, nil, fmt.Errorf("agent service: loading session state for chat %q: %w", chatID, err)
+	}
+
+	a, err := s.buildTopLevelAgent(ctx, chat, session)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	inner := a.Run(ctx, msgs, agent.WithSession(session))
+	state := &streamRunState{}
+
+	stream := agent.ResponseStream(func(yield func(*agent.ResponseUpdate, error) bool) {
+		var resp agent.Response
+		for update, updateErr := range inner {
+			if updateErr != nil {
+				state.err = fmt.Errorf("agent service: running chat %q: %w", chatID, updateErr)
+				state.done = true
+				yield(update, updateErr)
+				return
+			}
+			resp.Update(update)
+			if !yield(update, nil) {
+				// Caller stopped early (see doc comment above): no
+				// persistence happens, matching RunMessages' behavior when
+				// a.Run(...).Collect() never returns a result.
+				return
+			}
+		}
+		resp.Coalesce()
+
+		if persistErr := s.persistSession(ctx, chatID, session); persistErr != nil {
+			state.err = persistErr
+			state.done = true
+			return
+		}
+
+		state.result = &RunResult{
+			Response: &resp,
+			Todos:    s.todoProvider.GetAllItems(agent.WithSession(session)),
+			Mode:     s.modeProvider.GetMode(agent.WithSession(session)),
+		}
+		state.done = true
+	})
+
+	finalize := func() (*RunResult, error) {
+		if !state.done {
+			return nil, fmt.Errorf("agent service: finalize called for chat %q before its stream was fully drained", chatID)
+		}
+		if state.err != nil {
+			return nil, state.err
+		}
+		return state.result, nil
+	}
+
+	return stream, finalize, nil
+}
+
+// streamRunState carries RunMessagesStream's post-run outcome from its
+// wrapping stream closure to the paired finalize func it returns alongside
+// that stream — see RunMessagesStream's doc comment. Not safe for concurrent
+// use: both the returned stream and finalize are meant to be driven from the
+// same goroutine, in order (range the stream fully, then call finalize
+// exactly once).
+type streamRunState struct {
+	done   bool
+	result *RunResult
+	err    error
+}
+
 // persistSession serializes session and writes it onto the chat's
 // SessionState field, reloading the chat first so this write doesn't
 // clobber a concurrent Messages update (see RunMessages' doc comment for
