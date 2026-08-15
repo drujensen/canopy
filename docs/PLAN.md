@@ -116,7 +116,10 @@ end-to-end in the TUI against a real provider.
   for v1 usage).
 - Security pass: no secrets in logs by default, bash/file input validation and approval-gating
   re-verified, MCP-provided mutating tools respect approval-gating the same as built-ins, standing
-  "always allow" rules can't be tricked into covering a broader call than approved.
+  "always allow" rules can't be tricked into covering a broader call than approved. Specifically
+  revisit `internal/impl/tools/web_fetch.go`: it currently allows fetching any http(s) URL,
+  including internal/link-local addresses (e.g. cloud metadata endpoints, localhost) — decide
+  whether to add an IP-range denylist before this ships, flagged during Phase 3 review.
 - Single static binary build/release process (replaces aiagent's Docker-first packaging — a
   standalone binary is the point of the "lighter" goal); Docker remains optional, not primary.
 - Canopy's own `README.md`/`AGENTS.md`.
