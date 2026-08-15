@@ -85,7 +85,7 @@ func TestAgentService_RunText_RoundTrip(t *testing.T) {
 
 	resp, err := svc.RunText(ctx, "chat-1", "hi there")
 	require.NoError(t, err)
-	assert.Equal(t, "hello from agent service", resp.String())
+	assert.Equal(t, "hello from agent service", resp.Response.String())
 
 	stored, err := repo.Get(ctx, "chat-1")
 	require.NoError(t, err)
@@ -97,7 +97,7 @@ func TestAgentService_RunText_RoundTrip(t *testing.T) {
 	// round-trip mechanism internal/impl/harness's own test covers directly.
 	resp2, err := svc.RunText(ctx, "chat-1", "and again")
 	require.NoError(t, err)
-	assert.Equal(t, "hello from agent service", resp2.String())
+	assert.Equal(t, "hello from agent service", resp2.Response.String())
 	stored2, err := repo.Get(ctx, "chat-1")
 	require.NoError(t, err)
 	assert.Len(t, stored2.Messages, 4)
@@ -166,7 +166,7 @@ func TestAgentService_BuildTools(t *testing.T) {
 			}
 			def := agentsource.AgentDefinition{Name: "test-agent", Tools: tt.allowlist}
 
-			got, err := svc.buildTools(def)
+			got, err := svc.buildTools(def, "")
 			if tt.wantErr != "" {
 				require.Error(t, err)
 				assert.Contains(t, err.Error(), tt.wantErr)
@@ -257,7 +257,7 @@ func TestAgentService_BuildTopLevelAgent_WrapsOtherAgentsAsSubagentTools(t *test
 
 	ctx := context.Background()
 
-	toolList, err := svc.buildTopLevelTools(ctx, agentsource.AgentDefinition{Name: "parent", Description: "parent agent"})
+	toolList, err := svc.buildTopLevelTools(ctx, agentsource.AgentDefinition{Name: "parent", Description: "parent agent"}, "")
 	require.NoError(t, err)
 
 	// 6 core tools (no WebSearchBackend configured here, so WebSearch is

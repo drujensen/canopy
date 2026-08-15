@@ -47,4 +47,13 @@ type ModelConfig struct {
 	// Parameters holds free-form per-model invocation parameters
 	// (temperature, max_tokens, etc.).
 	Parameters map[string]any `json:"parameters,omitempty"`
+
+	// ContextWindowTokens is the model's total context window, used by
+	// impl/harness to size the compaction trigger (Design §3.5, Requirements
+	// FR10). Zero/unset means "unknown" — impl/harness falls back to a fixed,
+	// documented default rather than requiring every model configuration to
+	// set this before compaction works. Follow-up: seed this automatically
+	// from known-model tables per provider instead of requiring manual
+	// configuration.
+	ContextWindowTokens int `json:"context_window_tokens,omitempty"`
 }

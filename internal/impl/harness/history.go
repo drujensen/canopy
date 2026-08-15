@@ -115,12 +115,25 @@ func (p *ChatHistoryProvider) Invoked(ctx context.Context, invoked agent.Invoked
 		return fmt.Errorf("chat history provider: loading chat %q: %w", p.chatID, err)
 	}
 
-	// invoked.RequestMessages is the *post*-Invoking message set (loaded
-	// history + the new turn's messages) — see the chatHistorySourceID doc
-	// comment above for why the loaded-history messages must be filtered
-	// out here rather than re-appended.
+	// invoked.RequestMessages is the *post*-Invoking message set: loaded
+	// history (see the chatHistorySourceID doc comment above for why that
+	// must be filtered out here rather than re-appended) plus the new turn's
+	// messages plus, as of Phase 5's compaction/todo/agentmode wiring
+	// (impl/harness.WireLoopQuality), whatever those context providers
+	// injected this turn — a todo-list summary message, a mode-change
+	// notification, a compaction summary group, etc. (agent/context.go's
+	// invoke() captures requestMessages *after* the context-provider Invoking
+	// loop runs, so those injected messages land in RequestMessages too).
+	// Those are transient, regenerated-per-turn scaffolding, not real
+	// conversation content, so they're filtered out here the same way
+	// loaded-history messages are: persisting them would permanently bloat
+	// chat.Messages with a fresh "current todo list" message (etc.) on every
+	// single turn. Compaction in particular needs the *raw*, uncompacted
+	// chat.Messages to keep working correctly on reload — it keeps its own
+	// view (which groups are excluded) in session state, not by mutating
+	// what's persisted here.
 	for _, m := range invoked.RequestMessages {
-		if m == nil || m.Source.Type == agent.SourceTypeHistoryProvider {
+		if m == nil || m.Source.Type == agent.SourceTypeHistoryProvider || m.Source.Type == agent.SourceTypeContextProvider {
 			continue
 		}
 		chat.Messages = append(chat.Messages, m)
