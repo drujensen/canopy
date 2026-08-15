@@ -1,0 +1,6 @@
+.env
+.canopy/
+bin/
+/hello
+/canopy
+.omc/
