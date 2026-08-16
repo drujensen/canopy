@@ -147,6 +147,17 @@ MCP tools use `tool/mcptool` directly (§3.11). Skills are exposed to the model 
 §3.11's skill-loading design, which mirrors Claude Code's progressive disclosure rather than
 dumping every skill's full content into context up front.
 
+Addendum (post-v0.1.0): the `Skill` tool this section always described (`impl/tools/skill.go`,
+`NewSkillTool`) is now actually built and wired in — §3.11 was previously fully specified but
+never implemented (no `Skill` tool existed anywhere, `buildInstructions`/`buildTools` never
+referenced `Definitions.Skills` at all). `coreToolNames` grew from seven entries to eight (`Skill`
+appended); like `WebSearch` (only constructed when a backend is configured), `Skill` is only
+constructed into `AgentService.coreTools()`'s available map — and therefore only offered to any
+agent — when at least one skill is loaded (`len(s.defs.Skills) > 0`), so a project with no skills
+gets no tool offering nothing to look up. Not approval-gated, the same tier as `FileRead`. See
+§3.11's own addendum below for the full three-level design as implemented, including level 3's
+path-confinement decision.
+
 ### 3.3 The agentic loop
 
 `agent/harness/loop` and `toolautocall` provide the run loop and automatic tool-call
@@ -314,6 +325,42 @@ Claude Code's own no-file-required first-run experience given Canopy's picker-ba
 directory is Canopy-specific (`~/.canopy`, not `~/.claude`) so the generated fallback never leaks
 into the user's real Claude Code config.
 
+Addendum (post-v0.1.0): `impl/skillsource`'s progressive disclosure, described above in the
+original text of this section but never actually wired into `domain/services` until now, is
+implemented as follows.
+
+- **Level 1** (always-visible catalog): `AgentService.buildInstructions` appends a
+  `## Available Skills` section — one `- <name>: <description>` line per loaded skill, sorted by
+  name (`skillsCatalog`) — after the project/agent instruction blocks. Only `name`+`description`
+  ever appear here, never a skill's `Body`; the section is omitted entirely when no skills are
+  loaded, so an agent/project with none configured sees no trace of this feature in its prompt.
+- **Level 2** (on-demand full body): the `Skill` tool (`impl/tools/skill.go`, `NewSkillTool`,
+  wired into `AgentService.coreTools()` per §3.2's addendum above) takes `{name}` and returns that
+  skill's full `SKILL.md` `Body`, or a clear, specific error naming what skills *are* loaded when
+  `name` doesn't match — never a silent empty result.
+- **Level 3** (supporting files): the same `Skill` tool accepts an optional second field,
+  `{name, file}` — when `file` is set, it reads `filepath.Join(skill.Dir, file)` instead of
+  returning the body. This is a deliberate design choice, not reuse of the existing `FileRead`
+  tool: `FileRead` is confined to `ToolsConfig.WorkingRoot` (the project directory) via
+  `pathsafety.go`'s `resolveSafePath`, and that confinement is load-bearing — it exists to stop a
+  model-chosen, otherwise-untrusted path from escaping the project. A *personal* skill loaded from
+  `~/.claude/skills/<name>/` sits entirely outside `WorkingRoot`, so routing its supporting-file
+  reads through `FileRead` would mean either rejecting them outright or weakening `FileRead`'s
+  confinement for every other caller — and a skill's own directory is trusted local config the
+  user explicitly installed, not model-supplied input, so it doesn't belong under `FileRead`'s
+  boundary in the first place. Instead, the `Skill` tool calls the same `resolveSafePath` helper
+  `FileRead` uses, just with the matched skill's own `Dir` as the confinement root instead of the
+  project-wide `WorkingRoot` — a `file` path can only ever resolve into the one skill the model
+  named, project or personal, and a `../` escape attempt out of that skill's directory is rejected
+  exactly the way `FileRead` rejects one against its own root.
+- **TUI (`ctrl+s`)**: a read-only skills-browser overlay (`chatModel.openSkillPicker`,
+  `internal/tui/chat.go`), reusing `picker.go`'s overlay pattern (`ctrl+a`/`ctrl+o`) but, since
+  browsing a skill isn't a chat-level switch, never calling an `AgentService` mutator — selecting
+  an entry folds that skill's real `Body` into the transcript as a system-style informational
+  entry (`showSkill`) via the new read-only `AgentService.ListSkills()`/`GetSkillBody()`. Zero
+  skills loaded produces a brief "No skills configured." transcript entry rather than a silent,
+  unexplained no-op.
+
 ## 4. Provider adapter design (FR2)
 
 `impl/providers/factory.go` — one function, keyed on configured provider type:
@@ -377,6 +424,43 @@ the `"api"` (base URL) field entirely, presumably because their consuming SDKs b
 base URL elsewhere. `DetectProviders` accounts for this: a non-native provider with no catalog base
 URL is skipped rather than emitting a config that would fail at dispatch time.
 
+Addendum (post-v0.1.0): `ProviderTypeOllama` was pulled out of the generic OpenAI-compatible
+dispatch table above and given its own path, `impl/providers.newOllama` (`ollama.go`), for two
+Ollama-specific reasons that don't belong in the path every hosted OpenAI-compatible provider
+shares:
+
+- **Base URL ergonomics.** Every other OpenAI-compatible provider is a hosted API whose documented
+  base URL is exactly the string that belongs in `ProviderConfig.BaseURL` — nothing to normalize.
+  Ollama is the one provider in this list a user is realistically self-hosting and typing from
+  memory, so `normalizeOllamaBaseURL` accepts a bare host (`"ai.drujensen.com"`,
+  `"localhost:11434"`) and fills in a `"https://"` scheme (a missing scheme defaults to HTTPS, not
+  HTTP, since anything other than localhost is overwhelmingly reverse-proxied behind TLS — a user
+  who genuinely wants plain HTTP still types `"http://"` explicitly) and the trailing `"/v1"` path,
+  rather than requiring the user to type the full Chat-Completions-compatible URL.
+- **A confirmed wire-format bug** in Ollama's OpenAI-compatible *streaming* endpoint
+  (`POST /v1/chat/completions`, `"stream": true`): a tool-call delta chunk carries a spurious
+  `"content":""` alongside `"tool_calls"` in the same delta object, which real OpenAI traffic never
+  does (the field is omitted entirely, not sent empty). That co-present empty field trips a
+  state-detection bug in the `openai-go` v3 SDK's `ChatCompletionAccumulator` — its
+  content-vs-tool-call classification checks whether the `"content"` field is *present* in the raw
+  JSON before checking `"tool_calls"`, so it misclassifies the delta and the accumulator's
+  `JustFinishedToolCall()` never fires. `agent-framework-go`'s `provider/openaiprovider` streaming
+  path relies exclusively on `JustFinishedToolCall()` to surface a tool call to the agent harness —
+  so with unpatched Ollama traffic, a tool call is fully assembled inside the SDK's internal state
+  but silently never reaches Canopy at all (confirmed directly: replaying a live streaming response
+  from a real Ollama server through the SDK's own accumulator, in the exact call pattern
+  `openaiprovider` uses, showed the tool call fully present in the final accumulated state while
+  `JustFinishedToolCall()` never once returned true across the whole stream). `ollama_transport.go`
+  installs an `http.RoundTripper` on the Ollama client (mirroring §3's Gemini
+  `functionCall.id`-patching transport precedent above) that rewrites each SSE event's JSON on the
+  way back from the server, deleting the `"content"` key from any `choices[].delta` object that
+  also carries a non-empty `"tool_calls"` array and an empty `"content"` value — restoring the shape
+  the SDK's accumulator already expects, before it ever parses the response. Only
+  `"text/event-stream"` responses are touched; non-streaming Chat Completions calls read tool calls
+  directly off the parsed body and were never affected by this bug. Verified end to end against a
+  real self-hosted Ollama server (0.32.13): a live tool call is now auto-invoked by the harness and
+  its result correctly reaches the model's final answer, which silently failed before this fix.
+
 ## 5. TUI
 
 The only frontend in v1 (Requirements §5). Existing aiagent TUI concepts (chat view, streaming
@@ -402,6 +486,21 @@ keybindings are no-ops while a tool-approval prompt is pending or a turn is acti
 same guard `enter` (sending a message) already applies. The sidebar gained `Agent: ...` and
 `Model: ...` lines next to the existing `Mode: ...` line, each with its own `(ctrl+x to switch)`
 hint.
+
+Addendum (post-v0.1.0): `ctrl+n`, pressed from the chat screen, starts a genuinely new chat —
+`AgentService.StartChat` with a freshly minted chat ID (the same `<agent>-<UnixNano>` scheme the
+top-level picker's own `startChatCmd` already used, now factored into a shared `newChatID` so
+there is only one ID-generation scheme) bound to the *current* chat's agent (`chat.AgentName`;
+`ctrl+a` already handles picking a different agent for the new chat in-place, so `ctrl+n` doesn't
+force the top-level picker screen). It reuses the existing `chatStartedMsg`/`Model.Update` path a
+fresh pick from the picker screen already produces — `Model.Update` discards the old `*chatModel`
+entirely and constructs a brand-new one via `newChatModel`, so transcript/streaming/pending-approval
+reset to zero values and todos/mode/model are seeded fresh from the new, empty chat, with no second,
+hand-rolled "reset in place" code path to keep in sync with that one. Guarded the same way
+`ctrl+a`/`ctrl+o` are: a no-op while a turn is actively streaming or a tool approval is pending.
+
+Also addendum (post-v0.1.0): `ctrl+s` opens a read-only skills-browser overlay — see §3.11's own
+addendum for the full three-level skill design this exposes.
 
 ## 6. Data model
 

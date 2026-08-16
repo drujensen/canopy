@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/microsoft/agent-framework-go/agent"
 	"github.com/stretchr/testify/assert"
@@ -117,9 +118,53 @@ func TestNew_OpenAICompatible(t *testing.T) {
 	assert.Equal(t, "deepseek-chat", gotBody["model"])
 }
 
+// TestNew_OpenAICompatible_TimeoutSecondsEnforced proves
+// entities.ProviderConfig.TimeoutSeconds actually bounds how long a request
+// waits for response headers — not just that it's wired into the option
+// list without effect. A server that never responds would otherwise hang
+// for openai-go's own 10-minute default (see openaiTimeoutOptions' doc
+// comment); with TimeoutSeconds set to a small value, the request must fail
+// well before that, with an error that reflects a timeout, not some other
+// failure mode.
+func TestNew_OpenAICompatible_TimeoutSecondsEnforced(t *testing.T) {
+	// The handler sleeps well past the 1s client-side timeout under test,
+	// then returns — long enough to guarantee the client gives up first,
+	// short enough that the deferred server.Close() below doesn't itself
+	// hang waiting for a handler goroutine that never returns (an earlier
+	// version of this test used select{} here and that's exactly what
+	// happened: httptest.Server.Close() waits for in-flight handlers to
+	// finish, so a handler that never returns hangs test cleanup even
+	// after the client has already correctly timed out).
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(5 * time.Second)
+	}))
+	defer server.Close()
+
+	cfg := entities.ProviderConfig{
+		Name:           "test-slow",
+		Type:           entities.ProviderTypeDeepSeek,
+		APIKey:         "k",
+		BaseURL:        server.URL + "/v1",
+		TimeoutSeconds: 1,
+	}
+	model := entities.ModelConfig{Name: "m", Provider: cfg.Name, ModelName: "slow-model"}
+
+	a, err := New(context.Background(), cfg, model, agent.Config{Name: "test-agent"})
+	require.NoError(t, err)
+
+	start := time.Now()
+	_, err = a.RunText(context.Background(), "hi").Collect()
+	elapsed := time.Since(start)
+
+	require.Error(t, err, "a request to a server that never responds must fail once TimeoutSeconds elapses")
+	assert.Less(t, elapsed, 10*time.Second, "must fail near the configured 1s timeout, not openai-go's 10-minute default")
+}
+
 // TestNew_OpenAICompatible_AllProviderTypes exercises every provider type
 // that routes through the openaicompat path, confirming none of them are
 // mis-dispatched to a different constructor and all require a BaseURL.
+// Ollama is deliberately excluded here — it has its own dedicated path
+// (newOllama, ollama.go) and its own test file (ollama_test.go).
 func TestNew_OpenAICompatible_AllProviderTypes(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -129,7 +174,6 @@ func TestNew_OpenAICompatible_AllProviderTypes(t *testing.T) {
 
 	types := []entities.ProviderType{
 		entities.ProviderTypeDeepSeek,
-		entities.ProviderTypeOllama,
 		entities.ProviderTypeGroq,
 		entities.ProviderTypeMistral,
 		entities.ProviderTypeTogether,
@@ -151,8 +195,8 @@ func TestNew_OpenAICompatible_AllProviderTypes(t *testing.T) {
 // silently falling back to the real OpenAI endpoint when a compat provider
 // has no BaseURL configured.
 func TestNew_OpenAICompatible_MissingBaseURL(t *testing.T) {
-	cfg := entities.ProviderConfig{Name: "p", Type: entities.ProviderTypeOllama, APIKey: "k"}
-	model := entities.ModelConfig{Name: "m", Provider: "p", ModelName: "llama3"}
+	cfg := entities.ProviderConfig{Name: "p", Type: entities.ProviderTypeDeepSeek, APIKey: "k"}
+	model := entities.ModelConfig{Name: "m", Provider: "p", ModelName: "deepseek-chat"}
 	a, err := New(context.Background(), cfg, model, agent.Config{Name: "a"})
 	require.Error(t, err)
 	assert.Nil(t, a)

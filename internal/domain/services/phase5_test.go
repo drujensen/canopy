@@ -422,6 +422,28 @@ func TestAgentService_ListModels_Sorted(t *testing.T) {
 	assert.Equal(t, []string{"alpha", "mid", "zeta"}, svc.ListModels())
 }
 
+// TestAgentService_ListModelSummaries_IncludesCostAndSorted asserts
+// ListModelSummaries (post-v0.1.0 addendum) carries each model's
+// input/output per-million-token cost through from entities.ModelConfig,
+// sorted the same deterministic way ListModels is, and that a model with no
+// configured cost (the common case for a self-hosted model) comes through
+// as zero rather than erroring or being omitted.
+func TestAgentService_ListModelSummaries_IncludesCostAndSorted(t *testing.T) {
+	svc := NewAgentService(AgentServiceConfig{
+		Models: []entities.ModelConfig{
+			{Name: "zeta", Provider: "p", InputCostPerMillionTokens: 3, OutputCostPerMillionTokens: 15},
+			{Name: "alpha", Provider: "p"}, // no cost configured (e.g. self-hosted)
+			{Name: "mid", Provider: "p", InputCostPerMillionTokens: 0.5, OutputCostPerMillionTokens: 1.5},
+		},
+	})
+
+	got := svc.ListModelSummaries()
+	require.Len(t, got, 3)
+	assert.Equal(t, ModelSummary{Name: "alpha"}, got[0])
+	assert.Equal(t, ModelSummary{Name: "mid", InputCostPerMillionTokens: 0.5, OutputCostPerMillionTokens: 1.5}, got[1])
+	assert.Equal(t, ModelSummary{Name: "zeta", InputCostPerMillionTokens: 3, OutputCostPerMillionTokens: 15}, got[2])
+}
+
 // TestAgentService_ModelOverride_RoutesProviderDispatch is the routing proof
 // this feature actually needs, not just persistence: two real provider
 // shapes — an OpenAI Chat Completions-shaped httptest.Server (chatCompletionResponse,

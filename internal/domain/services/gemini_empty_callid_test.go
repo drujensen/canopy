@@ -84,7 +84,19 @@ func TestGeminiEmptyCallID_ApproveThenContinue(t *testing.T) {
 		require.NoError(t, err)
 		approvalReq := findApprovalRequest(t, lastMessage(t, result1.Response))
 		require.NotNil(t, approvalReq)
-		require.Equal(t, "", approvalReq.ToolCall.GetCallID(), "sanity check: the fake server must reproduce the real Gemini API's empty CallID")
+		// The fake server sends an empty CallID, reproducing real Gemini
+		// traffic — but internal/impl/providers/gemini_transport.go now
+		// patches a synthetic id into the raw HTTP response before the SDK
+		// ever parses it, so by the time this reaches the application
+		// layer it must already be non-empty. This is the transport fix
+		// working, not a bug: the old assertion here (expecting an empty
+		// CallID to reach this layer) tested the bug's symptom directly;
+		// now that the fix intercepts it at a lower layer, that symptom
+		// never reaches here at all, and this test's job shifts to proving
+		// the rest of the approve-then-continue flow still completes
+		// correctly using the transport-patched id (see the rest of this
+		// test, unchanged).
+		require.NotEmpty(t, approvalReq.ToolCall.GetCallID(), "gemini_transport.go must have patched a synthetic CallID in before this layer ever saw the request")
 
 		approvalMsg := &message.Message{
 			Role:     message.RoleUser,

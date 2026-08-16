@@ -31,6 +31,7 @@ import (
 	"log/slog"
 	"net/http"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/microsoft/agent-framework-go/agent"
@@ -50,11 +51,18 @@ import (
 	"github.com/drujensen/canopy/internal/impl/tools"
 )
 
-// coreToolNames lists the seven built-in tools (Design §3.2) in a fixed
+// coreToolNames lists Canopy's built-in tools (Design §3.2) in a fixed
 // order, used both to build the "inherit everything" tool list (an
 // AgentDefinition with no explicit Tools allowlist) deterministically and to
-// validate an AgentDefinition's explicit allowlist.
-var coreToolNames = []string{"Bash", "FileRead", "FileWrite", "FileSearch", "DirectoryList", "WebFetch", "WebSearch"}
+// validate an AgentDefinition's explicit allowlist. Eight names total: the
+// original seven core tools, plus "Skill" (post-v0.1.0 addendum, Design
+// §3.11/FR19). Like "WebSearch" (only constructed when a WebSearchBackend is
+// configured), "Skill" is only actually constructed into coreTools'
+// available map under a condition of its own — at least one skill loaded
+// (see coreTools) — so its presence in this fixed name list matters for
+// allowlist validation and MCP-name-collision avoidance (isCoreToolName)
+// even on a deployment where it isn't currently offered.
+var coreToolNames = []string{"Bash", "FileRead", "FileWrite", "FileSearch", "DirectoryList", "WebFetch", "WebSearch", "Skill"}
 
 // isCoreToolName reports whether name is one of the seven core built-in tool
 // names, used at NewAgentService construction time to keep a same-named MCP
@@ -728,11 +736,33 @@ func withReconstructedApprovalFunctionCalls(chat *entities.Chat, msgs []*message
 		}
 		seen[fcc] = true
 		if fcc.CallID == "" {
-			// Real Gemini traffic: mint one synthetic ID and apply it to both
-			// this response's own snapshot and the matching historical
-			// request's snapshot in chat.Messages (if found), so
-			// toolautocall's request/response reconciliation still agrees —
-			// see this function's doc comment for why both sides need it.
+			// Post gemini_transport.go (internal/impl/providers): this
+			// branch is no longer reachable for any *newly received* Gemini
+			// function call — the transport now patches a synthetic,
+			// non-empty id into the raw HTTP response before genai's
+			// decoder (and therefore this code) ever sees it, so a
+			// ToolApprovalRequestContent built from a fresh response always
+			// already has fcc.CallID != "" by the time it would reach here.
+			// It remains reachable, and is still needed, for exactly one
+			// real case: a chat persisted to disk *before* the transport
+			// fix existed can already contain a ToolApprovalRequestContent
+			// snapshot with CallID == "" (chat storage round-trips through
+			// JSON, so there's no way to retroactively repair
+			// already-persisted history just by shipping a new binary) — if
+			// a user resumes that chat and answers the still-pending
+			// approval today, CreateResponse clones that same empty CallID
+			// onto the new response, and this branch is what repairs it.
+			// See TestWithReconstructedApprovalFunctionCalls_EmptyCallID_PreFixPersistedChat
+			// (reconstructed_approval_calls_test.go) for a fast,
+			// transport-independent repro of that exact scenario, and
+			// TestWithReconstructedApprovalFunctionCalls_NonEmptyCallID_BranchNotTriggered
+			// confirming this branch stays inert once a CallID is already
+			// present (the post-fix steady state). Kept intentionally, not
+			// dead code: mint one synthetic ID and apply it to both this
+			// response's own snapshot and the matching historical request's
+			// snapshot in chat.Messages (if found), so toolautocall's
+			// request/response reconciliation still agrees — see this
+			// function's doc comment for why both sides need it.
 			if hist, found := historicalRequestsByID[requestID]; found && hist.CallID != "" {
 				fcc.CallID = hist.CallID
 			} else {
@@ -860,6 +890,37 @@ func (s *AgentService) ListModels() []string {
 	}
 	sort.Strings(names)
 	return names
+}
+
+// ModelSummary is one entry in ListModelSummaries' result: a configured
+// model's Name plus its per-million-token request/response cost
+// (post-v0.1.0 addendum), mirroring SkillSummary's role for the ctrl+s
+// skills browser — used by the TUI's ctrl+o model-picker overlay so a user
+// can compare cost before switching, without needing the full
+// entities.ModelConfig (Parameters, provider linkage, etc.) that isn't
+// relevant to that picker.
+type ModelSummary struct {
+	Name                       string
+	InputCostPerMillionTokens  float64
+	OutputCostPerMillionTokens float64
+}
+
+// ListModelSummaries returns every configured model's ModelSummary, sorted
+// by name (post-v0.1.0 addendum) — the richer counterpart to ListModels for
+// callers (the ctrl+o picker) that want to display cost alongside the name,
+// not just the name alone that SetModel's validation needs.
+func (s *AgentService) ListModelSummaries() []ModelSummary {
+	names := s.ListModels()
+	result := make([]ModelSummary, 0, len(names))
+	for _, name := range names {
+		model := s.models[name]
+		result = append(result, ModelSummary{
+			Name:                       model.Name,
+			InputCostPerMillionTokens:  model.InputCostPerMillionTokens,
+			OutputCostPerMillionTokens: model.OutputCostPerMillionTokens,
+		})
+	}
+	return result
 }
 
 // GetModel returns chat's currently *active* model name (post-v0.1.0
@@ -1147,16 +1208,102 @@ func (s *AgentService) resolveProviderModel(def agentsource.AgentDefinition, ove
 // buildInstructions combines the project's CLAUDE.md/AGENTS.md content
 // (Design §3.11, loaded once into Definitions.ProjectInstructions) with
 // def's own body instructions, project context first, matching
-// projectcontext's own doc comment ordering.
+// projectcontext's own doc comment ordering — and, post-v0.1.0 addendum,
+// appends the skills catalog (skillsCatalog) last: level 1 of §3.11/FR19's
+// progressive disclosure, every loaded skill's name+description (never its
+// full Body — see the Skill tool, NewSkillTool, for levels 2/3), so the
+// model always knows what's available without spending context on a body it
+// may never need. Ordering — project instructions, then agent instructions,
+// then the skills catalog — puts the catalog where it reads naturally as an
+// appendix rather than interrupting either instruction block. When neither
+// ProjectInstructions nor def.Instructions nor the skills catalog has
+// anything to contribute, this returns "", matching this function's
+// pre-addendum behavior exactly (see agent_service_test.go's "returns just
+// the agent's instructions when project instructions are empty" case).
 func (s *AgentService) buildInstructions(def agentsource.AgentDefinition) string {
-	switch {
-	case s.defs.ProjectInstructions == "":
-		return def.Instructions
-	case def.Instructions == "":
-		return s.defs.ProjectInstructions
-	default:
-		return s.defs.ProjectInstructions + "\n\n" + def.Instructions
+	parts := make([]string, 0, 3)
+	if s.defs.ProjectInstructions != "" {
+		parts = append(parts, s.defs.ProjectInstructions)
 	}
+	if def.Instructions != "" {
+		parts = append(parts, def.Instructions)
+	}
+	if catalog := s.skillsCatalog(); catalog != "" {
+		parts = append(parts, catalog)
+	}
+	return strings.Join(parts, "\n\n")
+}
+
+// skillsCatalog renders §3.11/FR19's level-1 progressive-disclosure list:
+// every loaded skill's name+description, one per line, under a
+// "## Available Skills" heading — never the Body (see NewSkillTool for
+// levels 2/3, which return a specific skill's Body/supporting file only
+// when the model actually asks for it by name). Returns "" when no skills
+// are loaded, so buildInstructions never adds an empty, useless
+// "## Available Skills" header to an agent's prompt (Design's own
+// instruction: "only add the section when skills exist").
+func (s *AgentService) skillsCatalog() string {
+	if len(s.defs.Skills) == 0 {
+		return ""
+	}
+	names := make([]string, 0, len(s.defs.Skills))
+	for name := range s.defs.Skills {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+
+	var b strings.Builder
+	b.WriteString("## Available Skills\n\n")
+	for _, name := range names {
+		skill := s.defs.Skills[name]
+		fmt.Fprintf(&b, "- %s: %s\n", skill.Name, skill.Description)
+	}
+	return strings.TrimRight(b.String(), "\n")
+}
+
+// SkillSummary is one entry in ListSkills' result: a loaded skill's
+// Name/Description (level 1 of Design §3.11/FR19's progressive disclosure —
+// the same two fields skillsCatalog renders into the system prompt), used by
+// the TUI's ctrl+s skills-browser overlay (post-v0.1.0 addendum) to list
+// what's available without needing every skill's full Body up front.
+type SkillSummary struct {
+	Name        string
+	Description string
+}
+
+// ListSkills returns every loaded skill's Name/Description, sorted by name
+// (post-v0.1.0 addendum, Design §3.11/FR19) — mirrors ListAgents/ListModels
+// for the same "a TUI picker needs a deterministic list of valid choices"
+// reason, here for the ctrl+s skills-browser overlay rather than an
+// in-place chat switch.
+func (s *AgentService) ListSkills() []SkillSummary {
+	names := make([]string, 0, len(s.defs.Skills))
+	for name := range s.defs.Skills {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+
+	result := make([]SkillSummary, 0, len(names))
+	for _, name := range names {
+		skill := s.defs.Skills[name]
+		result = append(result, SkillSummary{Name: skill.Name, Description: skill.Description})
+	}
+	return result
+}
+
+// GetSkillBody returns the full SKILL.md body for the named skill
+// (post-v0.1.0 addendum, Design §3.11/FR19) — the exact same content the
+// model-facing Skill tool (level 2, NewSkillTool) returns, exposed here
+// read-only so the TUI's ctrl+s browser can show a user what a skill
+// actually does without going through the model at all. Returns a clear
+// error for an unknown name, the same defensive posture SetAgent/SetModel
+// apply against their own name-lookup maps.
+func (s *AgentService) GetSkillBody(name string) (string, error) {
+	skill, ok := s.defs.Skills[name]
+	if !ok {
+		return "", fmt.Errorf("agent service: unknown skill %q", name)
+	}
+	return skill.Body, nil
 }
 
 // buildTools assembles def's tool list from the core built-in set (Design
@@ -1220,10 +1367,13 @@ func (s *AgentService) buildTools(def agentsource.AgentDefinition, mode string) 
 	return result, nil
 }
 
-// coreTools constructs one instance of each of the seven built-in tools
+// coreTools constructs one instance of each configured built-in tool
 // (Design §3.2), keyed by the name used in an AgentDefinition's "tools"
 // frontmatter allowlist. WebSearch is omitted when no WebSearchBackend is
-// configured (see ToolsConfig.WebSearchBackend's doc comment).
+// configured (see ToolsConfig.WebSearchBackend's doc comment); Skill is
+// omitted when no skills are loaded (post-v0.1.0 addendum, Design
+// §3.11/FR19) — an agent/project with no skills shouldn't get a tool that
+// offers nothing to look up, the same reasoning WebSearch already applies.
 func (s *AgentService) coreTools() (map[string]tool.Tool, error) {
 	bash, err := tools.NewBashTool(tools.BashConfig{
 		WorkingDirectory: s.toolsCfg.WorkingRoot,
@@ -1243,6 +1393,9 @@ func (s *AgentService) coreTools() (map[string]tool.Tool, error) {
 	}
 	if s.toolsCfg.WebSearchBackend != nil {
 		result["WebSearch"] = tools.NewWebSearchTool(tools.WebSearchConfig{Backend: s.toolsCfg.WebSearchBackend})
+	}
+	if len(s.defs.Skills) > 0 {
+		result["Skill"] = tools.NewSkillTool(s.defs.Skills)
 	}
 	return result, nil
 }

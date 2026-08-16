@@ -23,6 +23,7 @@ import (
 	"github.com/drujensen/canopy/internal/domain/services"
 	"github.com/drujensen/canopy/internal/impl/agentsource"
 	jsonrepo "github.com/drujensen/canopy/internal/impl/repositories/json"
+	"github.com/drujensen/canopy/internal/impl/skillsource"
 )
 
 // --- synthetic-message tests: no real AgentService/network involved ---
@@ -530,4 +531,210 @@ func TestChatModel_CtrlA_CtrlO_NoopDuringActiveStream(t *testing.T) {
 	assert.Nil(t, cmd)
 	assert.Nil(t, c.picker, "ctrl+o must not open the model-switch overlay while a stream is active")
 	assert.True(t, c.streamActive, "streamActive must be untouched by the no-op key presses")
+}
+
+// --- ctrl+n (start a genuinely new chat) tests (post-v0.1.0 addendum) ---
+
+// TestModel_CtrlN_StartsGenuinelyNewChat_ResetsState drives the real ctrl+n
+// keybinding path end to end: chatModel.startNewChatCmd's tea.Cmd against a
+// real AgentService, then Model.Update applying the resulting chatStartedMsg
+// the same way it does for the top-level picker's own chat start. Asserts a
+// brand-new chat ID is used (not the old chat rewritten), the new chat is
+// bound to the *same* agent the old one was using (ctrl+n doesn't force the
+// picker), and the resulting chatModel's transcript/todos/pending-approval
+// are all genuinely empty/nil rather than carried over from the old chat.
+func TestModel_CtrlN_StartsGenuinelyNewChat_ResetsState(t *testing.T) {
+	svc := newSwitchTestService(t)
+	ctx := context.Background()
+	_, err := svc.StartChat(ctx, "chat-1", "assistant")
+	require.NoError(t, err)
+
+	c := newChatModel("chat-1", "assistant", nil, "execute", "m1", 80, 24)
+	c.transcript = append(c.transcript, transcriptEntry{role: message.RoleUser, text: "hello before new chat"})
+	c.todos = []todo.Item{{ID: 1, Title: "leftover todo"}}
+	c.pendingApproval = nil // starts nil; asserted below on the fresh chat too
+
+	m := Model{svc: svc, ctx: ctx, screen: screenChat, chat: c, width: 80, height: 24}
+
+	cmd := c.handleKey(tea.KeyMsg{Type: tea.KeyCtrlN}, svc, ctx)
+	require.NotNil(t, cmd, "ctrl+n must produce a tea.Cmd that starts a new chat")
+	msg := cmd()
+	startedMsg, ok := msg.(chatStartedMsg)
+	require.True(t, ok, "ctrl+n must produce a chatStartedMsg, got %#v", msg)
+	require.NoError(t, startedMsg.err)
+
+	assert.NotEqual(t, "chat-1", startedMsg.chatID, "ctrl+n must generate a genuinely new chat ID, not reuse the old one")
+	assert.Equal(t, "assistant", startedMsg.agentName, "the new chat must keep the current agent — ctrl+n must not force the user back through the agent picker")
+	assert.Empty(t, startedMsg.todos, "a brand-new chat must start with no leftover todos")
+	assert.Equal(t, "execute", startedMsg.mode, "a brand-new chat must start in the default mode, not whatever the old chat's mode was")
+	assert.Equal(t, "m1", startedMsg.model, "a brand-new chat with no override must resolve to the agent's normal model")
+
+	updated, updCmd := m.Update(startedMsg)
+	assert.Nil(t, updCmd)
+	next := updated.(Model)
+	require.NotNil(t, next.chat)
+	assert.Equal(t, startedMsg.chatID, next.chat.chatID)
+	assert.Empty(t, next.chat.transcript, "a genuinely new chat must start with an empty transcript")
+	assert.Empty(t, next.chat.todos, "a genuinely new chat must start with no leftover todos")
+	assert.Nil(t, next.chat.pendingApproval, "a genuinely new chat must start with no pending approval")
+	assert.False(t, next.chat.streamActive)
+	assert.Equal(t, "execute", next.chat.mode)
+	assert.Equal(t, "m1", next.chat.model)
+
+	// Prove it's a new chat file, not the old one rewritten: the old chat ID
+	// is still resolvable on its own and untouched.
+	oldStillModel, err := svc.GetModel(ctx, "chat-1")
+	require.NoError(t, err)
+	assert.Equal(t, "m1", oldStillModel, "the old chat must still exist, untouched, under its own ID")
+}
+
+// TestChatModel_CtrlN_NoopDuringActiveStream asserts ctrl+n does not
+// abandon an in-flight turn — the same guard ctrl+a/ctrl+o/enter already
+// apply.
+func TestChatModel_CtrlN_NoopDuringActiveStream(t *testing.T) {
+	svc := newSwitchTestService(t)
+	ctx := context.Background()
+	_, err := svc.StartChat(ctx, "chat-1", "assistant")
+	require.NoError(t, err)
+
+	c := newChatModel("chat-1", "assistant", nil, "execute", "m1", 80, 24)
+	c.streamActive = true
+
+	cmd := c.handleKey(tea.KeyMsg{Type: tea.KeyCtrlN}, svc, ctx)
+	assert.Nil(t, cmd, "ctrl+n must be a no-op while a turn is actively streaming")
+	assert.True(t, c.streamActive, "streamActive must be untouched by the no-op key press")
+	assert.Equal(t, "chat-1", c.chatID, "the chat must not have been replaced while streaming")
+}
+
+// TestChatModel_CtrlN_NoopDuringPendingApproval asserts ctrl+n is swallowed
+// (routed to handleApprovalKey, which has no case for it) while a tool
+// approval is pending, rather than abandoning that pending decision.
+func TestChatModel_CtrlN_NoopDuringPendingApproval(t *testing.T) {
+	svc := newSwitchTestService(t)
+	ctx := context.Background()
+	_, err := svc.StartChat(ctx, "chat-1", "assistant")
+	require.NoError(t, err)
+
+	c := newChatModel("chat-1", "assistant", nil, "execute", "m1", 80, 24)
+	c.pendingApproval = &message.ToolApprovalRequestContent{
+		RequestID: "req-1",
+		ToolCall:  &message.FunctionCallContent{CallID: "call-1", Name: "run_shell", Arguments: "{}"},
+	}
+
+	cmd := c.handleKey(tea.KeyMsg{Type: tea.KeyCtrlN}, svc, ctx)
+	assert.Nil(t, cmd, "ctrl+n must be a no-op while an approval prompt is pending")
+	assert.NotNil(t, c.pendingApproval, "the pending approval must be untouched")
+	assert.Equal(t, "chat-1", c.chatID, "the chat must not have been replaced while an approval is pending")
+}
+
+// --- ctrl+s (skills browser) tests (post-v0.1.0 addendum, Design §3.11/FR19) ---
+
+// newSkillsTestService builds a real AgentService with one loaded skill
+// (GetSkillBody/ListSkills only touch in-memory Definitions.Skills, no
+// provider/repository I/O needed for these tests beyond StartChat itself).
+func newSkillsTestService(t *testing.T) *services.AgentService {
+	t.Helper()
+	repo, err := jsonrepo.NewChatRepository(t.TempDir())
+	require.NoError(t, err)
+	return services.NewAgentService(services.AgentServiceConfig{
+		Definitions: services.Definitions{
+			Agents: map[string]agentsource.AgentDefinition{"assistant": {Name: "assistant"}},
+			Skills: map[string]skillsource.SkillDefinition{
+				"pdf-processing": {
+					Name:        "pdf-processing",
+					Description: "Extract text and tables from PDF files.",
+					Body:        "# PDF Processing\n\nDistinctive real skill body content, marker XYZZY.",
+					Dir:         t.TempDir(),
+				},
+			},
+		},
+		Providers:    []entities.ProviderConfig{{Name: "p", Type: entities.ProviderTypeOpenAI}},
+		Models:       []entities.ModelConfig{{Name: "m1", Provider: "p"}},
+		DefaultModel: "m1",
+		Repository:   repo,
+	})
+}
+
+// TestChatModel_CtrlS_OpensSkillsBrowser_SelectingShowsRealBody drives the
+// real ctrl+s keybinding path end to end: opens the overlay, selects the
+// only loaded skill, and asserts the skill's actual Body (not a
+// placeholder) lands in the transcript as a system-style entry.
+func TestChatModel_CtrlS_OpensSkillsBrowser_SelectingShowsRealBody(t *testing.T) {
+	svc := newSkillsTestService(t)
+	ctx := context.Background()
+	_, err := svc.StartChat(ctx, "chat-1", "assistant")
+	require.NoError(t, err)
+
+	c := newChatModel("chat-1", "assistant", nil, "execute", "m1", 80, 24)
+
+	cmd := c.handleKey(tea.KeyMsg{Type: tea.KeyCtrlS}, svc, ctx)
+	assert.Nil(t, cmd, "opening the skills browser is a synchronous, in-memory ListSkills() read — no Cmd needed")
+	require.NotNil(t, c.picker, "ctrl+s must open the in-chat skills-browser overlay")
+	assert.Equal(t, pickerSkill, c.pickerKind)
+
+	selectCmd := c.handleKey(tea.KeyMsg{Type: tea.KeyEnter}, svc, ctx)
+	assert.Nil(t, selectCmd, "selecting a skill is also synchronous — GetSkillBody is a pure in-memory lookup")
+	assert.Nil(t, c.picker, "selecting an entry must close the overlay")
+
+	require.Len(t, c.transcript, 1, "the skill's body must be folded into the transcript")
+	assert.True(t, c.transcript[0].system, "the skill-detail entry must be marked system, not a real user/assistant message")
+	assert.Contains(t, c.transcript[0].text, "Distinctive real skill body content, marker XYZZY", "the real Body must be shown, not a hallucination or placeholder")
+
+	view := c.View(80, 24)
+	assert.Contains(t, view, "XYZZY", "the shown skill content must actually be visible in the rendered view")
+}
+
+// TestChatModel_CtrlS_NoSkillsConfigured_ShowsSensibleMessage asserts ctrl+s
+// is non-broken (not a silent no-op with no feedback) when zero skills are
+// loaded.
+func TestChatModel_CtrlS_NoSkillsConfigured_ShowsSensibleMessage(t *testing.T) {
+	svc := newSwitchTestService(t) // no skills configured
+	ctx := context.Background()
+	_, err := svc.StartChat(ctx, "chat-1", "assistant")
+	require.NoError(t, err)
+
+	c := newChatModel("chat-1", "assistant", nil, "execute", "m1", 80, 24)
+
+	cmd := c.handleKey(tea.KeyMsg{Type: tea.KeyCtrlS}, svc, ctx)
+	assert.Nil(t, cmd)
+	assert.Nil(t, c.picker, "no overlay should open when there are no skills to browse")
+	require.Len(t, c.transcript, 1, "ctrl+s with no skills must still give visible feedback, not a silent no-op")
+	assert.True(t, c.transcript[0].system)
+	assert.Contains(t, c.transcript[0].text, "No skills configured")
+}
+
+// TestChatModel_CtrlS_EscCancelsWithNoChange proves "esc" closes the skills
+// overlay without adding anything to the transcript, mirroring ctrl+a/
+// ctrl+o's own cancel behavior.
+func TestChatModel_CtrlS_EscCancelsWithNoChange(t *testing.T) {
+	svc := newSkillsTestService(t)
+	ctx := context.Background()
+	_, err := svc.StartChat(ctx, "chat-1", "assistant")
+	require.NoError(t, err)
+
+	c := newChatModel("chat-1", "assistant", nil, "execute", "m1", 80, 24)
+	c.handleKey(tea.KeyMsg{Type: tea.KeyCtrlS}, svc, ctx)
+	require.NotNil(t, c.picker)
+
+	cmd := c.handleKey(tea.KeyMsg{Type: tea.KeyEsc}, svc, ctx)
+	assert.Nil(t, cmd)
+	assert.Nil(t, c.picker, "esc must close the skills overlay")
+	assert.Equal(t, pickerNone, c.pickerKind)
+	assert.Empty(t, c.transcript, "cancelling the skills browser must not add anything to the transcript")
+}
+
+// TestChatModel_CtrlS_NoopDuringActiveStream asserts ctrl+s does not open
+// the skills browser mid-turn, the same guard ctrl+a/ctrl+o apply.
+func TestChatModel_CtrlS_NoopDuringActiveStream(t *testing.T) {
+	svc := newSkillsTestService(t)
+	ctx := context.Background()
+	_, err := svc.StartChat(ctx, "chat-1", "assistant")
+	require.NoError(t, err)
+
+	c := newChatModel("chat-1", "assistant", nil, "execute", "m1", 80, 24)
+	c.streamActive = true
+
+	cmd := c.handleKey(tea.KeyMsg{Type: tea.KeyCtrlS}, svc, ctx)
+	assert.Nil(t, cmd)
+	assert.Nil(t, c.picker, "ctrl+s must not open the skills browser while a stream is active")
 }

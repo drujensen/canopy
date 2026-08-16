@@ -47,6 +47,19 @@ type ProviderConfig struct {
 	// the env var *name* is ever persisted to disk — never the secret
 	// itself.
 	APIKeyEnv string `json:"api_key_env,omitempty"`
+
+	// TimeoutSeconds overrides how long impl/providers waits for a
+	// response's headers before giving up (post-v0.1.0 addendum,
+	// Requirements §7). Zero means "use the provider SDK's own default" —
+	// for the OpenAI/OpenAI-compatible path that's openai-go's own
+	// 10-minute ResponseHeaderTimeout, which is generous for a hosted API
+	// but can still be too short for a self-hosted, locally-run model
+	// (e.g. Ollama cold-loading a large model before it can start
+	// responding). Set this explicitly for a provider known to be slow
+	// rather than living with a timeout error; it has no effect on an
+	// already-started streaming response body, only on how long Canopy
+	// waits for the response to *begin*.
+	TimeoutSeconds int `json:"timeout_seconds,omitempty"`
 }
 
 // ModelConfig pairs a model with one configured provider and its invocation
@@ -75,4 +88,18 @@ type ModelConfig struct {
 	// from known-model tables per provider instead of requiring manual
 	// configuration.
 	ContextWindowTokens int `json:"context_window_tokens,omitempty"`
+
+	// InputCostPerMillionTokens and OutputCostPerMillionTokens are the
+	// model's price in US dollars per million request/response tokens
+	// (post-v0.1.0 addendum), shown in the TUI's ctrl+o model picker so a
+	// user can compare cost before switching. Zero/unset means "unknown or
+	// free" (e.g. a self-hosted Ollama model, or a model whose provider
+	// doesn't publish per-token pricing) — the picker shows nothing rather
+	// than a misleading "$0.00" in that case. impl/config.DetectProviders
+	// populates these automatically from the models.dev catalog's own
+	// "cost.input"/"cost.output" fields for an auto-detected provider; a
+	// manually hand-edited providers.json entry can set them directly the
+	// same way.
+	InputCostPerMillionTokens  float64 `json:"input_cost_per_million_tokens,omitempty"`
+	OutputCostPerMillionTokens float64 `json:"output_cost_per_million_tokens,omitempty"`
 }

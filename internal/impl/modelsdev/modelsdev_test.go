@@ -46,7 +46,8 @@ const fixtureBody = `{
         "tool_call": true,
         "temperature": true,
         "release_date": "2024-05-13",
-        "limit": {"context": 128000, "output": 16384}
+        "limit": {"context": 128000, "output": 16384},
+        "cost": {"input": 2.5, "output": 10, "cache_read": 1.25, "cache_write": 3.75}
       }
     }
   },
@@ -115,6 +116,15 @@ func TestFetch_Success(t *testing.T) {
 	assert.True(t, gpt4o.ToolCall)
 	assert.Equal(t, "2024-05-13", gpt4o.ReleaseDate)
 	assert.Equal(t, 128000, gpt4o.Limit.Context)
+	assert.Equal(t, 2.5, gpt4o.Cost.Input, "cost.input must decode into ModelData.Cost.Input")
+	assert.Equal(t, 10.0, gpt4o.Cost.Output, "cost.output must decode into ModelData.Cost.Output")
+
+	// A model whose fixture entry has no "cost" object at all (claude-opus-4-7
+	// below) must decode to CostData's zero value rather than erroring.
+	opus, ok := (*catalog)["anthropic"].Models["claude-opus-4-7"]
+	require.True(t, ok)
+	assert.Zero(t, opus.Cost.Input)
+	assert.Zero(t, opus.Cost.Output)
 }
 
 func TestFetch_NetworkError(t *testing.T) {

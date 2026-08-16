@@ -58,10 +58,10 @@ type ProviderData struct {
 }
 
 // ModelData describes one model's entry in the models.dev catalog. Only the
-// fields Canopy's auto-detection heuristic actually uses are kept (tool-call
-// capability, release date for recency ranking, and context window size) —
-// pricing/cost fields aiagent's version carried aren't needed here and are
-// dropped rather than carried along unused.
+// fields Canopy's auto-detection heuristic and provider config actually use
+// are kept (tool-call capability, release date for recency ranking, context
+// window size, and — post-v0.1.0 addendum, for the TUI's ctrl+o model
+// picker — per-token cost).
 type ModelData struct {
 	ID          string    `json:"id"`
 	Name        string    `json:"name"`
@@ -76,12 +76,25 @@ type ModelData struct {
 	// "YYYY-MM" (no day). Parse defensively (time.Parse("2006-01-02", ...))
 	// and skip rather than error on a model whose date doesn't match.
 	ReleaseDate string `json:"release_date"`
+	// Cost is omitted entirely by the catalog for some models (e.g. several
+	// open-weights entries) rather than sent as zeros — CostData's own zero
+	// value already means "unknown," so no special-casing is needed here.
+	Cost CostData `json:"cost"`
 }
 
 // LimitData describes a model's context/output token limits.
 type LimitData struct {
 	Context int `json:"context"`
 	Output  int `json:"output"`
+}
+
+// CostData describes a model's price in US dollars per million tokens
+// (post-v0.1.0 addendum), confirmed directly against a live fetch: the
+// catalog's "cost" object also carries "cache_read"/"cache_write", which
+// Canopy doesn't currently surface anywhere and so isn't captured here.
+type CostData struct {
+	Input  float64 `json:"input"`
+	Output float64 `json:"output"`
 }
 
 // Fetch performs a live, unauthenticated HTTP GET against the real

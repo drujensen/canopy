@@ -8,6 +8,8 @@ package providers
 import (
 	"context"
 	"fmt"
+	"net/http"
+	"time"
 
 	"github.com/anthropics/anthropic-sdk-go"
 	anthropicoption "github.com/anthropics/anthropic-sdk-go/option"
@@ -38,10 +40,18 @@ import (
 // config.DetectProviders) — now also succeeds via the generic
 // newOpenAICompatible path as long as cfg.BaseURL is set, on the same
 // rationale that already justified sharing that one path across DeepSeek,
-// Ollama, Groq, Mistral, Together, and xAI: the large majority of providers
-// only implement the OpenAI Chat Completions wire format. Only an
-// unrecognized type with no BaseURL is a real error — there's genuinely no
-// endpoint to call.
+// Groq, Mistral, Together, and xAI: the large majority of providers only
+// implement the OpenAI Chat Completions wire format. Only an unrecognized
+// type with no BaseURL is a real error — there's genuinely no endpoint to
+// call.
+//
+// Ollama gets its own case (newOllama, ollama.go) rather than sharing
+// newOpenAICompatible: it needs BaseURL normalization (a bare host is
+// enough, "/v1" is appended automatically) and a response-patching
+// transport that works around a confirmed tool-call streaming bug in
+// Ollama's OpenAI-compatible endpoint — see ollama_transport.go's
+// package comment for the full analysis. Neither behavior belongs in the
+// generic path shared by hosted, non-self-hosted providers.
 func New(ctx context.Context, cfg entities.ProviderConfig, model entities.ModelConfig, agentCfg agent.Config) (*agent.Agent, error) {
 	switch cfg.Type {
 	case entities.ProviderTypeOpenAI:
@@ -53,8 +63,10 @@ func New(ctx context.Context, cfg entities.ProviderConfig, model entities.ModelC
 	case entities.ProviderTypeGemini:
 		return newGemini(ctx, cfg, model, agentCfg)
 
+	case entities.ProviderTypeOllama:
+		return newOllama(cfg, model, agentCfg)
+
 	case entities.ProviderTypeDeepSeek,
-		entities.ProviderTypeOllama,
 		entities.ProviderTypeGroq,
 		entities.ProviderTypeMistral,
 		entities.ProviderTypeTogether,
@@ -79,6 +91,7 @@ func newOpenAINative(cfg entities.ProviderConfig, model entities.ModelConfig, ag
 	if cfg.BaseURL != "" {
 		opts = append(opts, openaioption.WithBaseURL(cfg.BaseURL))
 	}
+	opts = append(opts, openaiTimeoutOptions(cfg)...)
 	client := openai.NewClient(opts...)
 	return openaiprovider.NewChatCompletionsAgent(client, openaiprovider.AgentConfig{
 		Config: agentCfg,
@@ -92,6 +105,9 @@ func newAnthropic(cfg entities.ProviderConfig, model entities.ModelConfig, agent
 	if cfg.BaseURL != "" {
 		opts = append(opts, anthropicoption.WithBaseURL(cfg.BaseURL))
 	}
+	if cfg.TimeoutSeconds > 0 {
+		opts = append(opts, anthropicoption.WithRequestTimeout(time.Duration(cfg.TimeoutSeconds)*time.Second))
+	}
 	client := anthropic.NewClient(opts...)
 	return anthropicprovider.NewAgent(client, anthropicprovider.AgentConfig{
 		Config: agentCfg,
@@ -100,8 +116,21 @@ func newAnthropic(cfg entities.ProviderConfig, model entities.ModelConfig, agent
 }
 
 // newGemini builds a Google Gemini-backed agent via geminiprovider.NewAgent.
+//
+// The client is given an HTTPClient wrapping
+// newGeminiFunctionCallIDPatchingTransport (gemini_transport.go): real
+// Gemini responses can omit functionCall.id entirely (it's documented
+// json:"id,omitempty" in google.golang.org/genai's own FunctionCall type),
+// which agent-framework-go's geminiprovider requires internally and errors
+// on when missing — this patches a synthetic id into the raw response body
+// before the SDK ever parses it, fixing the gap transparently for every
+// downstream consumer (toolautocall's same-turn auto-call loop included,
+// not just Canopy's own cross-turn approval-response reconstruction).
 func newGemini(ctx context.Context, cfg entities.ProviderConfig, model entities.ModelConfig, agentCfg agent.Config) (*agent.Agent, error) {
-	clientCfg := &genai.ClientConfig{APIKey: cfg.APIKey}
+	clientCfg := &genai.ClientConfig{
+		APIKey:     cfg.APIKey,
+		HTTPClient: &http.Client{Transport: newGeminiFunctionCallIDPatchingTransport(http.DefaultTransport)},
+	}
 	if cfg.BaseURL != "" {
 		clientCfg.HTTPOptions = genai.HTTPOptions{BaseURL: cfg.BaseURL}
 	}

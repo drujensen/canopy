@@ -1,6 +1,10 @@
 package tui
 
-import "github.com/charmbracelet/bubbles/list"
+import (
+	"fmt"
+
+	"github.com/charmbracelet/bubbles/list"
+)
 
 // pickerItem adapts a plain name string to bubbles/list's Item
 // (FilterValue) and DefaultItem (Title/Description) interfaces, the same
@@ -15,6 +19,70 @@ type pickerItem struct{ name string }
 func (i pickerItem) Title() string       { return i.name }
 func (i pickerItem) Description() string { return "" }
 func (i pickerItem) FilterValue() string { return i.name }
+
+// skillPickerItem adapts a services.SkillSummary's Name/Description to
+// bubbles/list's Item interfaces for chatModel's ctrl+s skills-browser
+// overlay (post-v0.1.0 addendum, Design §3.11/FR19). Unlike pickerItem
+// (ctrl+a/ctrl+o, names only — ListAgents/ListModels return only names),
+// the skills browser shows each skill's description too, per Design's own
+// spec for the browser ("lists skill names+descriptions"); kept as two
+// plain strings rather than importing domain/services.SkillSummary here so
+// this file doesn't need that import for what's otherwise the same
+// Title/Description/FilterValue shape as agentItem.
+type skillPickerItem struct{ name, description string }
+
+func (i skillPickerItem) Title() string       { return i.name }
+func (i skillPickerItem) Description() string { return i.description }
+func (i skillPickerItem) FilterValue() string { return i.name }
+
+// modelPickerItem adapts a services.ModelSummary (name plus per-million-token
+// request/response cost) to bubbles/list's Item interfaces for the ctrl+o
+// model-switch overlay (post-v0.1.0 addendum) — the model-picker analogue of
+// skillPickerItem showing a skill's description: pickerItem's blank
+// Description() is no longer good enough here now that ListModelSummaries
+// gives the picker something worth showing.
+type modelPickerItem struct {
+	name                                      string
+	inputCostPerMillion, outputCostPerMillion float64
+}
+
+func (i modelPickerItem) Title() string { return i.name }
+
+// Description formats cost as "$<input>/$<output> per 1M tokens (req/resp)"
+// when at least one side is known, or "" (matching pickerItem's blank
+// Description, rather than a misleading "$0.00/$0.00") when a model's cost
+// is entirely unset — true for every self-hosted/local model (Ollama and
+// the like) and for any provider models.dev doesn't publish pricing for.
+// Costs are formatted with up to 2 decimal places, trimmed of a trailing
+// ".00" (most published per-million prices are whole or half dollars; a
+// forced two decimals would make "$2 in / $10 out" read as
+// "$2.00 in / $10.00 out" for no benefit) via %g-style trimming done by hand
+// since Go's %g uses scientific notation past 6 significant digits, which a
+// price like 1234.5 would otherwise trigger.
+func (i modelPickerItem) Description() string {
+	if i.inputCostPerMillion == 0 && i.outputCostPerMillion == 0 {
+		return ""
+	}
+	return fmt.Sprintf("$%s in / $%s out per 1M tokens (request/response)",
+		formatCost(i.inputCostPerMillion), formatCost(i.outputCostPerMillion))
+}
+
+func (i modelPickerItem) FilterValue() string { return i.name }
+
+// formatCost renders a per-million-token dollar amount with up to 2 decimal
+// places, dropping a trailing ".00"/".0" rather than always showing two
+// decimals — see modelPickerItem.Description's doc comment for why %g isn't
+// used directly.
+func formatCost(v float64) string {
+	s := fmt.Sprintf("%.2f", v)
+	for len(s) > 0 && s[len(s)-1] == '0' {
+		s = s[:len(s)-1]
+	}
+	if len(s) > 0 && s[len(s)-1] == '.' {
+		s = s[:len(s)-1]
+	}
+	return s
+}
 
 // newPickerList builds a bubbles/list.Model listing names, titled title,
 // styled the same way NewModel's own agentList is (list.NewDefaultDelegate,

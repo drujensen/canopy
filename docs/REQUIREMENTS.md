@@ -167,6 +167,19 @@ generic OpenAI-compatible adapter as long as a base URL is configured, not just 
 re-check and additively appends any newly-detectable provider without touching what's already
 configured.
 
+Addendum (post-v0.1.0): FR19's progressive disclosure — specified above from the start but never
+actually implemented until now (no `Skill` tool existed, and `Definitions.Skills` was loaded but
+never read by anything) — is real: `AgentService.buildInstructions` appends every loaded skill's
+`name`+`description` to the system prompt (level 1); the new `Skill` tool
+(`internal/impl/tools/skill.go`) returns a named skill's full body on request (level 2) and,
+given an optional `file` field, a supporting file confined to that skill's own directory (level
+3) rather than the project-wide working root the existing file-read tool is confined to — see
+DESIGN.md §3.2/§3.11's addenda for why that's a deliberate, separate confinement rather than
+reuse. The TUI also gained `ctrl+s`, a read-only skills browser (DESIGN.md §5's addendum), and
+`ctrl+n`, which starts a genuinely new chat bound to the current agent without forcing the
+top-level agent picker (DESIGN.md §5's addendum) — both are TUI-only additions with no new FR
+number of their own, extensions of FR8's chat-screen UX and FR19's skill support respectively.
+
 ## 7. Non-functional requirements
 
 - **Security.** No API keys or secrets in logs by default. Bash/file tools retain input validation

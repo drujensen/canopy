@@ -26,14 +26,23 @@ const (
 	pickerNone pickerKind = iota
 	pickerAgent
 	pickerModel
+	// pickerSkill identifies the ctrl+s read-only skills browser (post-v0.1.0
+	// addendum, Design §3.11/FR19) — unlike pickerAgent/pickerModel, selecting
+	// an entry never calls an AgentService mutator; it shows the skill's real
+	// Body in the transcript instead (see chatModel.showSkill).
+	pickerSkill
 )
 
 // transcriptEntry is one finished message rendered in the chat transcript —
-// either something the user sent or a completed assistant reply (built up
-// from streamed chunks, see chatModel.streaming).
+// either something the user sent, a completed assistant reply (built up
+// from streamed chunks, see chatModel.streaming), or a system-style
+// informational entry (post-v0.1.0 addendum: the ctrl+s skills browser
+// folding a skill's real Body into the transcript so a user can see it
+// without asking the model — see showSkill).
 type transcriptEntry struct {
-	role message.Role
-	text string
+	role   message.Role
+	text   string
+	system bool
 }
 
 // chatModel is the chat screen (Design §5): a scrolling transcript fed by
@@ -78,11 +87,12 @@ type chatModel struct {
 	pendingApproval     *message.ToolApprovalRequestContent
 	pendingApprovalTool string
 
-	// picker, when non-nil, is the in-chat overlay currently shown — either
-	// the ctrl+a agent-switch or ctrl+o model-switch picker (post-v0.1.0
-	// addendum, Design §3.4/§4/§5), pre-empting the composer/transcript the
-	// same way pendingApproval does. pickerKind says which one, so
-	// handlePickerKey knows whether a selection calls SetAgent or SetModel.
+	// picker, when non-nil, is the in-chat overlay currently shown — the
+	// ctrl+a agent-switch, ctrl+o model-switch, or ctrl+s skills-browser
+	// picker (post-v0.1.0 addendum, Design §3.4/§4/§5/§3.11), pre-empting the
+	// composer/transcript the same way pendingApproval does. pickerKind says
+	// which one, so handlePickerKey knows whether a selection calls
+	// SetAgent/SetModel or just displays the chosen skill's body.
 	picker     *list.Model
 	pickerKind pickerKind
 
@@ -164,6 +174,25 @@ func (c *chatModel) handleKey(msg tea.KeyMsg, svc *services.AgentService, ctx co
 		}
 		c.openPicker(svc, pickerModel)
 		return nil
+	case "ctrl+s":
+		// Same guard as ctrl+a/ctrl+o: don't open the skills browser
+		// mid-turn. It's read-only (no AgentService mutator involved), but
+		// staying consistent with the other overlays keeps the composer's
+		// "no overlay while streaming" invariant simple and uniform.
+		if c.streamActive {
+			return nil
+		}
+		c.openSkillPicker(svc)
+		return nil
+	case "ctrl+n":
+		// Guarded the same way ctrl+a/ctrl+o/enter are: starting a new chat
+		// must not silently abandon a turn that's actively streaming. A
+		// pending approval is already excluded above (pendingApproval != nil
+		// routes to handleApprovalKey instead, which has no ctrl+n case).
+		if c.streamActive {
+			return nil
+		}
+		return c.startNewChatCmd(svc, ctx)
 	case "enter":
 		if c.streamActive {
 			return nil
@@ -188,46 +217,112 @@ func (c *chatModel) handleKey(msg tea.KeyMsg, svc *services.AgentService, ctx co
 
 // openPicker builds and shows one of the in-chat overlay pickers (ctrl+a
 // switch-agent, ctrl+o switch-model — post-v0.1.0 addendum) from
-// AgentService.ListAgents()/ListModels(). Both are pure, in-memory reads (no
-// I/O, unlike everything else this file calls through svc), so this runs
-// synchronously inside handleKey rather than round-tripping through a
-// tea.Cmd/tea.Msg the way starting a turn or toggling mode do.
+// AgentService.ListAgents()/ListModelSummaries(). Both are pure, in-memory
+// reads (no I/O, unlike everything else this file calls through svc), so
+// this runs synchronously inside handleKey rather than round-tripping
+// through a tea.Cmd/tea.Msg the way starting a turn or toggling mode do.
+//
+// The model picker (post-v0.1.0 addendum) uses ListModelSummaries rather
+// than ListModels/newPickerList's plain-name pickerItem, so each entry can
+// show its per-million-token request/response cost (modelPickerItem) the
+// same way the ctrl+s skills browser shows each skill's description.
 func (c *chatModel) openPicker(svc *services.AgentService, kind pickerKind) {
-	var names []string
-	title := "Select a model"
 	if kind == pickerAgent {
-		names = svc.ListAgents()
-		title = "Select an agent"
-	} else {
-		names = svc.ListModels()
+		l := newPickerList(svc.ListAgents(), "Select an agent", c.width-sidebarWidth, c.height-4)
+		c.picker = &l
+		c.pickerKind = kind
+		return
 	}
-	l := newPickerList(names, title, c.width-sidebarWidth, c.height-4)
+
+	summaries := svc.ListModelSummaries()
+	items := make([]list.Item, 0, len(summaries))
+	for _, m := range summaries {
+		items = append(items, modelPickerItem{
+			name:                 m.Name,
+			inputCostPerMillion:  m.InputCostPerMillionTokens,
+			outputCostPerMillion: m.OutputCostPerMillionTokens,
+		})
+	}
+	l := list.New(items, list.NewDefaultDelegate(), c.width-sidebarWidth, c.height-4)
+	l.Title = "Select a model"
+	l.SetShowStatusBar(false)
+	l.SetFilteringEnabled(true)
 	c.picker = &l
 	c.pickerKind = kind
 }
 
+// openSkillPicker builds and shows the read-only ctrl+s skills-browser
+// overlay (post-v0.1.0 addendum, Design §3.11/FR19), sourced from
+// AgentService.ListSkills() — a pure, in-memory read like openPicker's own
+// ListAgents()/ListModels() calls, so this too runs synchronously inside
+// handleKey.
+//
+// Unlike openPicker's two overlays, zero loaded skills is a real,
+// expected case (not every project configures any), and silently doing
+// nothing would leave the user wondering whether the keybinding even
+// fired. So that case is handled directly here rather than opening an
+// empty, useless list: a brief system-style transcript entry says so, with
+// no overlay shown at all.
+func (c *chatModel) openSkillPicker(svc *services.AgentService) {
+	skills := svc.ListSkills()
+	if len(skills) == 0 {
+		c.transcript = append(c.transcript, transcriptEntry{system: true, text: "No skills configured."})
+		c.refreshViewport()
+		return
+	}
+
+	items := make([]list.Item, 0, len(skills))
+	for _, sk := range skills {
+		items = append(items, skillPickerItem{name: sk.Name, description: sk.Description})
+	}
+	l := list.New(items, list.NewDefaultDelegate(), c.width-sidebarWidth, c.height-4)
+	l.Title = "Skills"
+	l.SetShowStatusBar(false)
+	l.SetFilteringEnabled(true)
+	c.picker = &l
+	c.pickerKind = pickerSkill
+}
+
 // handlePickerKey routes a key press to whichever in-chat overlay picker is
-// currently open (see openPicker): "enter" selects the highlighted item and
-// dispatches to SetAgent or SetModel depending on pickerKind, "esc" cancels
-// back to the chat screen with no change, and any other key is forwarded to
-// the underlying bubbles/list.Model for navigation/filtering — mirroring
+// currently open (see openPicker/openSkillPicker): "enter" selects the
+// highlighted item — dispatching to SetAgent/SetModel for the ctrl+a/ctrl+o
+// overlays, or displaying the chosen skill's body (showSkill) for the
+// ctrl+s browser, which never mutates the chat — "esc" cancels back to the
+// chat screen with no change, and any other key is forwarded to the
+// underlying bubbles/list.Model for navigation/filtering — mirroring
 // model.go's own screenAgentPicker case, reused here for the chat-scoped
 // overlay instead of a separate top-level screen.
 func (c *chatModel) handlePickerKey(msg tea.KeyMsg, svc *services.AgentService, ctx context.Context) tea.Cmd {
 	if c.picker.FilterState() != list.Filtering {
 		switch msg.String() {
 		case "enter":
-			item, ok := c.picker.SelectedItem().(pickerItem)
 			kind := c.pickerKind
+			if kind == pickerSkill {
+				item, ok := c.picker.SelectedItem().(skillPickerItem)
+				c.picker = nil
+				c.pickerKind = pickerNone
+				if !ok {
+					return nil
+				}
+				c.showSkill(svc, item.name)
+				return nil
+			}
+			if kind == pickerModel {
+				item, ok := c.picker.SelectedItem().(modelPickerItem)
+				c.picker = nil
+				c.pickerKind = pickerNone
+				if !ok {
+					return nil
+				}
+				return c.setModelCmd(svc, ctx, item.name)
+			}
+			item, ok := c.picker.SelectedItem().(pickerItem)
 			c.picker = nil
 			c.pickerKind = pickerNone
 			if !ok {
 				return nil
 			}
-			if kind == pickerAgent {
-				return c.setAgentCmd(svc, ctx, item.name)
-			}
-			return c.setModelCmd(svc, ctx, item.name)
+			return c.setAgentCmd(svc, ctx, item.name)
 		case "esc":
 			c.picker = nil
 			c.pickerKind = pickerNone
@@ -237,6 +332,24 @@ func (c *chatModel) handlePickerKey(msg tea.KeyMsg, svc *services.AgentService, 
 	var cmd tea.Cmd
 	*c.picker, cmd = c.picker.Update(msg)
 	return cmd
+}
+
+// showSkill folds skillName's full Body into the transcript as a
+// system-style informational entry (post-v0.1.0 addendum, Design
+// §3.11/FR19's ctrl+s browser) — the same content the model-facing Skill
+// tool (level 2) returns, shown here directly to the user so they don't
+// need to ask the model to find out what a skill does. GetSkillBody is a
+// pure in-memory map lookup (no I/O), so — like openPicker/openSkillPicker
+// — this runs synchronously rather than round-tripping through a tea.Cmd.
+func (c *chatModel) showSkill(svc *services.AgentService, skillName string) {
+	body, err := svc.GetSkillBody(skillName)
+	if err != nil {
+		c.transcript = append(c.transcript, transcriptEntry{system: true, text: fmt.Sprintf("error: %v", err)})
+		c.refreshViewport()
+		return
+	}
+	c.transcript = append(c.transcript, transcriptEntry{system: true, text: fmt.Sprintf("Skill: %s\n\n%s", skillName, body)})
+	c.refreshViewport()
 }
 
 // handleApprovalKey maps the approval prompt's keybindings (Design §3.6:
@@ -309,6 +422,47 @@ func (c *chatModel) setAgentCmd(svc *services.AgentService, ctx context.Context,
 			return streamErrMsg{err: fmt.Errorf("switching agent: %w", err)}
 		}
 		return agentChangedMsg{agentName: chosen}
+	}
+}
+
+// startNewChatCmd starts a genuinely new chat (ctrl+n, post-v0.1.0
+// addendum) bound to the *same* agent the current chat is using
+// (c.agentName) — if the user also wants a different agent for the new
+// chat, ctrl+a already handles that in-place, the same as for an existing
+// chat; ctrl+n does not force the user back through the top-level agent
+// picker. The new chat's ID is minted with newChatID (model.go), the exact
+// same scheme the top-level picker's own startChatCmd uses, so there is
+// only ever one ID-generation scheme in this codebase.
+//
+// This produces the same chatStartedMsg the top-level picker's
+// startChatCmd does, deliberately: Model.Update's chatStartedMsg case
+// already does exactly the reset ctrl+n needs — it discards the old
+// *chatModel entirely and constructs a brand-new one via newChatModel,
+// which zero-values transcript/streaming/pendingApproval and seeds
+// todos/mode/model fresh from the new (empty) chat's own state. Reusing
+// that message means ctrl+n's "reset" is not a second, hand-rolled reset
+// code path that could drift from what starting a chat from the picker
+// screen already guarantees.
+func (c *chatModel) startNewChatCmd(svc *services.AgentService, ctx context.Context) tea.Cmd {
+	agentName := c.agentName
+	return func() tea.Msg {
+		chatID := newChatID(agentName)
+		if _, err := svc.StartChat(ctx, chatID, agentName); err != nil {
+			return chatStartedMsg{err: fmt.Errorf("starting new chat: %w", err)}
+		}
+		todos, err := svc.GetTodos(ctx, chatID)
+		if err != nil {
+			return chatStartedMsg{err: fmt.Errorf("loading todos: %w", err)}
+		}
+		mode, err := svc.GetMode(ctx, chatID)
+		if err != nil {
+			return chatStartedMsg{err: fmt.Errorf("loading mode: %w", err)}
+		}
+		model, err := svc.GetModel(ctx, chatID)
+		if err != nil {
+			return chatStartedMsg{err: fmt.Errorf("loading model: %w", err)}
+		}
+		return chatStartedMsg{chatID: chatID, agentName: agentName, todos: todos, mode: mode, model: model}
 	}
 }
 
@@ -424,6 +578,9 @@ func (c *chatModel) refreshViewport() {
 }
 
 func renderEntry(e transcriptEntry) string {
+	if e.system {
+		return systemLabelStyle.Render("system") + "\n" + e.text
+	}
 	label := userLabelStyle.Render("you")
 	if e.role == message.RoleAssistant {
 		label = assistantLabelStyle.Render("assistant")
@@ -466,7 +623,9 @@ func (c *chatModel) renderSidebar() string {
 	b.WriteString(modeStyle.Render("Mode: " + c.mode))
 	b.WriteString("\n(ctrl+p to switch)\n")
 	b.WriteString(modeStyle.Render("Model: " + c.model))
-	b.WriteString("\n(ctrl+o to switch)\n\n")
+	b.WriteString("\n(ctrl+o to switch)\n")
+	b.WriteString("(ctrl+s to view skills)\n")
+	b.WriteString("(ctrl+n for new chat)\n\n")
 	b.WriteString("Todos:\n")
 	if len(c.todos) == 0 {
 		b.WriteString("  (none yet)\n")

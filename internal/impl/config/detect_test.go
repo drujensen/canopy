@@ -31,6 +31,7 @@ func fixtureCatalog() *modelsdev.Catalog {
 				"gpt-5": {
 					ID: "gpt-5", ToolCall: true, ReleaseDate: "2025-01-01",
 					Limit: modelsdev.LimitData{Context: 256000},
+					Cost:  modelsdev.CostData{Input: 2.5, Output: 10},
 				},
 				"whisper": {
 					ID: "whisper", ToolCall: false, ReleaseDate: "2026-01-01",
@@ -109,16 +110,33 @@ func TestDetectProviders_NativeTypeMostRecentToolCallModel(t *testing.T) {
 	assert.Equal(t, "OPENAI_API_KEY", provider.APIKeyEnv)
 	assert.Empty(t, provider.APIKey, "must never carry the literal key")
 
-	var model entities.ModelConfig
+	var models []entities.ModelConfig
 	for _, m := range file.Models {
 		if m.Provider == "openai" {
-			model = m
+			models = append(models, m)
 		}
 	}
-	// gpt-5 is the most recent tool-call-capable model (whisper is newer
-	// but not tool-call-capable, and must be skipped).
-	assert.Equal(t, "gpt-5", model.ModelName)
-	assert.Equal(t, 256000, model.ContextWindowTokens)
+	// Every tool-call-capable model is included (not just one — see
+	// pickToolCallModels' doc comment), with the most recent first: gpt-5
+	// is the most recent tool-call-capable model (whisper is newer but not
+	// tool-call-capable, and must be excluded entirely, from anywhere in
+	// the list, not just skipped as the pick).
+	require.NotEmpty(t, models)
+	assert.Equal(t, "gpt-5", models[0].ModelName)
+	assert.Equal(t, 256000, models[0].ContextWindowTokens)
+	assert.Equal(t, 2.5, models[0].InputCostPerMillionTokens, "cost.input from the catalog must carry through to ModelConfig")
+	assert.Equal(t, 10.0, models[0].OutputCostPerMillionTokens, "cost.output from the catalog must carry through to ModelConfig")
+	for _, m := range models {
+		assert.NotEqual(t, "whisper", m.ModelName, "a non-tool-call model must never appear")
+		if m.ModelName == "gpt-4o" {
+			assert.Zero(t, m.InputCostPerMillionTokens, "a model the fixture never gave a Cost must come through as zero, not a zero-value panic or stray value")
+		}
+	}
+	names := make(map[string]bool, len(models))
+	for _, m := range models {
+		names[m.Name] = true
+	}
+	assert.Len(t, names, len(models), "each model's Name must be unique")
 }
 
 func TestDetectProviders_GoogleMapsToGeminiType(t *testing.T) {

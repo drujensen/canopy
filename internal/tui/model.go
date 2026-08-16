@@ -44,6 +44,18 @@ type Model struct {
 	fatalErr error
 }
 
+// newChatID generates a chat ID for a brand-new chat bound to agentName —
+// the one ID-generation scheme Canopy uses, shared by the top-level agent
+// picker's startChatCmd and the in-chat ctrl+n "new chat" keybinding
+// (chatModel.startNewChatCmd, chat.go, post-v0.1.0 addendum) so there is
+// only ever one way chat IDs get minted, not two schemes that could drift
+// apart. Time-based (UnixNano) rather than a random UUID: simple, no new
+// dependency, and collision-proof in practice for a single-process CLI tool
+// creating chats one keypress at a time.
+func newChatID(agentName string) string {
+	return fmt.Sprintf("%s-%d", agentName, time.Now().UnixNano())
+}
+
 // NewModel constructs the picker-screen Model from svc and the agent
 // definitions it was built from (Design §5: "agent picker sourced from
 // agentsource, not a database list"). ctx is used for every AgentService
@@ -194,7 +206,7 @@ func (m Model) startChatCmd(agentName string) tea.Cmd {
 	svc := m.svc
 	ctx := m.ctx
 	return func() tea.Msg {
-		chatID := fmt.Sprintf("%s-%d", agentName, time.Now().UnixNano())
+		chatID := newChatID(agentName)
 		if _, err := svc.StartChat(ctx, chatID, agentName); err != nil {
 			return chatStartedMsg{err: fmt.Errorf("starting chat: %w", err)}
 		}
