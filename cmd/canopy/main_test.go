@@ -7,9 +7,62 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/drujensen/canopy/internal/domain/entities"
+	"github.com/drujensen/canopy/internal/impl/agentsource"
 	"github.com/drujensen/canopy/internal/impl/config"
 	"github.com/drujensen/canopy/internal/impl/modelsdev"
 )
+
+// TestComputeStartAgent_LastUsedStillExists is computeStartAgent's common
+// case (post-v0.1.0 addendum, Design §5's addendum): once at least one
+// prior session picked an agent that's still configured, auto-resume it.
+func TestComputeStartAgent_LastUsedStillExists(t *testing.T) {
+	agents := map[string]agentsource.AgentDefinition{
+		"assistant": {Name: "assistant"},
+		"general":   {Name: "general"},
+	}
+	assert.Equal(t, "assistant", computeStartAgent(agents, "assistant"))
+}
+
+// TestComputeStartAgent_LastUsedRemoved_FallsBackToGeneral covers the
+// explicitly requested fallback: the last-used agent no longer exists, but
+// "general" (agentsource.WriteDefault's own default agent name) does.
+func TestComputeStartAgent_LastUsedRemoved_FallsBackToGeneral(t *testing.T) {
+	agents := map[string]agentsource.AgentDefinition{
+		"general": {Name: "general"},
+	}
+	assert.Equal(t, "general", computeStartAgent(agents, "removed-agent"))
+}
+
+// TestComputeStartAgent_NoLastUsed_FallsBackToGeneral covers a brand-new
+// install with no last_agent.json yet (lastUsed == "") but a "general"
+// agent already configured (agentsource.WriteDefault's zero-config path).
+func TestComputeStartAgent_NoLastUsed_FallsBackToGeneral(t *testing.T) {
+	agents := map[string]agentsource.AgentDefinition{
+		"general": {Name: "general"},
+	}
+	assert.Equal(t, "general", computeStartAgent(agents, ""))
+}
+
+// TestComputeStartAgent_NoMatchAndNoGeneral_FallsBackToPicker is the final
+// fallback: neither the last-used agent nor "general" exist, so there's no
+// sensible single default to guess — computeStartAgent returns "", telling
+// the caller to fall through to showing the picker exactly as before this
+// feature existed.
+func TestComputeStartAgent_NoMatchAndNoGeneral_FallsBackToPicker(t *testing.T) {
+	agents := map[string]agentsource.AgentDefinition{
+		"reviewer": {Name: "reviewer"},
+		"writer":   {Name: "writer"},
+	}
+	assert.Equal(t, "", computeStartAgent(agents, "removed-agent"))
+	assert.Equal(t, "", computeStartAgent(agents, ""))
+}
+
+// TestComputeStartAgent_EmptyAgentsMap covers the (defensive) zero-agents
+// case — must not panic on a nil/empty map.
+func TestComputeStartAgent_EmptyAgentsMap(t *testing.T) {
+	assert.Equal(t, "", computeStartAgent(nil, "assistant"))
+	assert.Equal(t, "", computeStartAgent(map[string]agentsource.AgentDefinition{}, ""))
+}
 
 // TestMergeNewProviders_AdditiveNeverClobbersExisting is the specific test
 // requested for --refresh-providers' contract (Design §4 addendum): a

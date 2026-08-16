@@ -1,6 +1,10 @@
 package tui
 
-import "testing"
+import (
+	"strings"
+	"testing"
+	"time"
+)
 
 // ---------------------------------------------------------------------
 // formatCost
@@ -65,5 +69,42 @@ func TestModelPickerItem_TitleAndFilterValue(t *testing.T) {
 	}
 	if item.FilterValue() != "haiku" {
 		t.Errorf("FilterValue() = %q, want %q", item.FilterValue(), "haiku")
+	}
+}
+
+// ---------------------------------------------------------------------
+// historyPickerItem
+// ---------------------------------------------------------------------
+
+func TestHistoryPickerItem_Title_UsesGeneratedTitleWhenPresent(t *testing.T) {
+	when := time.Date(2026, 3, 5, 14, 30, 0, 0, time.UTC)
+	item := historyPickerItem{chatID: "c1", title: "Debugging the parser", agentName: "assistant", updatedAt: when}
+	if got := item.Title(); got != "Debugging the parser" {
+		t.Errorf("Title() = %q, want %q", got, "Debugging the parser")
+	}
+}
+
+func TestHistoryPickerItem_Title_FallsBackToDateWhenEmpty(t *testing.T) {
+	when := time.Date(2026, 3, 5, 14, 30, 0, 0, time.UTC)
+	item := historyPickerItem{chatID: "c1", title: "", agentName: "assistant", updatedAt: when}
+	got := item.Title()
+	if got == "" {
+		t.Fatal("Title() must fall back to a formatted date, not stay empty")
+	}
+	want := when.Local().Format(historyDateFormat)
+	if got != want {
+		t.Errorf("Title() = %q, want formatted date %q", got, want)
+	}
+}
+
+func TestHistoryPickerItem_Description_AlwaysShowsAgentAndDate(t *testing.T) {
+	when := time.Date(2026, 3, 5, 14, 30, 0, 0, time.UTC)
+	item := historyPickerItem{chatID: "c1", title: "A title", agentName: "reviewer", updatedAt: when}
+	desc := item.Description()
+	if !strings.Contains(desc, "reviewer") {
+		t.Errorf("Description() = %q, want it to contain the agent name", desc)
+	}
+	if !strings.Contains(desc, when.Local().Format(historyDateFormat)) {
+		t.Errorf("Description() = %q, want it to contain the formatted date", desc)
 	}
 }

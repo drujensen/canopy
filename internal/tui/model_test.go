@@ -136,6 +136,26 @@ func TestChatModel_View_LongMultilineError_StaysOneLineAndKeepsSidebarVisible(t 
 	assert.Contains(t, view, "Mode: execute", "the sidebar's mode indicator must still render alongside a long status error")
 }
 
+// TestChatModel_EmptyTranscript_ShowsGreeting_ClearedByFirstMessage asserts
+// the post-v0.1.0 addendum: a brand-new chat's viewport shows a cosmetic
+// greeting instead of dead space, that greeting is never part of
+// transcript (so it can never be sent to the model or persisted), and it's
+// gone the instant a real message exists — proving handleKey's "enter"
+// case's own refreshViewport call already replaces it, no separate
+// "clear the greeting" step needed anywhere.
+func TestChatModel_EmptyTranscript_ShowsGreeting_ClearedByFirstMessage(t *testing.T) {
+	c := newChatModel("chat-1", "assistant", nil, "execute", "m1", 80, 24)
+
+	assert.Contains(t, c.viewport.View(), defaultGreeting, "an empty chat must show the greeting rather than a blank scrollback")
+	assert.Empty(t, c.transcript, "the greeting must never be appended to transcript")
+
+	c.transcript = append(c.transcript, transcriptEntry{role: message.RoleUser, text: "hello"})
+	c.refreshViewport()
+
+	assert.NotContains(t, c.viewport.View(), defaultGreeting, "the greeting must disappear once the transcript has real content")
+	assert.Contains(t, c.viewport.View(), "hello")
+}
+
 // TestChatModel_View_StreamActive_ShowsSpinnerNotComposer asserts the
 // post-v0.1.0 "still working" indicator: while a turn is in flight, View
 // replaces the composer with a spinner + status line (and the esc-to-cancel
@@ -210,7 +230,7 @@ func TestModel_ModeIndicatorReflectsSwitch(t *testing.T) {
 // specifically to avoid reaching in the first place — this asserts the TUI
 // itself is defensive too.
 func TestModel_NoAgentsConfigured_ShowsActionableMessage(t *testing.T) {
-	m := NewModel(context.Background(), nil, nil)
+	m := NewModel(context.Background(), nil, nil, "", "")
 	assert.Contains(t, m.View(), "No agents configured")
 }
 
@@ -223,8 +243,107 @@ func TestNewModel_SortsAgentNames(t *testing.T) {
 		"zeta":  {Name: "zeta", Description: "z"},
 		"alpha": {Name: "alpha", Description: "a"},
 		"mid":   {Name: "mid", Description: "m"},
-	})
+	}, "", "")
 	assert.Equal(t, []string{"alpha", "mid", "zeta"}, m.agentNames)
+}
+
+// TestModel_Init_AutoResumesStartAgent asserts a non-empty startAgent
+// (post-v0.1.0 addendum: cmd/canopy's computeStartAgent) makes Init produce
+// the same Cmd a manual picker selection would — draining it (one Cmd -> one
+// Msg -> Model.Update, the same loop Bubble Tea's real runtime performs)
+// must land on screenChat with a real *chatModel bound to that agent,
+// without the user ever seeing the picker screen.
+func TestModel_Init_AutoResumesStartAgent(t *testing.T) {
+	svc, closeServer := newLeakTestService(t, t.TempDir(), func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(chatCompletionResponse("ok"))
+	})
+	t.Cleanup(closeServer)
+
+	m := NewModel(context.Background(), svc, map[string]agentsource.AgentDefinition{"assistant": {Name: "assistant"}}, "assistant", "")
+	require.Equal(t, screenAgentPicker, m.screen, "Model is still constructed on the picker screen; only Init decides whether it's ever shown")
+
+	cmd := m.Init()
+	require.NotNil(t, cmd, "a non-empty startAgent must produce a Cmd")
+
+	msg := cmd()
+	require.IsType(t, chatStartedMsg{}, msg)
+
+	next, _ := m.Update(msg)
+	m2 := next.(Model)
+	assert.Equal(t, screenChat, m2.screen)
+	require.NotNil(t, m2.chat)
+	assert.Equal(t, "assistant", m2.chat.agentName)
+	assert.Nil(t, m2.fatalErr)
+}
+
+// TestModel_Init_EmptyStartAgent_StaysOnPicker asserts the prior, default
+// behavior (no last-used-agent record, or explicitly no agents configured)
+// is unchanged: Init returns nil and the picker screen is what's shown.
+func TestModel_Init_EmptyStartAgent_StaysOnPicker(t *testing.T) {
+	m := NewModel(context.Background(), nil, map[string]agentsource.AgentDefinition{"assistant": {Name: "assistant"}}, "", "")
+	assert.Nil(t, m.Init())
+	assert.Equal(t, screenAgentPicker, m.screen)
+}
+
+// TestModel_Init_ResumeChatID_TakesPriorityOverStartAgent asserts
+// --continue's resumeChatID (post-v0.1.0 addendum) wins over startAgent
+// when both are somehow set — --continue is an explicit, one-shot request,
+// a stronger signal than the passive last-used-agent default.
+func TestModel_Init_ResumeChatID_TakesPriorityOverStartAgent(t *testing.T) {
+	svc, closeServer := newLeakTestService(t, t.TempDir(), func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(chatCompletionResponse("ok"))
+	})
+	t.Cleanup(closeServer)
+
+	ctx := context.Background()
+	_, err := svc.StartChat(ctx, "existing-chat", "assistant")
+	require.NoError(t, err)
+
+	m := Model{svc: svc, ctx: ctx, screen: screenAgentPicker, startAgent: "assistant", resumeChatID: "existing-chat"}
+	cmd := m.Init()
+	require.NotNil(t, cmd)
+
+	msg := cmd()
+	started, ok := msg.(chatStartedMsg)
+	require.True(t, ok)
+	assert.Equal(t, "existing-chat", started.chatID, "resumeChatID must be used, not startAgent's fresh-chat path")
+}
+
+// ---------------------------------------------------------------------
+// reconstructTranscript (post-v0.1.0 addendum: ctrl+h/--continue)
+// ---------------------------------------------------------------------
+
+func TestReconstructTranscript_IncludesUserAndAssistantText(t *testing.T) {
+	msgs := []*message.Message{
+		{Role: message.RoleUser, Contents: message.Contents{&message.TextContent{Text: "hi"}}},
+		{Role: message.RoleAssistant, Contents: message.Contents{&message.TextContent{Text: "hello there"}}},
+	}
+	entries := reconstructTranscript(msgs)
+	require.Len(t, entries, 2)
+	assert.Equal(t, message.RoleUser, entries[0].role)
+	assert.Equal(t, "hi", entries[0].text)
+	assert.Equal(t, message.RoleAssistant, entries[1].role)
+	assert.Equal(t, "hello there", entries[1].text)
+}
+
+func TestReconstructTranscript_SkipsToolMessagesAndEmptyText(t *testing.T) {
+	msgs := []*message.Message{
+		{Role: message.RoleUser, Contents: message.Contents{&message.TextContent{Text: "read the file"}}},
+		{Role: message.RoleAssistant, Contents: message.Contents{&message.FunctionCallContent{Name: "file_read"}}}, // no text
+		{Role: message.RoleTool, Contents: message.Contents{&message.TextContent{Text: "file contents"}}},
+		nil,
+		{Role: message.RoleAssistant, Contents: message.Contents{&message.TextContent{Text: "here's the summary"}}},
+	}
+	entries := reconstructTranscript(msgs)
+	require.Len(t, entries, 2, "only the two text-bearing user/assistant messages must survive")
+	assert.Equal(t, "read the file", entries[0].text)
+	assert.Equal(t, "here's the summary", entries[1].text)
+}
+
+func TestReconstructTranscript_Empty(t *testing.T) {
+	assert.Empty(t, reconstructTranscript(nil))
 }
 
 // --- real-AgentService integration tests: exercise the actual production
@@ -816,4 +935,205 @@ func TestChatModel_CtrlS_NoopDuringActiveStream(t *testing.T) {
 	cmd := c.handleKey(tea.KeyMsg{Type: tea.KeyCtrlS}, svc, ctx)
 	assert.Nil(t, cmd)
 	assert.Nil(t, c.picker, "ctrl+s must not open the skills browser while a stream is active")
+}
+
+// ---------------------------------------------------------------------
+// ctrl+h history browser (post-v0.1.0 addendum, Design §5's addendum)
+// ---------------------------------------------------------------------
+
+// TestModel_CtrlH_TopLevel_LoadsHistoryAndResumesSelectedChat drives the
+// real ctrl+h path from the top-level agent-picker screen: loadHistoryCmd's
+// real ListChatSummaries call, historyLoadedMsg opening screenHistory, and
+// selecting the one entry resuming it with its prior transcript restored.
+func TestModel_CtrlH_TopLevel_LoadsHistoryAndResumesSelectedChat(t *testing.T) {
+	svc, closeServer := newLeakTestService(t, t.TempDir(), func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(chatCompletionResponse("4"))
+	})
+	t.Cleanup(closeServer)
+
+	ctx := context.Background()
+	_, err := svc.StartChat(ctx, "old-chat", "assistant")
+	require.NoError(t, err)
+	_, err = svc.RunText(ctx, "old-chat", "what is 2+2?")
+	require.NoError(t, err)
+
+	m := NewModel(ctx, svc, map[string]agentsource.AgentDefinition{"assistant": {Name: "assistant"}}, "", "")
+
+	next, loadCmd := m.handleKey(tea.KeyMsg{Type: tea.KeyCtrlH})
+	m = next.(Model)
+	require.NotNil(t, loadCmd)
+	loadedMsg := loadCmd()
+	require.IsType(t, historyLoadedMsg{}, loadedMsg)
+
+	next2, _ := m.Update(loadedMsg)
+	m = next2.(Model)
+	require.Equal(t, screenHistory, m.screen)
+	require.Len(t, m.historyList.Items(), 1)
+
+	next3, resumeCmd := m.handleKey(tea.KeyMsg{Type: tea.KeyEnter})
+	m = next3.(Model)
+	require.NotNil(t, resumeCmd)
+	resumeMsg := resumeCmd()
+	started, ok := resumeMsg.(chatStartedMsg)
+	require.True(t, ok)
+	require.NoError(t, started.err)
+	assert.Equal(t, "old-chat", started.chatID)
+
+	next4, _ := m.Update(resumeMsg)
+	m = next4.(Model)
+	assert.Equal(t, screenChat, m.screen)
+	require.NotNil(t, m.chat)
+	assert.NotEmpty(t, m.chat.transcript, "resuming must reconstruct the prior transcript")
+	assert.True(t, m.chat.titleAttempted, "a resumed chat must never (re)trigger title generation")
+}
+
+// TestChatModel_CtrlH_OpensOverlay_SelectingResumesToDifferentChat is the
+// in-chat counterpart: ctrl+h while already chatting opens the overlay
+// (chatModel.picker/pickerHistory) rather than a top-level screen, and
+// selecting a *different* chat than the one currently open replaces
+// Model.chat entirely (via the same chatStartedMsg path a top-level pick
+// uses).
+func TestChatModel_CtrlH_OpensOverlay_SelectingResumesToDifferentChat(t *testing.T) {
+	svc, closeServer := newLeakTestService(t, t.TempDir(), func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(chatCompletionResponse("ok"))
+	})
+	t.Cleanup(closeServer)
+
+	ctx := context.Background()
+	_, err := svc.StartChat(ctx, "chat-a", "assistant")
+	require.NoError(t, err)
+	_, err = svc.RunText(ctx, "chat-a", "hello from chat a")
+	require.NoError(t, err)
+	_, err = svc.StartChat(ctx, "chat-b", "assistant")
+	require.NoError(t, err)
+
+	c := newChatModel("chat-b", "assistant", nil, "execute", "m1", 80, 24)
+
+	loadCmd := c.handleKey(tea.KeyMsg{Type: tea.KeyCtrlH}, svc, ctx)
+	require.NotNil(t, loadCmd)
+	loadedMsg := loadCmd()
+	require.IsType(t, historyLoadedMsg{}, loadedMsg)
+
+	m := Model{svc: svc, ctx: ctx, screen: screenChat, chat: c}
+	next, _ := m.Update(loadedMsg)
+	m = next.(Model)
+	require.NotNil(t, m.chat.picker)
+	require.Equal(t, pickerHistory, m.chat.pickerKind)
+	require.Len(t, m.chat.picker.Items(), 2)
+
+	// Move to the second entry and select it — deliberately not asserting
+	// which chat ID ends up first (recency-sorted, not hardcoded here);
+	// only that resuming actually switches to a *different* chat than the
+	// one ctrl+h was opened from.
+	m.chat.handleKey(tea.KeyMsg{Type: tea.KeyDown}, svc, ctx)
+	resumeCmd := m.chat.handleKey(tea.KeyMsg{Type: tea.KeyEnter}, svc, ctx)
+	require.NotNil(t, resumeCmd)
+	resumeMsg := resumeCmd()
+	started, ok := resumeMsg.(chatStartedMsg)
+	require.True(t, ok)
+	require.NoError(t, started.err)
+
+	final, _ := m.Update(resumeMsg)
+	m2 := final.(Model)
+	require.NotNil(t, m2.chat)
+	assert.NotEqual(t, "chat-b", m2.chat.chatID, "must have switched to the other chat")
+}
+
+// TestModel_FirstExchangeCompletes_TriggersTitleGeneration is the direct
+// test of Model.Update's streamChunkMsg/streamDoneMsg/streamErrMsg case
+// (post-v0.1.0 addendum): a streamDoneMsg completing a chat's first
+// exchange (transcript going from length 1 to 2) must batch in
+// generateTitleCmd, and running that Cmd must actually persist a title
+// generated from the chat's real messages.
+func TestModel_FirstExchangeCompletes_TriggersTitleGeneration(t *testing.T) {
+	titleServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(chatCompletionResponse("Arithmetic Question"))
+	}))
+	t.Cleanup(titleServer.Close)
+	provider := entities.ProviderConfig{Name: "p", Type: entities.ProviderTypeOpenAI, APIKey: "sk-test", BaseURL: titleServer.URL + "/v1"}
+	model := entities.ModelConfig{Name: "m1", Provider: provider.Name, ModelName: "gpt-test"}
+
+	repo, err := jsonrepo.NewChatRepository(t.TempDir())
+	require.NoError(t, err)
+
+	svc := services.NewAgentService(services.AgentServiceConfig{
+		Definitions: services.Definitions{
+			Agents: map[string]agentsource.AgentDefinition{"assistant": {Name: "assistant"}},
+		},
+		Providers:    []entities.ProviderConfig{provider},
+		Models:       []entities.ModelConfig{model},
+		DefaultModel: model.Name,
+		Repository:   repo,
+	})
+
+	ctx := context.Background()
+	_, err = svc.StartChat(ctx, "chat-1", "assistant")
+	require.NoError(t, err)
+
+	// Seed the persisted chat's Messages directly — GenerateChatTitle reads
+	// from the repository, not from chatModel.transcript, so this stands in
+	// for "a real turn already completed and was persisted" without needing
+	// to drive an actual streaming turn through this test.
+	chat, err := repo.Get(ctx, "chat-1")
+	require.NoError(t, err)
+	chat.Messages = []*message.Message{
+		{Role: message.RoleUser, Contents: message.Contents{&message.TextContent{Text: "what is 6*7?"}}},
+		{Role: message.RoleAssistant, Contents: message.Contents{&message.TextContent{Text: "42"}}},
+	}
+	require.NoError(t, repo.Update(ctx, chat))
+
+	c := newChatModel("chat-1", "assistant", nil, "execute", model.Name, 80, 24)
+	c.transcript = []transcriptEntry{{role: message.RoleUser, text: "what is 6*7?"}}
+	require.False(t, c.titleAttempted)
+
+	m := Model{svc: svc, ctx: ctx, screen: screenChat, chat: c}
+	next, cmd := m.Update(streamDoneMsg{result: &services.RunResult{Response: &agent.Response{}, Mode: "execute"}})
+	m = next.(Model)
+	require.True(t, m.chat.titleAttempted, "titleAttempted must flip the moment the first exchange is detected, not after generation completes")
+	require.NotNil(t, cmd)
+
+	// cmd is tea.Batch(handleStreamMsg's own nil cmd, generateTitleCmd(...)):
+	// with one side nil, tea.Batch collapses to the other Cmd directly
+	// rather than a genuine tea.BatchMsg (compactCmds' own documented
+	// behavior) — handle both shapes so this doesn't depend on that
+	// implementation detail.
+	msg := cmd()
+	if batch, ok := msg.(tea.BatchMsg); ok {
+		for _, sub := range batch {
+			if sub != nil {
+				sub()
+			}
+		}
+	}
+	// Otherwise cmd() already ran generateTitleCmd's own body directly.
+
+	got, err := repo.Get(ctx, "chat-1")
+	require.NoError(t, err)
+	assert.Equal(t, "Arithmetic Question", got.Title)
+}
+
+// TestModel_SecondExchange_DoesNotRetriggerTitleGeneration asserts
+// titleAttempted actually guards against firing on every turn, not just the
+// first — a second streamDoneMsg on the same chatModel must not re-batch
+// generateTitleCmd.
+func TestModel_SecondExchange_DoesNotRetriggerTitleGeneration(t *testing.T) {
+	c := newChatModel("chat-1", "assistant", nil, "execute", "m1", 80, 24)
+	c.titleAttempted = true
+	c.transcript = []transcriptEntry{
+		{role: message.RoleUser, text: "first"},
+		{role: message.RoleAssistant, text: "reply"},
+		{role: message.RoleUser, text: "second"},
+	}
+
+	m := Model{screen: screenChat, chat: c}
+	next, cmd := m.Update(streamDoneMsg{result: &services.RunResult{Response: &agent.Response{}, Mode: "execute"}})
+	m = next.(Model)
+	if cmd != nil {
+		msg := cmd()
+		_, isBatch := msg.(tea.BatchMsg)
+		assert.False(t, isBatch, "a second turn's streamDoneMsg must not batch in generateTitleCmd again")
+	}
 }

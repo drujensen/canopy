@@ -546,6 +546,98 @@ turn's lifecycle.
   before the new turn's own result can arrive — the one point both "next message sent" and "next
   response received" are guaranteed to follow.
 
+Addendum (post-v0.1.0, auto-resume last-used agent): starting Canopy no longer always lands on the
+top-level agent picker. `cmd/canopy`'s `run()` resolves a small per-project state file,
+`last_agent.json` (`impl/config.LoadLastAgent`/`SaveLastAgent`) — a sibling of `providers.json`/
+`models-cache.json`/`chats/` in whatever directory `providerStore.Path()` already resolved to
+(project-local `.canopy/` or global `~/.canopy/`, matching `--global`/`-g`), so this needed no new
+path-resolution scheme. `computeStartAgent(agents, lastUsed)` decides what to do with it: the
+last-used agent if it's still configured; otherwise `"general"` if that's configured
+(`agentsource.WriteDefault`'s own default-agent name, reused here so a brand-new install — no
+`last_agent.json` yet — still starts with zero friction); otherwise `""`, meaning fall through to
+the picker screen exactly as before this feature existed — there's no single sensible agent to
+guess among several unrelated ones. `tui.NewModel` gained a `startAgent string` parameter threaded
+into a new `Model.Init()`: when non-empty, `Init` fires the same `startChatCmd` a manual picker
+selection already produces, so a successful auto-resume reaches `screenChat` via the exact same
+`chatStartedMsg` path (and a failure surfaces via the exact same `fatalErr` display) — no second,
+parallel "start a chat" code path to keep in sync.
+
+Recording which agent was last used is symmetric with reading it: `AgentServiceConfig` gained an
+optional `RecordLastAgent func(agentName string) error` (nil for every pre-existing caller/test — a
+safe no-op), called by both `StartChat` and `SetAgent` on success — the two service-level choke
+points that cover all three UI-level places "which agent is active" can change (the top-level
+picker, ctrl+n, ctrl+a), so `cmd/canopy` only wires one callback rather than hooking three separate
+TUI call sites. Deliberately best-effort: a `RecordLastAgent` failure is logged (`AgentService`'s
+own `Logger`, if set) but never propagated, since forgetting the last-used agent for next time is a
+convenience regression, not a reason to fail an otherwise-successful `StartChat`/`SetAgent` call.
+
+Addendum (post-v0.1.0, chat history browser — ctrl+h/--continue): a chat can now be resumed with
+its full prior transcript, not just started fresh.
+
+- **Listing/reading.** `AgentService.ListChatSummaries` wraps `interfaces.ChatRepository.List`
+  (already existed, previously unused by AgentService's exported surface) into `[]ChatSummary`
+  (ID/Title/AgentName/UpdatedAt), sorted most-recently-updated first — the one place recency
+  ordering is computed, shared by ctrl+h and `--continue`. `AgentService.GetChat` exposes the full
+  `*entities.Chat` (Messages included) — unlike every other accessor (GetTodos/GetMode/GetModel),
+  which deliberately expose one derived value each, resuming needs the raw history too.
+- **Resuming.** `tui.resumeChatCmd` (stream.go) loads a chat's full state (`GetChat`/`GetTodos`/
+  `GetMode`/`GetModel`) and returns the same `chatStartedMsg` a fresh picker selection already
+  produces, with a new `messages []*message.Message` field populated. `Model.Update`'s existing
+  `chatStartedMsg` case reconstructs `transcript` from it (`reconstructTranscript`, chat.go) —
+  only user/assistant messages with non-empty rendered text, deliberately not reconstructing
+  historical tool-call/approval-prompt formatting (a resumed chat mid-tool-call isn't a supported
+  scenario; the pending approval itself doesn't survive a restart either, per §3.9's session-state
+  contract). One function, three callers: `Model.Init` (`--continue`), the top-level `screenHistory`
+  screen, and `chatModel`'s in-chat `pickerHistory` overlay — resuming is identical regardless of
+  entry point. Deliberate scope cut: resuming does *not* call `RecordLastAgent` (no natural
+  "this agent is now active" hook the way `StartChat`/`SetAgent` already have one) — a restart's
+  zero-flag auto-resume (the addendum above) still reflects the last agent *started or switched to*,
+  not merely resumed.
+- **ctrl+h, two entry points.** Unlike ctrl+a/ctrl+o/ctrl+s's overlays (`ListAgents`/
+  `ListModelSummaries`/`ListSkills` — pure in-memory reads, built synchronously inside `handleKey`),
+  `ListChatSummaries` is real disk I/O, so ctrl+h has to go through the normal Cmd/Msg round trip
+  (`loadHistoryCmd` → `historyLoadedMsg`) like starting a turn does. `Model.Update`'s
+  `historyLoadedMsg` case decides which UI it populates based on which screen requested it:
+  `screenAgentPicker` → a new top-level `screenHistory` screen (mirroring `screenAgentPicker`'s own
+  `list.Model` pattern, since `Model` had no overlay concept of its own before this); an active chat
+  → `chatModel`'s existing overlay mechanism, a new `pickerHistory` kind. Both list items are
+  `historyPickerItem` (picker.go): `Title()` returns the generated title, falling back — the
+  explicitly requested behavior — to a formatted date (`historyDateFormat`) when none exists yet or
+  generation failed; `Description()` always shows agent name + date regardless.
+- **Title generation.** `AgentService.GenerateChatTitle` builds a minimal, tool-less `*agent.Agent`
+  via `providers.New` directly (the same lightweight construction `buildSubagentAgent` already
+  uses, skipping `buildTopLevelAgent`/`harness.Build`'s tool/history/compaction wiring a single
+  throwaway completion doesn't need) against the chat's own resolved provider/model, prompts it with
+  the first user message + first assistant reply (`buildTitlePrompt`), and persists the sanitized
+  result (`sanitizeTitle` — trims quotes/whitespace, collapses embedded newlines, caps length) onto
+  `Chat.Title` — deliberately not touching `UpdatedAt`, so generating a title can't skew
+  recency ordering. `Model.Update`'s `streamChunkMsg`/`streamDoneMsg`/`streamErrMsg` case detects a
+  `streamDoneMsg` completing a chat's *first* exchange (`transcript` going from length 1 to 2) and
+  batches in `generateTitleCmd` — fire-and-forget (returns no message; nothing in the UI needs to
+  react to a title landing, since the history browser reads it fresh from disk next time it opens).
+  `chatModel.titleAttempted` guards against ever firing twice for the same chat — set the moment
+  first-exchange completion is detected (not after generation finishes, so a slow/failed generation
+  can't race a second attempt), and already `true` at construction for a resumed chat (`chatStartedMsg`
+  handling), which by definition is past its first exchange. On any failure (no messages yet,
+  provider error, empty/unusable response), `Title` is left untouched and the error is logged
+  (`AgentService`'s own `Logger`) but never surfaced to the user — the history browser's date
+  fallback already covers it.
+- **`--continue`.** Resolved in `cmd/canopy` after `svc` is constructed (unlike `startAgent`, it
+  needs a real `ListChatSummaries` call, not a purely in-memory decision): `summaries[0].ID` if any
+  chats exist, otherwise a non-fatal stderr note and normal startup (the already-resolved
+  `startAgent`, or the picker). `tui.NewModel` gained a `resumeChatID` parameter/field, taking
+  priority over `startAgent` in `Init` — an explicit, one-shot `--continue` is a stronger signal than
+  the passive last-used-agent default.
+
+Addendum (post-v0.1.0, empty-chat greeting): a brand-new (or freshly `ctrl+n`'d) chat's viewport no
+longer starts as dead space. `chatModel.refreshViewport` renders a purely cosmetic
+`defaultGreeting` ("How can I help you today?") whenever there's nothing else to show — no
+`transcript` entries and nothing currently streaming — styled distinctly (`greetingStyle`: faint,
+italic) from a real transcript entry. It is never appended to `transcript` itself, so it's never
+part of what a turn sends to the model and never persisted; the very next `refreshViewport` call
+that has real content (the first user message, via `handleKey`'s `"enter"` case) simply omits it
+rather than needing an explicit "clear the greeting" step anywhere.
+
 Addendum (post-v0.1.0, provider retry/backoff): `impl/providers.maxProviderRetries`
 (`openaicompat.go`) makes retry-on-429 an explicit, uniform choice across all three provider
 families rather than silently inheriting whatever each vendored SDK defaults to. Confirmed directly

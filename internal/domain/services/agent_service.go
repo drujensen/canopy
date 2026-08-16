@@ -223,6 +223,22 @@ type AgentServiceConfig struct {
 	// that merge is meant to happen (see mcpclient.ConnectAll's own doc
 	// comment).
 	MCPTools map[string]tool.Tool
+
+	// RecordLastAgent, when set (post-v0.1.0 addendum), is called with an
+	// agent name every time StartChat or SetAgent successfully makes it the
+	// active agent for some chat — the single choke point covering every
+	// UI-level place "which agent is in use" can change (the top-level
+	// picker, ctrl+n, ctrl+a), so cmd/canopy only needs to wire one callback
+	// rather than hooking three separate TUI call sites. The real
+	// implementation (impl/config.SaveLastAgent) persists it to a small
+	// per-project state file so the next session can auto-resume the same
+	// agent (cmd/canopy reads it back via impl/config.LoadLastAgent before
+	// constructing the TUI's Model). Best-effort: a nil callback (the
+	// default — every existing caller/test) is simply not invoked, and an
+	// error it returns is logged (Logger, if set) rather than propagated —
+	// remembering the last-used agent is a convenience, not something that
+	// should ever fail an otherwise-successful StartChat/SetAgent call.
+	RecordLastAgent func(agentName string) error
 }
 
 // AgentService ties agentsource-loaded agent definitions, provider/model
@@ -237,6 +253,10 @@ type AgentService struct {
 	repository   interfaces.ChatRepository
 	toolsCfg     ToolsConfig
 	logger       *slog.Logger
+
+	// recordLastAgent is AgentServiceConfig.RecordLastAgent, possibly nil
+	// (see that field's doc comment).
+	recordLastAgent func(agentName string) error
 
 	// todoProvider and modeProvider are the single, shared agent/harness/todo
 	// and agent/harness/agentmode instances (Design §3.7/§3.8) used both to
@@ -296,17 +316,18 @@ func NewAgentService(cfg AgentServiceConfig) *AgentService {
 	sort.Strings(mcpToolNames)
 
 	return &AgentService{
-		defs:         cfg.Definitions,
-		providers:    providerIndex,
-		models:       modelIndex,
-		defaultModel: cfg.DefaultModel,
-		repository:   cfg.Repository,
-		toolsCfg:     cfg.Tools,
-		logger:       cfg.Logger,
-		middlewares:  cfg.Middlewares,
-		mcpTools:     mcpTools,
-		mcpToolNames: mcpToolNames,
-		todoProvider: todo.New(nil),
+		defs:            cfg.Definitions,
+		providers:       providerIndex,
+		models:          modelIndex,
+		defaultModel:    cfg.DefaultModel,
+		repository:      cfg.Repository,
+		toolsCfg:        cfg.Tools,
+		logger:          cfg.Logger,
+		recordLastAgent: cfg.RecordLastAgent,
+		middlewares:     cfg.Middlewares,
+		mcpTools:        mcpTools,
+		mcpToolNames:    mcpToolNames,
+		todoProvider:    todo.New(nil),
 		// DefaultMode is "execute", not agentmode's own package default of
 		// "plan" (defaultModes[0]): a brand-new chat should be immediately
 		// able to act, matching Claude Code's default posture — a user opts
@@ -335,7 +356,21 @@ func (s *AgentService) StartChat(ctx context.Context, chatID, agentName string) 
 	if err := s.repository.Create(ctx, chat); err != nil {
 		return nil, fmt.Errorf("agent service: starting chat %q: %w", chatID, err)
 	}
+	s.tryRecordLastAgent(agentName)
 	return chat, nil
+}
+
+// tryRecordLastAgent calls recordLastAgent (AgentServiceConfig.
+// RecordLastAgent, post-v0.1.0 addendum), if set, logging rather than
+// propagating any error — see that field's doc comment for why this must
+// never fail an otherwise-successful StartChat/SetAgent call.
+func (s *AgentService) tryRecordLastAgent(agentName string) {
+	if s.recordLastAgent == nil {
+		return
+	}
+	if err := s.recordLastAgent(agentName); err != nil && s.logger != nil {
+		s.logger.Warn("failed to record last-used agent", "agent", agentName, "error", err)
+	}
 }
 
 // RunResult is AgentService.RunText/RunMessages' return value: the model's
@@ -1019,7 +1054,225 @@ func (s *AgentService) SetAgent(ctx context.Context, chatID, agentName string) e
 	if err := s.repository.Update(ctx, chat); err != nil {
 		return fmt.Errorf("agent service: switching agent for chat %q: %w", chatID, err)
 	}
+	s.tryRecordLastAgent(agentName)
 	return nil
+}
+
+// ChatSummary is one entry in ListChatSummaries' result (post-v0.1.0
+// addendum, Design §5's addendum — the ctrl+h history browser): enough to
+// render a picker row (Title, falling back to a formatted date when empty —
+// tui.historyPickerItem's job, not this type's) and to resume the chat (ID)
+// without needing the full entities.Chat (message history, session state)
+// up front.
+type ChatSummary struct {
+	ID        string
+	Title     string
+	AgentName string
+	UpdatedAt time.Time
+}
+
+// ListChatSummaries returns every persisted chat as a ChatSummary, most
+// recently updated first (post-v0.1.0 addendum) — the ctrl+h history
+// browser's source list, and also what cmd/canopy's --continue flag
+// consults (summaries[0].ID) to find the single most recent chat to resume.
+func (s *AgentService) ListChatSummaries(ctx context.Context) ([]ChatSummary, error) {
+	chats, err := s.repository.List(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("agent service: listing chats: %w", err)
+	}
+	summaries := make([]ChatSummary, 0, len(chats))
+	for _, chat := range chats {
+		summaries = append(summaries, ChatSummary{
+			ID:        chat.ID,
+			Title:     chat.Title,
+			AgentName: chat.AgentName,
+			UpdatedAt: chat.UpdatedAt,
+		})
+	}
+	sort.Slice(summaries, func(i, j int) bool {
+		return summaries[i].UpdatedAt.After(summaries[j].UpdatedAt)
+	})
+	return summaries, nil
+}
+
+// GetChat returns the full persisted entities.Chat for chatID (post-v0.1.0
+// addendum). Unlike every other AgentService accessor (GetTodos/GetMode/
+// GetModel), which deliberately expose one derived piece of state each,
+// this is the one place the TUI needs the raw Messages too: resuming a chat
+// (ctrl+h/--continue, tui.resumeChatCmd) has to reconstruct a transcript
+// from prior history, which no existing accessor returns.
+func (s *AgentService) GetChat(ctx context.Context, chatID string) (*entities.Chat, error) {
+	chat, err := s.repository.Get(ctx, chatID)
+	if err != nil {
+		return nil, fmt.Errorf("agent service: loading chat %q: %w", chatID, err)
+	}
+	return chat, nil
+}
+
+// titleGenerationTextLimit caps how much of each message's text is fed into
+// the title-generation prompt (buildTitlePrompt), so an unusually long
+// first exchange doesn't balloon token usage for what's meant to be a
+// cheap, throwaway call.
+const titleGenerationTextLimit = 2000
+
+// GenerateChatTitle generates a short, human-readable title for chatID from
+// its first exchange (post-v0.1.0 addendum, Design §5's addendum — the
+// ctrl+h history browser), using the same provider/model the chat itself is
+// configured to use (resolveProviderModel, honoring chat.ModelOverride —
+// the generated title's cost/quality tracks whatever the user is actually
+// paying for and using), and persists it onto the chat's Title field. The
+// TUI is expected to call this once, shortly after a chat's first turn
+// completes (chatModel's titleAttempted guard) — but this method itself is
+// idempotent-safe to call again: it always makes a fresh generation call
+// and overwrites whatever Title (if any) is already stored, rather than
+// skipping when one exists.
+//
+// Deliberately not built via buildTopLevelAgent/harness.Build: a title-
+// generation call needs no tools, no ChatHistoryProvider, no compaction/
+// todo/mode wiring — providers.New directly (the same minimal-construction
+// path buildSubagentAgent already uses) is enough, and skips all of that
+// overhead for a single throwaway completion.
+//
+// On any failure — no messages yet, provider error, or an empty/unusable
+// response — no partial state is written (chat.Title is left exactly as it
+// was) and the error is returned for the caller to log; the history
+// browser's own date fallback (services.ChatSummary/tui.historyPickerItem)
+// covers this case, so a title-generation failure is never user-facing as
+// an error.
+func (s *AgentService) GenerateChatTitle(ctx context.Context, chatID string) (string, error) {
+	title, err := s.generateChatTitle(ctx, chatID)
+	if err != nil && s.logger != nil {
+		s.logger.Warn("failed to generate chat title", "chat", chatID, "error", err)
+	}
+	return title, err
+}
+
+func (s *AgentService) generateChatTitle(ctx context.Context, chatID string) (string, error) {
+	chat, err := s.repository.Get(ctx, chatID)
+	if err != nil {
+		return "", fmt.Errorf("agent service: loading chat %q: %w", chatID, err)
+	}
+	def, ok := s.defs.Agents[chat.AgentName]
+	if !ok {
+		return "", fmt.Errorf("agent service: chat %q references unknown agent %q", chatID, chat.AgentName)
+	}
+	provider, model, err := s.resolveProviderModel(def, chat.ModelOverride)
+	if err != nil {
+		return "", err
+	}
+
+	prompt := buildTitlePrompt(chat.Messages)
+	if prompt == "" {
+		return "", fmt.Errorf("agent service: chat %q has no messages to generate a title from yet", chatID)
+	}
+
+	titleAgent, err := providers.New(ctx, provider, model, agent.Config{Name: "canopy-title-generator", Logger: s.logger})
+	if err != nil {
+		return "", fmt.Errorf("agent service: building title-generation agent for chat %q: %w", chatID, err)
+	}
+	resp, err := titleAgent.RunText(ctx, prompt).Collect()
+	if err != nil {
+		return "", fmt.Errorf("agent service: generating title for chat %q: %w", chatID, err)
+	}
+
+	title := sanitizeTitle(resp.String())
+	if title == "" {
+		return "", fmt.Errorf("agent service: model returned an empty title for chat %q", chatID)
+	}
+
+	// Reload rather than reusing chat from the top of this function, same
+	// reasoning as persistSession: apply the Title write on top of whatever
+	// the actual turn (which may well have completed after this function
+	// started resolving the title, in a real caller) has since persisted,
+	// rather than clobbering it with a stale in-memory copy. UpdatedAt is
+	// deliberately left untouched — generating a title is not user
+	// activity, and touching it here would skew --continue/ctrl+h's
+	// "most recently updated" ordering by however long generation took.
+	fresh, err := s.repository.Get(ctx, chatID)
+	if err != nil {
+		return "", fmt.Errorf("agent service: reloading chat %q to persist its title: %w", chatID, err)
+	}
+	fresh.Title = title
+	if err := s.repository.Update(ctx, fresh); err != nil {
+		return "", fmt.Errorf("agent service: persisting title for chat %q: %w", chatID, err)
+	}
+	return title, nil
+}
+
+// buildTitlePrompt builds GenerateChatTitle's prompt from messages' first
+// user message and first assistant reply (each independently — a message
+// list can interleave tool-call/tool-result messages with no usable text in
+// between, so this doesn't assume the first two messages are the pair).
+// Returns "" when there's no user message with any text yet (nothing to
+// title), the one condition GenerateChatTitle treats as a real error rather
+// than attempting a call.
+func buildTitlePrompt(messages []*message.Message) string {
+	var userText, assistantText string
+	for _, m := range messages {
+		if m == nil {
+			continue
+		}
+		text := strings.TrimSpace(m.String())
+		if text == "" {
+			continue
+		}
+		switch m.Role {
+		case message.RoleUser:
+			if userText == "" {
+				userText = truncateForTitlePrompt(text)
+			}
+		case message.RoleAssistant:
+			if assistantText == "" {
+				assistantText = truncateForTitlePrompt(text)
+			}
+		}
+		if userText != "" && assistantText != "" {
+			break
+		}
+	}
+	if userText == "" {
+		return ""
+	}
+
+	var b strings.Builder
+	b.WriteString("Generate a short, plain-text title (4-6 words, no quotes, no trailing punctuation) summarizing what this conversation is about. Reply with ONLY the title, nothing else.\n\n")
+	b.WriteString("User: " + userText + "\n")
+	if assistantText != "" {
+		b.WriteString("Assistant: " + assistantText + "\n")
+	}
+	return b.String()
+}
+
+// truncateForTitlePrompt caps s at titleGenerationTextLimit runes.
+func truncateForTitlePrompt(s string) string {
+	r := []rune(s)
+	if len(r) <= titleGenerationTextLimit {
+		return s
+	}
+	return string(r[:titleGenerationTextLimit]) + "…"
+}
+
+// maxGeneratedTitleLen bounds a generated title's length as a safety net
+// against a model ignoring buildTitlePrompt's "4-6 words" instruction —
+// truncated, not rejected, since a too-long-but-otherwise-good title is
+// still far more useful in the history browser than falling back to a bare
+// date.
+const maxGeneratedTitleLen = 80
+
+// sanitizeTitle cleans a raw model response into a display-ready title:
+// trims whitespace and any wrapping quote characters a model might add
+// despite being asked not to, collapses embedded newlines/repeated
+// whitespace into single spaces (a picker row is one line), and caps
+// length. Returns "" if nothing usable remains, which GenerateChatTitle
+// treats as a failure.
+func sanitizeTitle(s string) string {
+	s = strings.TrimSpace(s)
+	s = strings.Trim(s, "\"'“”‘’")
+	s = strings.Join(strings.Fields(s), " ")
+	if r := []rune(s); len(r) > maxGeneratedTitleLen {
+		s = string(r[:maxGeneratedTitleLen])
+	}
+	return s
 }
 
 // loadChatSession loads chatID's persisted chat and deserializes its

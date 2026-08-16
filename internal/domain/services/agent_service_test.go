@@ -3,6 +3,7 @@ package services
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -115,6 +116,61 @@ func TestAgentService_RunText_RoundTrip(t *testing.T) {
 	stored2, err := repo.Get(ctx, "chat-1")
 	require.NoError(t, err)
 	assert.Len(t, stored2.Messages, 4)
+}
+
+// TestAgentService_StartChat_RecordsLastAgent asserts StartChat calls
+// AgentServiceConfig.RecordLastAgent (post-v0.1.0 addendum, Design §5's
+// addendum) with the started chat's agent name, on success.
+func TestAgentService_StartChat_RecordsLastAgent(t *testing.T) {
+	repo, err := jsonrepo.NewChatRepository(t.TempDir())
+	require.NoError(t, err)
+
+	var recorded []string
+	svc := NewAgentService(AgentServiceConfig{
+		Definitions: Definitions{Agents: map[string]agentsource.AgentDefinition{"assistant": {Name: "assistant"}}},
+		Repository:  repo,
+		RecordLastAgent: func(name string) error {
+			recorded = append(recorded, name)
+			return nil
+		},
+	})
+
+	_, err = svc.StartChat(context.Background(), "chat-1", "assistant")
+	require.NoError(t, err)
+	assert.Equal(t, []string{"assistant"}, recorded)
+}
+
+// TestAgentService_StartChat_NilRecordLastAgent_NoPanic asserts the default
+// (every AgentServiceConfig that predates this feature, and every other
+// existing test) — no RecordLastAgent set at all — is a safe no-op, not a
+// nil-func-call panic.
+func TestAgentService_StartChat_NilRecordLastAgent_NoPanic(t *testing.T) {
+	repo, err := jsonrepo.NewChatRepository(t.TempDir())
+	require.NoError(t, err)
+	svc := NewAgentService(AgentServiceConfig{
+		Definitions: Definitions{Agents: map[string]agentsource.AgentDefinition{"assistant": {Name: "assistant"}}},
+		Repository:  repo,
+	})
+
+	_, err = svc.StartChat(context.Background(), "chat-1", "assistant")
+	require.NoError(t, err)
+}
+
+// TestAgentService_StartChat_RecordLastAgentError_DoesNotFailStartChat
+// asserts remembering the last-used agent is genuinely best-effort (see
+// RecordLastAgent's doc comment): a failure writing that state must never
+// fail an otherwise-successful StartChat call.
+func TestAgentService_StartChat_RecordLastAgentError_DoesNotFailStartChat(t *testing.T) {
+	repo, err := jsonrepo.NewChatRepository(t.TempDir())
+	require.NoError(t, err)
+	svc := NewAgentService(AgentServiceConfig{
+		Definitions:     Definitions{Agents: map[string]agentsource.AgentDefinition{"assistant": {Name: "assistant"}}},
+		Repository:      repo,
+		RecordLastAgent: func(name string) error { return errors.New("disk full") },
+	})
+
+	_, err = svc.StartChat(context.Background(), "chat-1", "assistant")
+	require.NoError(t, err, "a RecordLastAgent failure must not fail StartChat")
 }
 
 // TestAgentService_StartChat_UnknownAgent asserts a clear error rather than

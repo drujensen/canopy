@@ -2,6 +2,7 @@ package tui
 
 import (
 	"fmt"
+	"time"
 
 	"github.com/charmbracelet/bubbles/list"
 )
@@ -100,3 +101,44 @@ func newPickerList(names []string, title string, width, height int) list.Model {
 	l.SetFilteringEnabled(true)
 	return l
 }
+
+// historyPickerItem adapts a services.ChatSummary to bubbles/list's Item
+// interfaces for ctrl+h's history browser (post-v0.1.0 addendum, Design
+// §5's addendum) — both the top-level screenHistory screen and the in-chat
+// overlay (chatModel's pickerHistory) share this one item type. Kept as
+// plain fields rather than importing domain/services.ChatSummary here, the
+// same reasoning skillPickerItem's own doc comment gives.
+type historyPickerItem struct {
+	chatID    string
+	title     string
+	agentName string
+	updatedAt time.Time
+}
+
+// historyDateFormat is used both for a title-less entry's Title() fallback
+// and for every entry's Description() — deliberately including both date
+// and time (not just the date) since two sessions on the same day are
+// common and would otherwise be indistinguishable in the picker.
+const historyDateFormat = "Jan 2, 2006 3:04 PM"
+
+// Title returns the generated title, or — the explicitly requested
+// fallback (post-v0.1.0 addendum) — a formatted date when none exists yet
+// (the chat's first turn hasn't completed) or generation failed
+// (AgentService.GenerateChatTitle's doc comment).
+func (i historyPickerItem) Title() string {
+	if i.title != "" {
+		return i.title
+	}
+	return i.updatedAt.Local().Format(historyDateFormat)
+}
+
+// Description always shows the agent name and date/time together — even
+// when Title() is already falling back to a date, Description adds the
+// agent name Title() alone can't carry, and when Title() is a real
+// generated title, Description is what actually surfaces the date/agent a
+// user picking between sessions needs.
+func (i historyPickerItem) Description() string {
+	return fmt.Sprintf("%s · %s", i.agentName, i.updatedAt.Local().Format(historyDateFormat))
+}
+
+func (i historyPickerItem) FilterValue() string { return i.title + " " + i.agentName }

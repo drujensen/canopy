@@ -29,5 +29,10 @@ var (
 
 	errorStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("1")).Bold(true)
 
+	// greetingStyle renders the empty-transcript placeholder (post-v0.1.0
+	// addendum: chatModel.refreshViewport's defaultGreeting) — dim/italic so
+	// it visually reads as decoration, not a real system/assistant message.
+	greetingStyle = lipgloss.NewStyle().Faint(true).Italic(true)
+
 	todoDoneStyle = lipgloss.NewStyle().Strikethrough(true).Foreground(lipgloss.Color("8"))
 )

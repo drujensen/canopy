@@ -56,4 +56,13 @@ type Chat struct {
 
 	CreatedAt time.Time `json:"created_at"`
 	UpdatedAt time.Time `json:"updated_at"`
+
+	// Title is a short, human-readable summary of this chat (post-v0.1.0
+	// addendum, Design §5's addendum — the ctrl+h history browser), set by
+	// AgentService.GenerateChatTitle from the chat's first exchange. Empty
+	// means no title has been generated yet (a chat's very first turn
+	// hasn't completed) or generation failed — the history browser falls
+	// back to a formatted date in either case (services.ChatSummary/
+	// tui.historyPickerItem), never a blank/placeholder title.
+	Title string `json:"title,omitempty"`
 }

@@ -63,6 +63,7 @@ func run() error {
 		showVersion      bool
 		enableOTel       bool
 		refreshProviders bool
+		continueLatest   bool
 	)
 	flag.BoolVar(&global, "global", false, "use ~/.canopy config/storage instead of a project-local .canopy directory")
 	flag.BoolVar(&global, "g", false, "shorthand for --global")
@@ -70,6 +71,7 @@ func run() error {
 	flag.BoolVar(&showVersion, "version", false, "print the version and exit")
 	flag.BoolVar(&enableOTel, "otel", false, "enable optional OpenTelemetry tracing (Design §3.10); also enabled implicitly when OTEL_EXPORTER_OTLP_ENDPOINT or OTEL_EXPORTER_OTLP_TRACES_ENDPOINT is set")
 	flag.BoolVar(&refreshProviders, "refresh-providers", false, "force a live re-fetch of the models.dev catalog, add any newly-detectable providers/models to providers.json, and refresh cost data on existing models (every other field of an existing entry is left untouched — Design §4 addendum)")
+	flag.BoolVar(&continueLatest, "continue", false, "resume the most recently updated chat session (across any agent) instead of starting a new one or auto-resuming the last-used agent — Design §5 addendum")
 	flag.Parse()
 
 	if showVersion {
@@ -143,6 +145,20 @@ func run() error {
 	// fourth path-resolution scheme on top of --global/-g.
 	modelsCachePath := filepath.Join(filepath.Dir(providerStore.Path()), "models-cache.json")
 	detectCtx := context.Background()
+
+	// Auto-resume the last-used agent (post-v0.1.0 addendum, Design §5's
+	// addendum): last_agent.json lives alongside providers.json/
+	// models-cache.json/chats/, the same directory convention every other
+	// per-project state file already follows. Reading it is best-effort —
+	// a failure (permissions, corrupt file) falls through to the normal
+	// picker-screen startup rather than being a hard error, since this is
+	// purely a startup-convenience feature.
+	lastAgentPath := filepath.Join(filepath.Dir(providerStore.Path()), "last_agent.json")
+	lastUsedAgent, err := config.LoadLastAgent(lastAgentPath)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "canopy: warning: couldn't read last-used agent:", err)
+	}
+	startAgent := computeStartAgent(agents, lastUsedAgent)
 
 	// Explicit refresh (post-v0.1.0 addendum, Design §4 addendum):
 	// --refresh-providers forces a live re-fetch (bypasses the
@@ -397,9 +413,33 @@ func run() error {
 		},
 		Logger:      slogLogger,
 		Middlewares: middlewares,
+		RecordLastAgent: func(agentName string) error {
+			return config.SaveLastAgent(lastAgentPath, agentName)
+		},
 	})
 
-	program := tea.NewProgram(tui.NewModel(ctx, svc, agents), tea.WithAltScreen())
+	// --continue (post-v0.1.0 addendum, Design §5 addendum): resolved after
+	// svc exists, unlike startAgent, since it needs a real AgentService
+	// call (ListChatSummaries — disk I/O reading every persisted chat) that
+	// computeStartAgent's purely in-memory decision never required. Takes
+	// priority over startAgent in tui.Model.Init — see that field's own doc
+	// comment. A failure or an empty history is non-fatal: --continue with
+	// nothing to resume just falls through to normal startup (the
+	// already-resolved startAgent, or the picker).
+	var resumeChatID string
+	if continueLatest {
+		summaries, err := svc.ListChatSummaries(ctx)
+		switch {
+		case err != nil:
+			fmt.Fprintln(os.Stderr, "canopy: warning: couldn't list chat history for --continue:", err)
+		case len(summaries) == 0:
+			fmt.Fprintln(os.Stderr, "canopy: --continue: no previous chat sessions found; starting a new chat")
+		default:
+			resumeChatID = summaries[0].ID
+		}
+	}
+
+	program := tea.NewProgram(tui.NewModel(ctx, svc, agents, startAgent, resumeChatID), tea.WithAltScreen())
 	if _, err := program.Run(); err != nil {
 		return fmt.Errorf("running the TUI: %w", err)
 	}
@@ -408,9 +448,37 @@ func run() error {
 
 // mergeNewProviders adds any provider (and its paired model, matched via
 // ModelConfig.Provider) from detected that isn't already present in dst,
-// matched by ProviderConfig.Name — --refresh-providers' "additive, never
-// clobbers an existing entry" contract (Design §4 addendum). Returns the
-// names of providers actually added, for logging.
+// computeStartAgent decides which agent (if any) this run should
+// auto-resume into (post-v0.1.0 addendum, Design §5's addendum), rather
+// than always showing the top-level agent picker:
+//
+//  1. lastUsed, if it still names an entry in agents — the common case
+//     once at least one prior session has picked an agent.
+//  2. Otherwise "general", if that's a configured agent — matching
+//     agentsource.WriteDefault's own choice of default agent name, so a
+//     brand-new install (which has no last-used record yet) still starts
+//     with zero friction rather than a picker showing a single obvious
+//     choice.
+//  3. Otherwise "" — no sensible single default to guess (lastUsed was
+//     never set, or named an agent that's since been removed, and there's
+//     no "general" agent either), so the caller falls through to showing
+//     the picker exactly as before this feature existed.
+func computeStartAgent(agents map[string]agentsource.AgentDefinition, lastUsed string) string {
+	if lastUsed != "" {
+		if _, ok := agents[lastUsed]; ok {
+			return lastUsed
+		}
+	}
+	if _, ok := agents["general"]; ok {
+		return "general"
+	}
+	return ""
+}
+
+// mergeNewProviders adds any provider (and its paired model, matched via
+// ProviderConfig.Name — --refresh-providers' "additive, never clobbers an
+// existing entry" contract (Design §4 addendum). Returns the names of
+// providers actually added, for logging.
 func mergeNewProviders(dst *config.ProvidersFile, detected config.ProvidersFile) []string {
 	existing := make(map[string]bool, len(dst.Providers))
 	for _, p := range dst.Providers {

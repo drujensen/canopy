@@ -559,6 +559,38 @@ func TestAgentService_SetAgent_RejectsUnknownAgent(t *testing.T) {
 	assert.Equal(t, "assistant", chat.AgentName, "a rejected SetAgent call must not have mutated the chat's bound agent")
 }
 
+// TestAgentService_SetAgent_RecordsLastAgent asserts SetAgent, like
+// StartChat, calls RecordLastAgent (post-v0.1.0 addendum) with the newly
+// active agent's name — so a mid-session ctrl+a switch is remembered for
+// the next session too, not just the agent a chat was originally started
+// with.
+func TestAgentService_SetAgent_RecordsLastAgent(t *testing.T) {
+	repo, err := jsonrepo.NewChatRepository(t.TempDir())
+	require.NoError(t, err)
+
+	var recorded []string
+	svc := NewAgentService(AgentServiceConfig{
+		Definitions: Definitions{
+			Agents: map[string]agentsource.AgentDefinition{
+				"assistant": {Name: "assistant"},
+				"reviewer":  {Name: "reviewer"},
+			},
+		},
+		Repository: repo,
+		RecordLastAgent: func(name string) error {
+			recorded = append(recorded, name)
+			return nil
+		},
+	})
+
+	ctx := context.Background()
+	_, err = svc.StartChat(ctx, "chat-1", "assistant")
+	require.NoError(t, err)
+	require.NoError(t, svc.SetAgent(ctx, "chat-1", "reviewer"))
+
+	assert.Equal(t, []string{"assistant", "reviewer"}, recorded, "both StartChat and SetAgent must record")
+}
+
 // TestAgentService_SetAgent_SwitchesAgentKeepsHistory is the coordinator's
 // explicit correction to the ctrl+a design: switching a chat's agent must
 // behave symmetrically with SetModel — same chat ID, same persisted

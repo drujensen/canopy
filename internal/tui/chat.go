@@ -33,6 +33,14 @@ const (
 	// an entry never calls an AgentService mutator; it shows the skill's real
 	// Body in the transcript instead (see chatModel.showSkill).
 	pickerSkill
+	// pickerHistory identifies the ctrl+h chat-history browser (post-v0.1.0
+	// addendum, Design §5's addendum) — unlike every other picker here,
+	// selecting an entry doesn't mutate *this* chat at all; it resumes a
+	// *different* one entirely (resumeChatCmd, stream.go), which
+	// Model.Update's existing chatStartedMsg case handles by replacing
+	// m.chat outright, the same as picking an agent from the top-level
+	// screen does.
+	pickerHistory
 )
 
 // transcriptEntry is one finished message rendered in the chat transcript —
@@ -85,6 +93,16 @@ type chatModel struct {
 	// case (model.go), which only keeps re-arming the tick while
 	// streamActive stays true.
 	spinner spinner.Model
+
+	// titleAttempted guards generateTitleCmd (post-v0.1.0 addendum: ctrl+h
+	// history browser) from firing more than once per chatModel instance —
+	// only the completion of this chat's *first* exchange should attempt
+	// title generation, whether it succeeds or fails (see
+	// AgentService.GenerateChatTitle's doc comment on why a failure is
+	// never retried automatically). A resumed chat (ctrl+h/--continue)
+	// starts with this already true when it already has a Title, via
+	// newChatModel's caller — see Model.Update's chatStartedMsg case.
+	titleAttempted bool
 
 	composer textinput.Model
 	viewport viewport.Model
@@ -218,6 +236,16 @@ func (c *chatModel) handleKey(msg tea.KeyMsg, svc *services.AgentService, ctx co
 		}
 		c.openSkillPicker(svc)
 		return nil
+	case "ctrl+h":
+		// Same guard as the other overlays, post-v0.1.0 addendum. Unlike
+		// them, this can't populate c.picker synchronously (loadHistoryCmd's
+		// doc comment explains why — real disk I/O) — Model.Update's
+		// historyLoadedMsg case is what actually opens the overlay, once
+		// this Cmd's result comes back.
+		if c.streamActive {
+			return nil
+		}
+		return loadHistoryCmd(svc, ctx)
 	case "ctrl+n":
 		// Guarded the same way ctrl+a/ctrl+o/enter are: starting a new chat
 		// must not silently abandon a turn that's actively streaming. A
@@ -349,6 +377,15 @@ func (c *chatModel) handlePickerKey(msg tea.KeyMsg, svc *services.AgentService, 
 					return nil
 				}
 				return c.setModelCmd(svc, ctx, item.name)
+			}
+			if kind == pickerHistory {
+				item, ok := c.picker.SelectedItem().(historyPickerItem)
+				c.picker = nil
+				c.pickerKind = pickerNone
+				if !ok {
+					return nil
+				}
+				return resumeChatCmd(svc, ctx, item.chatID)
 			}
 			item, ok := c.picker.SelectedItem().(pickerItem)
 			c.picker = nil
@@ -676,8 +713,60 @@ func (c *chatModel) refreshViewport() {
 	if c.streaming.Len() > 0 {
 		b.WriteString(renderEntry(transcriptEntry{role: message.RoleAssistant, text: c.streaming.String()}))
 	}
+	if b.Len() == 0 {
+		// A brand-new (or freshly ctrl+n'd) chat has nothing in transcript
+		// and nothing streaming yet — rather than an empty scrollback,
+		// render a purely cosmetic greeting to avoid dead space. This is
+		// never appended to c.transcript, so it's never part of what a turn
+		// sends to the model or what gets persisted — it exists only in
+		// this one rendered frame, and the very next refreshViewport call
+		// that has real content (the first user message, via handleKey's
+		// "enter" case) replaces it outright rather than needing to be
+		// explicitly cleared anywhere.
+		b.WriteString(greetingStyle.Render(defaultGreeting))
+	}
 	c.viewport.SetContent(b.String())
 	c.viewport.GotoBottom()
+}
+
+// defaultGreeting is the placeholder shown in place of an empty transcript
+// (refreshViewport) — purely cosmetic, never part of chat history.
+const defaultGreeting = "How can I help you today?"
+
+// reconstructTranscript converts a resumed chat's persisted
+// []*message.Message (post-v0.1.0 addendum: ctrl+h/--continue,
+// resumeChatCmd) into displayable transcriptEntry values, so Model.Update's
+// chatStartedMsg case can seed a resumed *chatModel's transcript the same
+// way a live session builds it up turn by turn.
+//
+// Only user/assistant messages with non-empty rendered text are included —
+// deliberately mirroring what a *live* session's transcript ever contains
+// in the first place: applyUpdate only ever appends TextContent to
+// c.streaming (folded into a transcriptEntry by finishStreaming), never a
+// raw tool-result or empty tool-call-only message. A Tool-role result
+// message, or a message whose only content is a function call with no
+// accompanying text, is skipped rather than rendered as a confusing empty
+// entry. This is a known, deliberate simplification: full historical
+// tool-call/approval-prompt formatting isn't reconstructed on resume, only
+// the conversational text — resuming a chat mid-tool-call is not a
+// supported scenario (the pending approval itself doesn't survive a
+// restart either, per Design §3.9's session-state contract).
+func reconstructTranscript(messages []*message.Message) []transcriptEntry {
+	entries := make([]transcriptEntry, 0, len(messages))
+	for _, m := range messages {
+		if m == nil {
+			continue
+		}
+		if m.Role != message.RoleUser && m.Role != message.RoleAssistant {
+			continue
+		}
+		text := strings.TrimSpace(m.String())
+		if text == "" {
+			continue
+		}
+		entries = append(entries, transcriptEntry{role: m.Role, text: text})
+	}
+	return entries
 }
 
 func renderEntry(e transcriptEntry) string {
@@ -735,6 +824,7 @@ func (c *chatModel) renderSidebar() string {
 	b.WriteString(modeStyle.Render("Model: " + c.model))
 	b.WriteString("\n(ctrl+o to switch)\n")
 	b.WriteString("(ctrl+s to view skills)\n")
+	b.WriteString("(ctrl+h for history)\n")
 	b.WriteString("(ctrl+n for new chat)\n\n")
 	b.WriteString("Todos:\n")
 	if len(c.todos) == 0 {
