@@ -165,7 +165,8 @@ also no longer closed: `impl/providers.New` now routes *any* unrecognized provid
 generic OpenAI-compatible adapter as long as a base URL is configured, not just the 6 named types —
 "support any provider," not just Canopy's original 9. A `--refresh-providers` flag forces a live
 re-check and additively appends any newly-detectable provider without touching what's already
-configured.
+configured — except per-model cost (see DESIGN.md §4's addendum), which is refreshed on existing
+models too, since it's catalog metadata rather than connection config a user would hand-edit.
 
 Addendum (post-v0.1.0): FR19's progressive disclosure — specified above from the start but never
 actually implemented until now (no `Skill` tool existed, and `Definitions.Skills` was loaded but

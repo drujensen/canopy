@@ -69,7 +69,7 @@ func run() error {
 	flag.StringVar(&storage, "storage", "file", `storage backend; "file" is the only supported value in v1 (Requirements FR15)`)
 	flag.BoolVar(&showVersion, "version", false, "print the version and exit")
 	flag.BoolVar(&enableOTel, "otel", false, "enable optional OpenTelemetry tracing (Design §3.10); also enabled implicitly when OTEL_EXPORTER_OTLP_ENDPOINT or OTEL_EXPORTER_OTLP_TRACES_ENDPOINT is set")
-	flag.BoolVar(&refreshProviders, "refresh-providers", false, "force a live re-fetch of the models.dev catalog and add any newly-detectable providers/models to providers.json (existing entries are never touched — Design §4 addendum)")
+	flag.BoolVar(&refreshProviders, "refresh-providers", false, "force a live re-fetch of the models.dev catalog, add any newly-detectable providers/models to providers.json, and refresh cost data on existing models (every other field of an existing entry is left untouched — Design §4 addendum)")
 	flag.Parse()
 
 	if showVersion {
@@ -153,6 +153,13 @@ func run() error {
 	// for it changed, since the user may have hand-edited it. This is the
 	// escape hatch for "I added a new API key to my environment after first
 	// run and want Canopy to notice without hand-editing JSON."
+	//
+	// The one deliberate exception to "never touched" is per-model cost
+	// (updateExistingModelCosts): every existing model, even one whose
+	// provider was already configured and so skipped entirely by
+	// mergeNewProviders, gets its cost fields refreshed from the live
+	// catalog. See that function's doc comment for why cost specifically is
+	// safe to keep fresh where every other field on an existing entry isn't.
 	if refreshProviders {
 		catalog, _, err := modelsdev.FetchCached(detectCtx, modelsCachePath, 0)
 		if err != nil {
@@ -171,21 +178,32 @@ func run() error {
 			return fmt.Errorf("re-reading provider config for --refresh-providers: %w", err)
 		}
 		added := mergeNewProviders(raw, detectedFile)
-		if len(added) > 0 {
+		updatedCosts := updateExistingModelCosts(raw, detectedFile)
+
+		if len(added) > 0 || updatedCosts > 0 {
 			if err := providerStore.Save(raw); err != nil {
 				return fmt.Errorf("saving refreshed provider config: %w", err)
 			}
 			// Reload (resolved) so this run's AgentService picks up the
-			// newly-added provider(s) immediately, no restart needed — same
-			// as the zero-config first-run path below.
+			// newly-added provider(s)/refreshed cost immediately, no restart
+			// needed — same as the zero-config first-run path below.
 			providersFile, err = providerStore.Load()
 			if err != nil {
 				return fmt.Errorf("reloading provider config after refresh: %w", err)
 			}
+		}
+		switch {
+		case len(added) > 0 && updatedCosts > 0:
+			fmt.Fprintf(os.Stderr, "canopy: --refresh-providers added %d new provider(s) to %s:\n  %s\ncanopy: --refresh-providers also refreshed cost data for %d existing model(s)\n",
+				len(added), providerStore.Path(), strings.Join(describeProviders(providersFile.Providers, added), "\n  "), updatedCosts)
+		case len(added) > 0:
 			fmt.Fprintf(os.Stderr, "canopy: --refresh-providers added %d new provider(s) to %s:\n  %s\n",
 				len(added), providerStore.Path(), strings.Join(describeProviders(providersFile.Providers, added), "\n  "))
-		} else {
-			fmt.Fprintln(os.Stderr, "canopy: --refresh-providers found no new providers to add (already configured, or no new provider env vars set)")
+		case updatedCosts > 0:
+			fmt.Fprintf(os.Stderr, "canopy: --refresh-providers found no new providers, but refreshed cost data for %d existing model(s) in %s\n",
+				updatedCosts, providerStore.Path())
+		default:
+			fmt.Fprintln(os.Stderr, "canopy: --refresh-providers found no new providers or cost changes (already up to date, or no new provider env vars set)")
 		}
 	}
 
@@ -413,6 +431,57 @@ func mergeNewProviders(dst *config.ProvidersFile, detected config.ProvidersFile)
 		added = append(added, p.Name)
 	}
 	return added
+}
+
+// modelKey identifies a model independent of its user-chosen
+// entities.ModelConfig.Name (which mergeNewProviders/updateExistingModelCosts
+// must never require agreement on — a user is free to rename a model entry
+// after Canopy first wrote it) — (Provider, ModelName) is the pair that
+// actually ties a dst.Models entry back to one specific models.dev catalog
+// model.
+type modelKey struct{ provider, modelName string }
+
+// updateExistingModelCosts refreshes InputCostPerMillionTokens/
+// OutputCostPerMillionTokens on every dst.Models entry whose (Provider,
+// ModelName) matches a model in freshly re-detected catalog data — including
+// one whose provider was already configured and so mergeNewProviders skipped
+// it entirely as "not new" (this is deliberately the one exception to
+// mergeNewProviders' "an already-present entry is never touched" guarantee:
+// see that function's own doc comment and Design §4's addendum). Cost is
+// catalog metadata a user has no real reason to hand-edit away from whatever
+// the provider actually charges — unlike BaseURL, APIKey, or ModelName
+// itself, which stay sacrosanct on an existing entry — so keeping it fresh
+// on --refresh-providers is safe where touching any other field wouldn't be.
+//
+// A dst model with no match in detected.Models (a self-hosted model like
+// Ollama's, which models.dev has no pricing for at all, or simply a provider
+// that isn't currently detectable — its env var unset) is left completely
+// untouched, cost included: this only ever refreshes toward fresher catalog
+// data Canopy actually has in hand, never clears a value to zero for absence
+// of new data. Returns the count of models whose cost genuinely changed, for
+// the refresh summary message.
+func updateExistingModelCosts(dst *config.ProvidersFile, detected config.ProvidersFile) int {
+	type cost struct{ input, output float64 }
+	costByKey := make(map[modelKey]cost, len(detected.Models))
+	for _, m := range detected.Models {
+		costByKey[modelKey{m.Provider, m.ModelName}] = cost{m.InputCostPerMillionTokens, m.OutputCostPerMillionTokens}
+	}
+
+	updated := 0
+	for i := range dst.Models {
+		m := &dst.Models[i]
+		c, ok := costByKey[modelKey{m.Provider, m.ModelName}]
+		if !ok {
+			continue
+		}
+		if m.InputCostPerMillionTokens == c.input && m.OutputCostPerMillionTokens == c.output {
+			continue
+		}
+		m.InputCostPerMillionTokens = c.input
+		m.OutputCostPerMillionTokens = c.output
+		updated++
+	}
+	return updated
 }
 
 // describeProviders renders "name (from ENV_VAR)" for each of names, in the

@@ -81,6 +81,86 @@ func TestMergeNewProviders_NothingNewIsANoOp(t *testing.T) {
 	assert.Equal(t, "gpt-4o", dst.Models[0].ModelName)
 }
 
+// TestUpdateExistingModelCosts_RefreshesCostOnAlreadyPresentModel is the
+// specific behavior requested against --refresh-providers' original
+// "existing entries are never touched" contract: cost specifically must be
+// refreshed on a model whose provider was already configured (so
+// mergeNewProviders would have skipped it entirely), while every other
+// field of that same model entry stays exactly as the user left it.
+func TestUpdateExistingModelCosts_RefreshesCostOnAlreadyPresentModel(t *testing.T) {
+	dst := &config.ProvidersFile{
+		Providers: []entities.ProviderConfig{{Name: "openai", Type: entities.ProviderTypeOpenAI}},
+		Models: []entities.ModelConfig{
+			{
+				Name: "my-gpt", Provider: "openai", ModelName: "gpt-5",
+				// Simulates stale cost captured before a price change, plus a
+				// user-chosen display Name and hand-set ContextWindowTokens
+				// that must both survive untouched.
+				InputCostPerMillionTokens: 1, OutputCostPerMillionTokens: 5,
+				ContextWindowTokens: 999999,
+			},
+		},
+	}
+	detected := config.ProvidersFile{
+		Models: []entities.ModelConfig{
+			// Same (Provider, ModelName) as dst's entry, but under detection's
+			// own auto-generated Name ("openai/gpt-5") — proves matching is by
+			// (Provider, ModelName), not Name, since a user is free to rename
+			// the display Name after Canopy first wrote it.
+			{Name: "openai/gpt-5", Provider: "openai", ModelName: "gpt-5", InputCostPerMillionTokens: 2.5, OutputCostPerMillionTokens: 10},
+		},
+	}
+
+	updated := updateExistingModelCosts(dst, detected)
+
+	assert.Equal(t, 1, updated)
+	require.Len(t, dst.Models, 1)
+	assert.Equal(t, 2.5, dst.Models[0].InputCostPerMillionTokens)
+	assert.Equal(t, 10.0, dst.Models[0].OutputCostPerMillionTokens)
+	// Everything else on the entry is untouched.
+	assert.Equal(t, "my-gpt", dst.Models[0].Name)
+	assert.Equal(t, 999999, dst.Models[0].ContextWindowTokens)
+}
+
+func TestUpdateExistingModelCosts_NoMatchIsUntouchedNotZeroed(t *testing.T) {
+	dst := &config.ProvidersFile{
+		Models: []entities.ModelConfig{
+			// A self-hosted model models.dev has no pricing for at all.
+			{Name: "ornith", Provider: "drujensen", ModelName: "ornith:35b", InputCostPerMillionTokens: 0, OutputCostPerMillionTokens: 0},
+			// A model whose provider simply isn't in this detection run (e.g.
+			// its env var is currently unset).
+			{Name: "old-model", Provider: "anthropic", ModelName: "claude-legacy", InputCostPerMillionTokens: 3, OutputCostPerMillionTokens: 15},
+		},
+	}
+	detected := config.ProvidersFile{
+		Models: []entities.ModelConfig{
+			{Name: "openai/gpt-5", Provider: "openai", ModelName: "gpt-5", InputCostPerMillionTokens: 2.5, OutputCostPerMillionTokens: 10},
+		},
+	}
+
+	updated := updateExistingModelCosts(dst, detected)
+
+	assert.Zero(t, updated)
+	assert.Zero(t, dst.Models[0].InputCostPerMillionTokens, "no catalog data for a self-hosted model must never fabricate a cost")
+	assert.Equal(t, 3.0, dst.Models[1].InputCostPerMillionTokens, "a model absent from this detection run must keep its previously-known cost, not have it cleared")
+}
+
+func TestUpdateExistingModelCosts_UnchangedValueDoesNotCountAsUpdated(t *testing.T) {
+	dst := &config.ProvidersFile{
+		Models: []entities.ModelConfig{
+			{Name: "my-gpt", Provider: "openai", ModelName: "gpt-5", InputCostPerMillionTokens: 2.5, OutputCostPerMillionTokens: 10},
+		},
+	}
+	detected := config.ProvidersFile{
+		Models: []entities.ModelConfig{
+			{Name: "openai/gpt-5", Provider: "openai", ModelName: "gpt-5", InputCostPerMillionTokens: 2.5, OutputCostPerMillionTokens: 10},
+		},
+	}
+
+	updated := updateExistingModelCosts(dst, detected)
+	assert.Zero(t, updated, "identical cost data must not be reported as a change")
+}
+
 func TestDescribeProviders_PairsNameWithEnvVar(t *testing.T) {
 	providers := []entities.ProviderConfig{
 		{Name: "openai", APIKeyEnv: "OPENAI_API_KEY"},

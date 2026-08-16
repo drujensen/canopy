@@ -407,6 +407,19 @@ stale hardcoded list). A `--refresh-providers` flag forces a live re-fetch (bypa
 and re-runs detection, **adding** any newly-detectable provider to the existing file — matched by
 `ProviderConfig.Name`, an already-present entry (even a hand-edited one) is never touched.
 
+Addendum (post-v0.1.0, model cost display): the one deliberate exception to that "never touched"
+guarantee is per-model cost. `cmd/canopy`'s `updateExistingModelCosts` refreshes
+`InputCostPerMillionTokens`/`OutputCostPerMillionTokens` (see §4's own cost addendum below) on
+every existing `ModelConfig` — matched by `(Provider, ModelName)`, not `Name`, since a user is free
+to rename a model entry's display `Name` after Canopy first wrote it — including one whose provider
+was already configured and so skipped entirely by the provider-level merge above. Cost is catalog
+metadata a user has no real reason to hand-edit away from whatever the provider actually charges,
+unlike `BaseURL`/`APIKey`/`ModelName` itself, which stay untouched on an existing entry exactly as
+before. A model with no match in the freshly-detected catalog data (a self-hosted model models.dev
+has no pricing for at all, or a provider that isn't currently detectable) is left completely
+untouched, cost included — this only ever refreshes toward fresher data Canopy actually has in
+hand, never clears a value to zero for absence of new data.
+
 The table above ("Provider | Canopy implementation") is no longer a closed list at the dispatch
 level: `impl/providers.New`'s `default:` case now routes *any* unrecognized `cfg.Type` through the
 same generic OpenAI-compatible adapter as long as `cfg.BaseURL` is set — the auto-detected
