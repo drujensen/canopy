@@ -2,7 +2,9 @@ package json
 
 import (
 	"context"
+	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 	"time"
 
@@ -151,4 +153,114 @@ func TestChatRepository_ListEmpty(t *testing.T) {
 	chats, err := repo.List(context.Background())
 	require.NoError(t, err)
 	assert.Empty(t, chats)
+}
+
+// TestChatRepository_NewChatRepository_EmptyRootFails asserts the empty-root
+// guard, real reachable-from-caller-input validation (e.g. an unresolved
+// config path passed straight through).
+func TestChatRepository_NewChatRepository_EmptyRootFails(t *testing.T) {
+	_, err := NewChatRepository("")
+	assert.Error(t, err)
+}
+
+// TestChatRepository_NewChatRepository_MkdirAllFails asserts a storage root
+// whose parent path collides with an existing regular file (a plausible
+// stray-file scenario in a hand-managed directory tree) fails construction
+// clearly instead of silently misbehaving later.
+func TestChatRepository_NewChatRepository_MkdirAllFails(t *testing.T) {
+	root := t.TempDir()
+	blocker := filepath.Join(root, "blocker")
+	require.NoError(t, os.WriteFile(blocker, []byte("not a directory"), 0o644))
+
+	_, err := NewChatRepository(filepath.Join(blocker, "chats"))
+	assert.Error(t, err)
+}
+
+// TestChatRepository_Get_UnmarshalError asserts a corrupted chat file (e.g.
+// a hand-edited or partially-written-then-crashed store file, prior to the
+// atomic-rename protection this package otherwise provides) produces a
+// wrapped unmarshal error rather than a panic.
+func TestChatRepository_Get_UnmarshalError(t *testing.T) {
+	repo := newTestRepo(t)
+	require.NoError(t, os.WriteFile(repo.path("broken"), []byte("{not valid json"), 0o644))
+
+	_, err := repo.Get(context.Background(), "broken")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "broken")
+}
+
+// TestChatRepository_List_PropagatesGetError asserts List surfaces a
+// per-file Get error (here: corrupted JSON) instead of silently skipping
+// the bad file, so a corrupted chat file is loudly reported rather than
+// making chats vanish from the list.
+func TestChatRepository_List_PropagatesGetError(t *testing.T) {
+	repo := newTestRepo(t)
+	ctx := context.Background()
+	require.NoError(t, repo.Create(ctx, sampleChat("good")))
+	require.NoError(t, os.WriteFile(repo.path("broken"), []byte("{not valid json"), 0o644))
+
+	_, err := repo.List(ctx)
+	assert.Error(t, err)
+}
+
+// TestChatRepository_List_ReadDirFails asserts List's os.ReadDir error
+// branch (here: the storage root itself disappeared out from under the
+// repository, e.g. an external process/user removing it) is wrapped and
+// returned.
+func TestChatRepository_List_ReadDirFails(t *testing.T) {
+	repo := newTestRepo(t)
+	require.NoError(t, os.RemoveAll(repo.root))
+
+	_, err := repo.List(context.Background())
+	assert.Error(t, err)
+}
+
+// TestChatRepository_Delete_NonNotExistErrorPropagates asserts Delete
+// distinguishes a genuine ErrChatNotFound from some other os.Remove failure
+// (here: the chat "file" is actually a non-empty directory, which
+// os.Remove refuses to remove) rather than misreporting it as not-found.
+func TestChatRepository_Delete_NonNotExistErrorPropagates(t *testing.T) {
+	repo := newTestRepo(t)
+	dir := repo.path("dir-chat")
+	require.NoError(t, os.Mkdir(dir, 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "file"), []byte("x"), 0o644))
+
+	err := repo.Delete(context.Background(), "dir-chat")
+	require.Error(t, err)
+	assert.NotErrorIs(t, err, ErrChatNotFound)
+}
+
+// TestChatRepository_Update_RenameFailsWhenPathIsDirectory asserts write's
+// final os.Rename error branch: Update's own os.Stat existence check
+// succeeds against a directory that happens to occupy the chat's path (a
+// plausible stray-directory scenario), but the atomic rename onto that
+// directory then fails with a clear wrapped error rather than corrupting
+// state.
+func TestChatRepository_Update_RenameFailsWhenPathIsDirectory(t *testing.T) {
+	repo := newTestRepo(t)
+	require.NoError(t, os.Mkdir(repo.path("dir-chat"), 0o755))
+
+	err := repo.Update(context.Background(), sampleChat("dir-chat"))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "rename")
+}
+
+// TestChatRepository_Create_CreateTempFailsWhenRootNotWritable asserts
+// write's os.CreateTemp error branch: a storage root that exists but isn't
+// writable (a permission issue) fails clearly. Skipped when running as
+// root, since root bypasses Unix permission bits.
+func TestChatRepository_Create_CreateTempFailsWhenRootNotWritable(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX permission bits don't apply on windows")
+	}
+	if os.Geteuid() == 0 {
+		t.Skip("root bypasses directory write permissions")
+	}
+
+	repo := newTestRepo(t)
+	require.NoError(t, os.Chmod(repo.root, 0o555))
+	t.Cleanup(func() { _ = os.Chmod(repo.root, 0o755) })
+
+	err := repo.Create(context.Background(), sampleChat("chat-1"))
+	require.Error(t, err)
 }

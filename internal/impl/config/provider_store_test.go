@@ -1,7 +1,9 @@
 package config
 
 import (
+	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -129,4 +131,86 @@ func TestNewProviderStoreForProject_GlobalFlagForcesGlobalEvenWithProjectFile(t 
 	resolved, err := NewProviderStoreForProject(projectRoot, true)
 	require.NoError(t, err)
 	assert.Equal(t, filepath.Join(home, ".canopy", "providers.json"), resolved.Path())
+}
+
+// TestProviderStore_LoadInvalidJSON asserts a corrupted/hand-edited config
+// file produces a wrapped unmarshal error, not a panic or a silently empty
+// result — this is real, reachable-from-user-input behavior (a user hand-
+// editing ~/.canopy/providers.json and breaking the JSON).
+func TestProviderStore_LoadInvalidJSON(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "providers.json")
+	require.NoError(t, os.WriteFile(path, []byte("{not valid json"), 0o644))
+
+	store := NewProviderStore(path)
+	_, err := store.Load()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), path)
+}
+
+// TestProviderStore_LoadPathIsDirectory asserts Load's os.ReadFile error
+// branch for a non-missing-file error (here: the configured path is itself
+// a directory, e.g. from a prior Save's Rename step landing on a stray
+// directory) is wrapped and returned rather than misreported as "no config
+// yet".
+func TestProviderStore_LoadPathIsDirectory(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "providers.json")
+	require.NoError(t, os.Mkdir(path, 0o755))
+
+	store := NewProviderStore(path)
+	_, err := store.Load()
+	require.Error(t, err)
+}
+
+// TestProviderStore_SaveFailsWhenParentPathComponentIsAFile asserts Save's
+// MkdirAll error branch: a path whose directory component collides with an
+// existing regular file (a plausible manual-meddling scenario for a
+// hand-managed ~/.canopy directory) fails clearly instead of silently
+// writing somewhere unexpected.
+func TestProviderStore_SaveFailsWhenParentPathComponentIsAFile(t *testing.T) {
+	root := t.TempDir()
+	blocker := filepath.Join(root, "blocker")
+	require.NoError(t, os.WriteFile(blocker, []byte("not a directory"), 0o644))
+
+	store := NewProviderStore(filepath.Join(blocker, "sub", "providers.json"))
+	err := store.Save(&ProvidersFile{})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "config directory")
+}
+
+// TestProviderStore_SaveFailsWhenTargetPathIsADirectory asserts Save's final
+// os.Rename error branch: renaming the finished temp file onto a path that
+// is itself an existing directory (again, a plausible stray-directory
+// scenario) fails clearly instead of silently succeeding or corrupting
+// state.
+func TestProviderStore_SaveFailsWhenTargetPathIsADirectory(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "providers.json")
+	require.NoError(t, os.Mkdir(path, 0o755))
+
+	store := NewProviderStore(path)
+	err := store.Save(&ProvidersFile{})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "rename")
+}
+
+// TestProviderStore_SaveFailsWhenDirectoryNotWritable asserts Save's
+// os.CreateTemp error branch: a config directory that exists but isn't
+// writable (permission issue) fails clearly. Skipped when running as root,
+// since root bypasses Unix permission bits and the write would spuriously
+// succeed.
+func TestProviderStore_SaveFailsWhenDirectoryNotWritable(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX permission bits don't apply on windows")
+	}
+	if os.Geteuid() == 0 {
+		t.Skip("root bypasses directory write permissions")
+	}
+
+	dir := t.TempDir()
+	sub := filepath.Join(dir, "readonly")
+	require.NoError(t, os.Mkdir(sub, 0o555))
+	t.Cleanup(func() { _ = os.Chmod(sub, 0o755) })
+
+	store := NewProviderStore(filepath.Join(sub, "providers.json"))
+	err := store.Save(&ProvidersFile{})
+	require.Error(t, err)
 }
