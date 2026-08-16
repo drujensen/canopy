@@ -38,6 +38,22 @@ type Chat struct {
 	// job.
 	SessionState []byte `json:"session_state,omitempty"`
 
+	// ModelOverride is a per-chat model switch (post-v0.1.0 addendum,
+	// Requirements FR1, Design §4): empty (the default for every chat
+	// created before this field existed, and for any chat that hasn't used
+	// it) means "use normal resolution" — the agent definition's own
+	// "model" frontmatter, or AgentServiceConfig.DefaultModel if the
+	// definition doesn't set one (see AgentService.resolveProviderModel).
+	// A non-empty value names a ModelConfig.Name (Design §4's flat JSON
+	// model config, keyed by ModelConfig.Name — the same key space
+	// AgentDefinition.Model already resolves against) to use instead, for
+	// this chat specifically, set via AgentService.SetModel (the TUI's
+	// ctrl+o model-picker keybinding). It does not affect any other chat
+	// bound to the same agent, and — per Design §3.4's subagent-isolation
+	// model — it is never inherited by a dynamically-dispatched subagent:
+	// only the top-level, chat-bound agent (buildTopLevelAgent) honors it.
+	ModelOverride string `json:"model_override,omitempty"`
+
 	CreatedAt time.Time `json:"created_at"`
 	UpdatedAt time.Time `json:"updated_at"`
 }

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/charmbracelet/bubbles/list"
 	"github.com/charmbracelet/bubbles/textinput"
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
@@ -14,6 +15,17 @@ import (
 	"github.com/microsoft/agent-framework-go/message"
 
 	"github.com/drujensen/canopy/internal/domain/services"
+)
+
+// pickerKind identifies which in-chat overlay picker (see chatModel.picker)
+// is currently open, so handlePickerKey knows which AgentService setter a
+// selection should call.
+type pickerKind int
+
+const (
+	pickerNone pickerKind = iota
+	pickerAgent
+	pickerModel
 )
 
 // transcriptEntry is one finished message rendered in the chat transcript —
@@ -52,6 +64,13 @@ type chatModel struct {
 	todos []todo.Item
 	mode  string
 
+	// model is the currently active model name (post-v0.1.0 addendum,
+	// Design §4/FR1 — AgentService.GetModel), shown in the sidebar next to
+	// Mode. Seeded at construction and refreshed after every completed turn
+	// (RunResult.Model, via handleStreamMsg's streamDoneMsg case) and
+	// immediately after a ctrl+o switch (modelChangedMsg, see model.go).
+	model string
+
 	// pendingApproval is the tool-approval request currently awaiting a
 	// user decision (Design §3.6), or nil when none is pending. While set,
 	// the composer does not receive keystrokes — handleKey routes to
@@ -59,14 +78,23 @@ type chatModel struct {
 	pendingApproval     *message.ToolApprovalRequestContent
 	pendingApprovalTool string
 
+	// picker, when non-nil, is the in-chat overlay currently shown — either
+	// the ctrl+a agent-switch or ctrl+o model-switch picker (post-v0.1.0
+	// addendum, Design §3.4/§4/§5), pre-empting the composer/transcript the
+	// same way pendingApproval does. pickerKind says which one, so
+	// handlePickerKey knows whether a selection calls SetAgent or SetModel.
+	picker     *list.Model
+	pickerKind pickerKind
+
 	statusErr error
 
 	width, height int
 }
 
 // newChatModel constructs a chatModel for a just-started or resumed chat,
-// seeded with its current Todos/Mode snapshot (Design §3.7/§3.8).
-func newChatModel(chatID, agentName string, todos []todo.Item, mode string, width, height int) *chatModel {
+// seeded with its current Todos/Mode/Model snapshot (Design §3.7/§3.8,
+// post-v0.1.0 Model addendum).
+func newChatModel(chatID, agentName string, todos []todo.Item, mode, model string, width, height int) *chatModel {
 	composer := textinput.New()
 	composer.Placeholder = "Type a message and press enter..."
 	composer.Focus()
@@ -77,6 +105,7 @@ func newChatModel(chatID, agentName string, todos []todo.Item, mode string, widt
 		agentName: agentName,
 		todos:     todos,
 		mode:      mode,
+		model:     model,
 		composer:  composer,
 		viewport:  viewport.New(width, height),
 	}
@@ -106,16 +135,35 @@ func (c *chatModel) resize(width, height int) {
 }
 
 // handleKey processes a key press for the chat screen: approval decisions
-// while pendingApproval is set, mode-switch/message-submit otherwise, and
-// composer text editing as the fallback.
+// while pendingApproval is set, overlay-picker navigation while picker is
+// set, mode/agent/model-switch or message-submit otherwise, and composer
+// text editing as the fallback.
 func (c *chatModel) handleKey(msg tea.KeyMsg, svc *services.AgentService, ctx context.Context) tea.Cmd {
 	if c.pendingApproval != nil {
 		return c.handleApprovalKey(msg, svc, ctx)
+	}
+	if c.picker != nil {
+		return c.handlePickerKey(msg, svc, ctx)
 	}
 
 	switch msg.String() {
 	case "ctrl+p":
 		return c.toggleModeCmd(svc, ctx)
+	case "ctrl+a":
+		// Same guard streaming-sensitive actions elsewhere in this file
+		// apply (see "enter" below): don't open the agent-switch overlay
+		// mid-turn. Not-nil pendingApproval is already excluded above.
+		if c.streamActive {
+			return nil
+		}
+		c.openPicker(svc, pickerAgent)
+		return nil
+	case "ctrl+o":
+		if c.streamActive {
+			return nil
+		}
+		c.openPicker(svc, pickerModel)
+		return nil
 	case "enter":
 		if c.streamActive {
 			return nil
@@ -135,6 +183,59 @@ func (c *chatModel) handleKey(msg tea.KeyMsg, svc *services.AgentService, ctx co
 	}
 	var cmd tea.Cmd
 	c.composer, cmd = c.composer.Update(msg)
+	return cmd
+}
+
+// openPicker builds and shows one of the in-chat overlay pickers (ctrl+a
+// switch-agent, ctrl+o switch-model — post-v0.1.0 addendum) from
+// AgentService.ListAgents()/ListModels(). Both are pure, in-memory reads (no
+// I/O, unlike everything else this file calls through svc), so this runs
+// synchronously inside handleKey rather than round-tripping through a
+// tea.Cmd/tea.Msg the way starting a turn or toggling mode do.
+func (c *chatModel) openPicker(svc *services.AgentService, kind pickerKind) {
+	var names []string
+	title := "Select a model"
+	if kind == pickerAgent {
+		names = svc.ListAgents()
+		title = "Select an agent"
+	} else {
+		names = svc.ListModels()
+	}
+	l := newPickerList(names, title, c.width-sidebarWidth, c.height-4)
+	c.picker = &l
+	c.pickerKind = kind
+}
+
+// handlePickerKey routes a key press to whichever in-chat overlay picker is
+// currently open (see openPicker): "enter" selects the highlighted item and
+// dispatches to SetAgent or SetModel depending on pickerKind, "esc" cancels
+// back to the chat screen with no change, and any other key is forwarded to
+// the underlying bubbles/list.Model for navigation/filtering — mirroring
+// model.go's own screenAgentPicker case, reused here for the chat-scoped
+// overlay instead of a separate top-level screen.
+func (c *chatModel) handlePickerKey(msg tea.KeyMsg, svc *services.AgentService, ctx context.Context) tea.Cmd {
+	if c.picker.FilterState() != list.Filtering {
+		switch msg.String() {
+		case "enter":
+			item, ok := c.picker.SelectedItem().(pickerItem)
+			kind := c.pickerKind
+			c.picker = nil
+			c.pickerKind = pickerNone
+			if !ok {
+				return nil
+			}
+			if kind == pickerAgent {
+				return c.setAgentCmd(svc, ctx, item.name)
+			}
+			return c.setModelCmd(svc, ctx, item.name)
+		case "esc":
+			c.picker = nil
+			c.pickerKind = pickerNone
+			return nil
+		}
+	}
+	var cmd tea.Cmd
+	*c.picker, cmd = c.picker.Update(msg)
 	return cmd
 }
 
@@ -180,6 +281,37 @@ func (c *chatModel) toggleModeCmd(svc *services.AgentService, ctx context.Contex
 	}
 }
 
+// setModelCmd calls AgentService.SetModel for chosen (a ModelConfig.Name
+// from the ctrl+o picker's list, post-v0.1.0 addendum) and returns a
+// modelChangedMsg Model.Update applies to refresh the sidebar — mirroring
+// toggleModeCmd's modeChangedMsg pattern.
+func (c *chatModel) setModelCmd(svc *services.AgentService, ctx context.Context, chosen string) tea.Cmd {
+	chatID := c.chatID
+	return func() tea.Msg {
+		if err := svc.SetModel(ctx, chatID, chosen); err != nil {
+			return streamErrMsg{err: fmt.Errorf("switching model: %w", err)}
+		}
+		return modelChangedMsg{model: chosen}
+	}
+}
+
+// setAgentCmd calls AgentService.SetAgent for chosen (an agent name from the
+// ctrl+a picker's list, post-v0.1.0 addendum) and returns an agentChangedMsg
+// Model.Update applies to refresh the sidebar. Unlike Model.startChatCmd
+// (the top-level picker screen's "start a brand-new chat" path), this never
+// creates a new chat — the same chat ID and history carry over, only which
+// agent drives the next turn changes (see AgentService.SetAgent's doc
+// comment).
+func (c *chatModel) setAgentCmd(svc *services.AgentService, ctx context.Context, chosen string) tea.Cmd {
+	chatID := c.chatID
+	return func() tea.Msg {
+		if err := svc.SetAgent(ctx, chatID, chosen); err != nil {
+			return streamErrMsg{err: fmt.Errorf("switching agent: %w", err)}
+		}
+		return agentChangedMsg{agentName: chosen}
+	}
+}
+
 // startTurnCmd marks the chat as actively streaming and delegates to
 // startTurn (stream.go) to drive the turn against svc via
 // AgentService.RunMessagesStream.
@@ -208,6 +340,7 @@ func (c *chatModel) handleStreamMsg(msg tea.Msg) tea.Cmd {
 		if msg.result != nil {
 			c.todos = msg.result.Todos
 			c.mode = msg.result.Mode
+			c.model = msg.result.Model
 		}
 		c.refreshViewport()
 		return nil
@@ -298,11 +431,16 @@ func renderEntry(e transcriptEntry) string {
 	return label + "\n" + e.text
 }
 
-// View renders the chat screen: a sidebar (mode + todos) beside the
-// transcript, with either the composer or a pending approval prompt at the
-// bottom, and a status line for the last stream error, if any.
+// View renders the chat screen: a sidebar (agent + mode + model + todos)
+// beside either an open overlay picker (ctrl+a/ctrl+o, post-v0.1.0 addendum)
+// or the transcript with either the composer or a pending approval prompt at
+// the bottom, plus a status line for the last stream error, if any.
 func (c *chatModel) View(width, height int) string {
 	sidebar := c.renderSidebar()
+
+	if c.picker != nil {
+		return lipgloss.JoinHorizontal(lipgloss.Top, sidebar, c.picker.View())
+	}
 
 	var bottom string
 	if c.pendingApproval != nil {
@@ -319,12 +457,16 @@ func (c *chatModel) View(width, height int) string {
 	return lipgloss.JoinHorizontal(lipgloss.Top, sidebar, main)
 }
 
-// renderSidebar renders the mode indicator/switcher (Design §3.8) and the
-// live todo panel (Design §3.7).
+// renderSidebar renders the agent/mode/model indicators (Design §3.8,
+// post-v0.1.0 §3.4/§4 addendum) and the live todo panel (Design §3.7).
 func (c *chatModel) renderSidebar() string {
 	var b strings.Builder
+	b.WriteString(modeStyle.Render("Agent: " + c.agentName))
+	b.WriteString("\n(ctrl+a to switch)\n")
 	b.WriteString(modeStyle.Render("Mode: " + c.mode))
-	b.WriteString("\n(ctrl+p to switch)\n\n")
+	b.WriteString("\n(ctrl+p to switch)\n")
+	b.WriteString(modeStyle.Render("Model: " + c.model))
+	b.WriteString("\n(ctrl+o to switch)\n\n")
 	b.WriteString("Todos:\n")
 	if len(c.todos) == 0 {
 		b.WriteString("  (none yet)\n")

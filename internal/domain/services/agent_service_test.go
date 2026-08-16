@@ -295,29 +295,36 @@ func TestAgentService_ResolveProviderModel(t *testing.T) {
 	})
 
 	t.Run("uses default model when unset", func(t *testing.T) {
-		gotP, gotM, err := svc.resolveProviderModel(agentsource.AgentDefinition{Name: "a"})
+		gotP, gotM, err := svc.resolveProviderModel(agentsource.AgentDefinition{Name: "a"}, "")
 		require.NoError(t, err)
 		assert.Equal(t, p1, gotP)
 		assert.Equal(t, m1, gotM)
 	})
 
 	t.Run("agent's own model override wins", func(t *testing.T) {
-		gotP, gotM, err := svc.resolveProviderModel(agentsource.AgentDefinition{Name: "a", Model: "m2"})
+		gotP, gotM, err := svc.resolveProviderModel(agentsource.AgentDefinition{Name: "a", Model: "m2"}, "")
 		require.NoError(t, err)
 		assert.Equal(t, p2, gotP)
 		assert.Equal(t, m2, gotM)
 	})
 
 	t.Run("unknown model reference is an error", func(t *testing.T) {
-		_, _, err := svc.resolveProviderModel(agentsource.AgentDefinition{Name: "a", Model: "ghost"})
+		_, _, err := svc.resolveProviderModel(agentsource.AgentDefinition{Name: "a", Model: "ghost"}, "")
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "ghost")
 	})
 
 	t.Run("missing default and no override is an error", func(t *testing.T) {
 		bare := NewAgentService(AgentServiceConfig{Providers: []entities.ProviderConfig{p1}, Models: []entities.ModelConfig{m1}})
-		_, _, err := bare.resolveProviderModel(agentsource.AgentDefinition{Name: "a"})
+		_, _, err := bare.resolveProviderModel(agentsource.AgentDefinition{Name: "a"}, "")
 		require.Error(t, err)
+	})
+
+	t.Run("chat model override (post-v0.1.0) wins over the agent's own model", func(t *testing.T) {
+		gotP, gotM, err := svc.resolveProviderModel(agentsource.AgentDefinition{Name: "a", Model: "m1"}, "m2")
+		require.NoError(t, err)
+		assert.Equal(t, p2, gotP)
+		assert.Equal(t, m2, gotM, "an explicit chat override must win over the agent definition's own model: frontmatter")
 	})
 }
 

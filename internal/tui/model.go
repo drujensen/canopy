@@ -107,13 +107,25 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.fatalErr = msg.err
 			return m, nil
 		}
-		m.chat = newChatModel(msg.chatID, msg.agentName, msg.todos, msg.mode, m.width, m.height)
+		m.chat = newChatModel(msg.chatID, msg.agentName, msg.todos, msg.mode, msg.model, m.width, m.height)
 		m.screen = screenChat
 		return m, nil
 
 	case modeChangedMsg:
 		if m.chat != nil {
 			m.chat.mode = msg.mode
+		}
+		return m, nil
+
+	case modelChangedMsg:
+		if m.chat != nil {
+			m.chat.model = msg.model
+		}
+		return m, nil
+
+	case agentChangedMsg:
+		if m.chat != nil {
+			m.chat.agentName = msg.agentName
 		}
 		return m, nil
 
@@ -194,7 +206,11 @@ func (m Model) startChatCmd(agentName string) tea.Cmd {
 		if err != nil {
 			return chatStartedMsg{err: fmt.Errorf("loading mode: %w", err)}
 		}
-		return chatStartedMsg{chatID: chatID, agentName: agentName, todos: todos, mode: mode}
+		model, err := svc.GetModel(ctx, chatID)
+		if err != nil {
+			return chatStartedMsg{err: fmt.Errorf("loading model: %w", err)}
+		}
+		return chatStartedMsg{chatID: chatID, agentName: agentName, todos: todos, mode: mode, model: model}
 	}
 }
 

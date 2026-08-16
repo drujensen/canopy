@@ -125,7 +125,7 @@ func TestChatModel_MCPTool_ToolApprovalPromptAppears(t *testing.T) {
 	_, err := svc.StartChat(ctx, "chat-1", "assistant")
 	require.NoError(t, err)
 
-	c := newChatModel("chat-1", "assistant", nil, "execute", 80, 24)
+	c := newChatModel("chat-1", "assistant", nil, "execute", "m1", 80, 24)
 
 	drainCmdWithTimeout(t, c, c.startTurnCmd(svc, ctx, []*message.Message{message.NewText("please use the echo tool to say hi")}), 10*time.Second)
 
@@ -193,7 +193,7 @@ func TestChatModel_MCPTool_PlainMessage_NoHang(t *testing.T) {
 	_, err = svc.StartChat(ctx, "chat-1", "assistant")
 	require.NoError(t, err)
 
-	c := newChatModel("chat-1", "assistant", nil, "execute", 80, 24)
+	c := newChatModel("chat-1", "assistant", nil, "execute", "m1", 80, 24)
 	drainCmdWithTimeout(t, c, c.startTurnCmd(svc, ctx, []*message.Message{message.NewText("hi")}), 10*time.Second)
 
 	require.Len(t, c.transcript, 1)
@@ -212,7 +212,7 @@ func TestChatModel_MCPTool_ApproveOnce_ExecutesToolAndCompletes(t *testing.T) {
 	_, err := svc.StartChat(ctx, "chat-1", "assistant")
 	require.NoError(t, err)
 
-	c := newChatModel("chat-1", "assistant", nil, "execute", 80, 24)
+	c := newChatModel("chat-1", "assistant", nil, "execute", "m1", 80, 24)
 
 	drainCmdWithTimeout(t, c, c.startTurnCmd(svc, ctx, []*message.Message{message.NewText("please use the echo tool to say hi")}), 10*time.Second)
 	require.NotNil(t, c.pendingApproval)
@@ -247,7 +247,7 @@ func TestRealProgram_MCPTool_AsyncRuntime(t *testing.T) {
 		svc:    svc,
 		ctx:    ctx,
 		screen: screenChat,
-		chat:   newChatModel("chat-1", "assistant", nil, "execute", 80, 24),
+		chat:   newChatModel("chat-1", "assistant", nil, "execute", "m1", 80, 24),
 		width:  80, height: 24,
 	}
 
@@ -357,7 +357,7 @@ func TestRealProgram_MCPTool_Gemini400Error(t *testing.T) {
 	_, err = svc.StartChat(ctx, "chat-1", "assistant")
 	require.NoError(t, err)
 
-	c := newChatModel("chat-1", "assistant", nil, "execute", 80, 24)
+	c := newChatModel("chat-1", "assistant", nil, "execute", "m1", 80, 24)
 	drainCmdWithTimeout(t, c, c.startTurnCmd(svc, ctx, []*message.Message{message.NewText("hi")}), 10*time.Second)
 
 	require.NotNil(t, c.statusErr, "a real 400 from the provider must surface as a rendered error, not be silently swallowed")

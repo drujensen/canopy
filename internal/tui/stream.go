@@ -43,15 +43,34 @@ type modeChangedMsg struct {
 	mode string
 }
 
+// modelChangedMsg reports a user-initiated model switch (AgentService.
+// SetModel, the ctrl+o model-picker overlay — post-v0.1.0 addendum, Design
+// §4/FR1) completed, mirroring modeChangedMsg's shape/role for the mode
+// switch.
+type modelChangedMsg struct {
+	model string
+}
+
+// agentChangedMsg reports a user-initiated agent switch (AgentService.
+// SetAgent, the ctrl+a in-chat agent-picker overlay — post-v0.1.0 addendum,
+// Design §3.4/§5) completed. Unlike chatStartedMsg (the top-level picker
+// screen's "start a brand-new chat" path), this never carries a new chatID —
+// the chat and its history are unchanged, only which agent definition drives
+// subsequent turns.
+type agentChangedMsg struct {
+	agentName string
+}
+
 // chatStartedMsg reports the outcome of picking an agent in the picker
 // screen: either a newly started chat (id, agent name, and its initial
-// Todos/Mode snapshot) or an error, which the top-level Model surfaces
+// Todos/Mode/Model snapshot) or an error, which the top-level Model surfaces
 // instead of transitioning to the chat screen.
 type chatStartedMsg struct {
 	chatID    string
 	agentName string
 	todos     []todo.Item
 	mode      string
+	model     string
 	err       error
 }
 

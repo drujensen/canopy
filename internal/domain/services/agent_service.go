@@ -332,14 +332,23 @@ func (s *AgentService) StartChat(ctx context.Context, chatID, agentName string) 
 
 // RunResult is AgentService.RunText/RunMessages' return value: the model's
 // response plus a post-turn snapshot of the session-scoped state Design
-// §3.7/§3.8 track (todos, mode), so a caller (Plan Phase 6's TUI) doesn't
-// need a second round-trip just to render the current todo list or mode
-// after every turn. Todos/Mode reflect state as of immediately after this
-// turn completed (i.e. after session persistence — see persistSession).
+// §3.7/§3.8 track (todos, mode) and the chat-scoped model routing state
+// (post-v0.1.0 addendum, Design §4/FR1 — Chat.ModelOverride), so a caller
+// (Plan Phase 6's TUI) doesn't need a second round-trip just to render the
+// current todo list, mode, or active model name after every turn.
+// Todos/Mode/Model reflect state as of immediately after this turn completed
+// (i.e. after session persistence — see persistSession).
 type RunResult struct {
 	Response *agent.Response
 	Todos    []todo.Item
 	Mode     string
+
+	// Model is the ModelConfig.Name this turn was actually routed through —
+	// chat.ModelOverride if set, otherwise the agent definition's own
+	// "model" frontmatter or s.defaultModel (see resolveModelName/
+	// activeModelName), the same value GetModel returns for this chat
+	// immediately after the turn.
+	Model string
 }
 
 // RunText loads the chat with the given ID, builds the *agent.Agent its
@@ -437,10 +446,16 @@ func (s *AgentService) RunMessages(ctx context.Context, chatID string, msgs []*m
 		return nil, err
 	}
 
+	modelName, err := s.activeModelName(chat)
+	if err != nil {
+		return nil, err
+	}
+
 	return &RunResult{
 		Response: resp,
 		Todos:    s.todoProvider.GetAllItems(agent.WithSession(session)),
 		Mode:     s.modeProvider.GetMode(agent.WithSession(session)),
+		Model:    modelName,
 	}, nil
 }
 
@@ -559,10 +574,18 @@ func (s *AgentService) RunMessagesStream(ctx context.Context, chatID string, msg
 			return
 		}
 
+		modelName, modelErr := s.activeModelName(chat)
+		if modelErr != nil {
+			state.err = modelErr
+			state.done = true
+			return
+		}
+
 		state.result = &RunResult{
 			Response: &resp,
 			Todos:    s.todoProvider.GetAllItems(agent.WithSession(session)),
 			Mode:     s.modeProvider.GetMode(agent.WithSession(session)),
+			Model:    modelName,
 		}
 		state.done = true
 	})
@@ -825,6 +848,119 @@ func (s *AgentService) SetMode(ctx context.Context, chatID, mode string) error {
 	return s.persistSession(ctx, chatID, session)
 }
 
+// ListModels returns every configured ModelConfig.Name, sorted (post-v0.1.0
+// addendum, Design §4/FR1) — a caller (Plan Phase 6's TUI's ctrl+o
+// model-picker overlay) uses this to present the set of valid choices
+// SetModel will accept. Sorted for the same "deterministic over Go's
+// randomized map iteration order" reason NewAgentService sorts mcpToolNames.
+func (s *AgentService) ListModels() []string {
+	names := make([]string, 0, len(s.models))
+	for name := range s.models {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
+}
+
+// GetModel returns chat's currently *active* model name (post-v0.1.0
+// addendum, Design §4/FR1): chat.ModelOverride if set, otherwise whatever
+// resolveProviderModel would fall back to (the agent definition's own
+// "model" frontmatter, or s.defaultModel) — the caller (the TUI sidebar)
+// wants to know what's actually in effect for this chat's next turn, not
+// merely whether an override happens to be set.
+func (s *AgentService) GetModel(ctx context.Context, chatID string) (string, error) {
+	chat, err := s.repository.Get(ctx, chatID)
+	if err != nil {
+		return "", fmt.Errorf("agent service: loading chat %q: %w", chatID, err)
+	}
+	return s.activeModelName(chat)
+}
+
+// SetModel sets chat's per-chat model override (Chat.ModelOverride,
+// post-v0.1.0 addendum, Design §4/FR1) and persists it immediately —
+// mirroring SetMode's "a user-initiated switch doesn't need to wait for a
+// run to take effect or to be saved" reasoning (Design §3.8). modelName must
+// name an already-configured ModelConfig; this is a real, defensive check
+// even though the TUI's model picker (ListModels) only ever offers valid
+// choices — the same defensive posture SetMode applies against
+// s.modeProvider's known modes.
+func (s *AgentService) SetModel(ctx context.Context, chatID, modelName string) error {
+	if _, ok := s.models[modelName]; !ok {
+		return fmt.Errorf("agent service: unknown model %q", modelName)
+	}
+	chat, err := s.repository.Get(ctx, chatID)
+	if err != nil {
+		return fmt.Errorf("agent service: loading chat %q: %w", chatID, err)
+	}
+	chat.ModelOverride = modelName
+	chat.UpdatedAt = time.Now().UTC()
+	if err := s.repository.Update(ctx, chat); err != nil {
+		return fmt.Errorf("agent service: setting model override for chat %q: %w", chatID, err)
+	}
+	return nil
+}
+
+// activeModelName resolves chat's currently active model name — the shared
+// "chat.ModelOverride, else the agent definition's own model:, else
+// s.defaultModel" precedence (see resolveModelName) used by both GetModel's
+// read-only view and RunMessages/RunMessagesStream's RunResult.Model, kept
+// as one function so the two never drift from resolveProviderModel's own
+// resolution (which buildTopLevelAgent actually routes a turn through).
+func (s *AgentService) activeModelName(chat *entities.Chat) (string, error) {
+	def, ok := s.defs.Agents[chat.AgentName]
+	if !ok {
+		return "", fmt.Errorf("agent service: chat %q references unknown agent %q", chat.ID, chat.AgentName)
+	}
+	name := resolveModelName(def, chat.ModelOverride, s.defaultModel)
+	if name == "" {
+		return "", fmt.Errorf("agent service: agent %q has no model configured and no default model is set", def.Name)
+	}
+	return name, nil
+}
+
+// ListAgents returns every loaded agent definition's Name, sorted
+// (post-v0.1.0 addendum, Design §3.4/§5) — mirrors ListModels for the same
+// "a TUI picker needs a deterministic list of valid choices" reason, here
+// for the ctrl+a in-chat agent-switch overlay rather than the top-level
+// picker screen (which sources its list directly from the agentsource-
+// loaded map it's constructed with, not through AgentService — see
+// NewModel/Model.agentNames).
+func (s *AgentService) ListAgents() []string {
+	names := make([]string, 0, len(s.defs.Agents))
+	for name := range s.defs.Agents {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
+}
+
+// SetAgent switches chat's bound agent definition (post-v0.1.0 addendum,
+// Design §3.4/§5) without starting a new chat: unlike StartChat, this does
+// NOT touch chat.Messages or chat.SessionState — the same chat ID and its
+// entire conversation history carry over unchanged, only chat.AgentName
+// changes. The *next* turn is driven by the new agent's system
+// prompt/tools because buildTopLevelAgent resolves chat.AgentName fresh
+// from the reloaded chat on every RunMessages/RunMessagesStream call — there
+// is no cached *agent.Agent this needs to invalidate. agentName must
+// reference an already-loaded agent definition, the same validation
+// StartChat itself already performs, and the same defensive posture
+// SetModel applies against s.models.
+func (s *AgentService) SetAgent(ctx context.Context, chatID, agentName string) error {
+	if _, ok := s.defs.Agents[agentName]; !ok {
+		return fmt.Errorf("agent service: unknown agent %q", agentName)
+	}
+	chat, err := s.repository.Get(ctx, chatID)
+	if err != nil {
+		return fmt.Errorf("agent service: loading chat %q: %w", chatID, err)
+	}
+	chat.AgentName = agentName
+	chat.UpdatedAt = time.Now().UTC()
+	if err := s.repository.Update(ctx, chat); err != nil {
+		return fmt.Errorf("agent service: switching agent for chat %q: %w", chatID, err)
+	}
+	return nil
+}
+
 // loadChatSession loads chatID's persisted chat and deserializes its
 // SessionState, the common first step GetTodos/GetMode/SetMode all need.
 func (s *AgentService) loadChatSession(ctx context.Context, chatID string) (*agent.Session, error) {
@@ -860,7 +996,7 @@ func (s *AgentService) buildTopLevelAgent(ctx context.Context, chat *entities.Ch
 		return nil, fmt.Errorf("agent service: chat %q references unknown agent %q", chat.ID, chat.AgentName)
 	}
 
-	provider, model, err := s.resolveProviderModel(def)
+	provider, model, err := s.resolveProviderModel(def, chat.ModelOverride)
 	if err != nil {
 		return nil, err
 	}
@@ -933,8 +1069,18 @@ func (s *AgentService) buildTopLevelTools(ctx context.Context, def agentsource.A
 // and this package's doc comment on why AgentService pragmatically keeps
 // subagent construction on the direct impl/providers.New path rather than
 // impl/harness.Build.
+//
+// Subagents also do NOT honor the parent chat's Chat.ModelOverride
+// (post-v0.1.0 addendum, Design §4/FR1): resolveProviderModel is called here
+// with an empty override, the same "no override" resolution a top-level
+// agent gets when its chat has never called SetModel. This is a deliberate
+// choice, not an oversight — Design §3.4's whole point is subagent context
+// isolation (a subagent runs in its own fresh, unpersisted session with no
+// Chat of its own, see above), and a parent chat's model switch is exactly
+// the kind of chat-scoped state that isolation says shouldn't leak into a
+// dispatched subagent's own construction.
 func (s *AgentService) buildSubagentAgent(ctx context.Context, def agentsource.AgentDefinition) (*agent.Agent, error) {
-	provider, model, err := s.resolveProviderModel(def)
+	provider, model, err := s.resolveProviderModel(def, "")
 	if err != nil {
 		return nil, err
 	}
@@ -953,15 +1099,37 @@ func (s *AgentService) buildSubagentAgent(ctx context.Context, def agentsource.A
 	return providers.New(ctx, provider, model, cfg)
 }
 
-// resolveProviderModel resolves def's provider/model against the flat JSON
-// config (Design §4): def.Model, when set, names a ModelConfig; otherwise
-// s.defaultModel is used. The named ModelConfig's Provider then names a
-// ProviderConfig.
-func (s *AgentService) resolveProviderModel(def agentsource.AgentDefinition) (entities.ProviderConfig, entities.ModelConfig, error) {
-	modelName := def.Model
-	if modelName == "" {
-		modelName = s.defaultModel
+// resolveModelName applies the shared "which model" precedence (Design §4,
+// post-v0.1.0 per-chat override addendum, FR1): override (a chat's
+// Chat.ModelOverride), when non-empty, wins outright; otherwise def.Model
+// (the agent definition's own "model" frontmatter); otherwise defaultModel
+// (AgentServiceConfig.DefaultModel). An empty return means none of the three
+// resolved to anything — the caller decides how to report that (see
+// resolveProviderModel/activeModelName, both of which turn it into an
+// error). Split out as a pure function (no AgentService method receiver,
+// nothing but string comparisons) so resolveProviderModel (routing a real
+// turn) and activeModelName (GetModel/RunResult.Model's read-only view) can
+// share the exact same precedence without one silently drifting from the
+// other.
+func resolveModelName(def agentsource.AgentDefinition, override, defaultModel string) string {
+	if override != "" {
+		return override
 	}
+	if def.Model != "" {
+		return def.Model
+	}
+	return defaultModel
+}
+
+// resolveProviderModel resolves def's provider/model against the flat JSON
+// config (Design §4): override (chat.ModelOverride, post-v0.1.0 addendum —
+// empty for a subagent, which never receives one, see buildSubagentAgent's
+// doc comment on why subagents stay isolated from the parent chat's
+// override), when set, wins outright; otherwise def.Model, when set, names a
+// ModelConfig; otherwise s.defaultModel is used (resolveModelName). The
+// named ModelConfig's Provider then names a ProviderConfig.
+func (s *AgentService) resolveProviderModel(def agentsource.AgentDefinition, override string) (entities.ProviderConfig, entities.ModelConfig, error) {
+	modelName := resolveModelName(def, override, s.defaultModel)
 	if modelName == "" {
 		return entities.ProviderConfig{}, entities.ModelConfig{}, fmt.Errorf("agent service: agent %q has no model configured and no default model is set", def.Name)
 	}

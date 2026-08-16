@@ -390,6 +390,19 @@ response rendering) port over consuming `agent.ResponseStream`. New/changed:
   back, it's an additive frontend consuming the same `domain/services` the TUI does; nothing in
   this design assumes TUI-only forever, just TUI-only *now*.
 
+Addendum (post-v0.1.0): a chat's agent and model are switchable mid-session, not just fixed at
+`StartChat` time. `ctrl+a` and `ctrl+o` each open an in-chat `bubbles/list` overlay
+(`internal/tui/picker.go`, sharing the same item/list construction the top-level agent-picker
+screen uses) sourced from the new `AgentService.ListAgents()`/`ListModels()`. Selecting an entry
+calls the new `AgentService.SetAgent`/`SetModel` against the *same* chat ID and returns to the chat
+screen — neither ends the chat or clears its history; only `Chat.AgentName`/`Chat.ModelOverride`
+change, and `buildTopLevelAgent` already re-resolves both fresh on every turn, so the very next
+message is driven by the switched agent/model with the full prior transcript intact. Both
+keybindings are no-ops while a tool-approval prompt is pending or a turn is actively streaming, the
+same guard `enter` (sending a message) already applies. The sidebar gained `Agent: ...` and
+`Model: ...` lines next to the existing `Mode: ...` line, each with its own `(ctrl+x to switch)`
+hint.
+
 ## 6. Data model
 
 Much smaller than earlier drafts, because Agent/Skill configuration moved from database entities
@@ -413,6 +426,16 @@ Model repository — those concepts are either files on disk (§3.11) or the sma
 This is a significant simplification versus aiagent's seven-repository model, and it's intentional
 (Requirements §4.5 "keep it simple"): fewer things to keep in sync between a database and the
 files a user actually edits.
+
+Addendum (post-v0.1.0): `Chat` gained `ModelOverride string` (FR1, §4/§5's addendum above) — empty
+(every pre-existing chat) means normal resolution (the agent definition's own `model:` frontmatter,
+or `AgentServiceConfig.DefaultModel`); non-empty names a `ModelConfig.Name` to use for this chat
+specifically, set via `AgentService.SetModel`. `AgentService.resolveProviderModel` now takes the
+override as an explicit parameter rather than reading it off `Chat` itself, so the choice of who
+gets to supply one is a call-site decision, not baked into the function: `buildTopLevelAgent`
+passes `chat.ModelOverride`, but `buildSubagentAgent` always passes `""`, deliberately never
+inheriting the parent chat's override — consistent with §3.4's subagent context-isolation model, a
+dispatched subagent has no `Chat` of its own to read one from in the first place.
 
 ## 7. Testing strategy
 

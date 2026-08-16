@@ -107,7 +107,7 @@ func TestStartTurn_NoLeak_ManyTurnsBackToBack(t *testing.T) {
 	_, err := svc.StartChat(ctx, "chat-1", "assistant")
 	require.NoError(t, err)
 
-	c := newChatModel("chat-1", "assistant", nil, "execute", 80, 24)
+	c := newChatModel("chat-1", "assistant", nil, "execute", "m1", 80, 24)
 
 	opts := goleak.IgnoreCurrent()
 
@@ -154,7 +154,7 @@ func TestStartTurn_NoLeak_ErrorMidStream(t *testing.T) {
 	_, err := svc.StartChat(ctx, "chat-1", "assistant")
 	require.NoError(t, err)
 
-	c := newChatModel("chat-1", "assistant", nil, "execute", 80, 24)
+	c := newChatModel("chat-1", "assistant", nil, "execute", "m1", 80, 24)
 
 	opts := goleak.IgnoreCurrent()
 
@@ -217,7 +217,7 @@ func TestStartTurn_NoLeak_ContextCancelledMidTurn(t *testing.T) {
 	_, err := svc.StartChat(runCtx, "chat-1", "assistant")
 	require.NoError(t, err)
 
-	c := newChatModel("chat-1", "assistant", nil, "execute", 80, 24)
+	c := newChatModel("chat-1", "assistant", nil, "execute", "m1", 80, 24)
 
 	opts := goleak.IgnoreCurrent()
 

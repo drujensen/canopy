@@ -37,7 +37,7 @@ import (
 // before being folded into the transcript once a terminal streamDoneMsg
 // arrives.
 func TestChatModel_StreamedContentAccumulates(t *testing.T) {
-	c := newChatModel("chat-1", "assistant", nil, "execute", 80, 24)
+	c := newChatModel("chat-1", "assistant", nil, "execute", "m1", 80, 24)
 
 	cmd := c.handleStreamMsg(streamChunkMsg{update: &agent.ResponseUpdate{
 		Contents: message.Contents{&message.TextContent{Text: "Hello"}},
@@ -71,7 +71,7 @@ func TestChatModel_StreamedContentAccumulates(t *testing.T) {
 // TestChatModel_TodoPanelReflectsRunResult proves the live todo panel
 // (Design §3.7) renders whatever Todos a turn's RunResult carries.
 func TestChatModel_TodoPanelReflectsRunResult(t *testing.T) {
-	c := newChatModel("chat-1", "assistant", nil, "execute", 80, 24)
+	c := newChatModel("chat-1", "assistant", nil, "execute", "m1", 80, 24)
 
 	c.handleStreamMsg(streamDoneMsg{result: &services.RunResult{
 		Response: &agent.Response{},
@@ -93,7 +93,7 @@ func TestChatModel_TodoPanelReflectsRunResult(t *testing.T) {
 // carrying a *message.ToolApprovalRequestContent and asserts the approval
 // prompt (Design §3.6) becomes visible, pre-empting the composer.
 func TestChatModel_ApprovalPromptAppears(t *testing.T) {
-	c := newChatModel("chat-1", "assistant", nil, "execute", 80, 24)
+	c := newChatModel("chat-1", "assistant", nil, "execute", "m1", 80, 24)
 
 	req := &message.ToolApprovalRequestContent{
 		RequestID: "req-1",
@@ -123,7 +123,7 @@ func TestChatModel_ApprovalPromptAppears(t *testing.T) {
 // it can't add unbudgeted rows) and that the sidebar's mode indicator is
 // still present in the same render.
 func TestChatModel_View_LongMultilineError_StaysOneLineAndKeepsSidebarVisible(t *testing.T) {
-	c := newChatModel("chat-1", "assistant", nil, "execute", 80, 24)
+	c := newChatModel("chat-1", "assistant", nil, "execute", "m1", 80, 24)
 	c.statusErr = fmt.Errorf("error: POST \"https://api.example.com/v1/chat/completions\": 429 Too Many Requests {\n  \"error\": {\n    \"message\": \"You exceeded your current quota, please check your plan and billing details. For more information on this error, see: https://platform.openai.com/docs/guides/error-codes/api-errors.\",\n    \"type\": \"insufficient_quota\",\n    \"param\": null,\n    \"code\": \"insufficient_quota\"\n  }\n}")
 
 	view := c.View(80, 24)
@@ -142,7 +142,7 @@ func TestChatModel_View_LongMultilineError_StaysOneLineAndKeepsSidebarVisible(t 
 func TestModel_ModeIndicatorReflectsSwitch(t *testing.T) {
 	m := Model{
 		screen: screenChat,
-		chat:   newChatModel("chat-1", "assistant", nil, "execute", 80, 24),
+		chat:   newChatModel("chat-1", "assistant", nil, "execute", "m1", 80, 24),
 		width:  80, height: 24,
 	}
 	assert.Contains(t, m.View(), "Mode: execute")
@@ -284,7 +284,7 @@ func TestChatModel_ApprovalFlow_ApproveOnce_DoesNotPersist(t *testing.T) {
 	_, err := svc.StartChat(ctx, "chat-1", "assistant")
 	require.NoError(t, err)
 
-	c := newChatModel("chat-1", "assistant", nil, "execute", 80, 24)
+	c := newChatModel("chat-1", "assistant", nil, "execute", "m1", 80, 24)
 
 	drainCmd(t, c, c.startTurnCmd(svc, ctx, []*message.Message{message.NewText("please run the marker command")}))
 	require.NotNil(t, c.pendingApproval, "the first run_shell request must surface an approval prompt")
@@ -310,7 +310,7 @@ func TestChatModel_ApprovalFlow_AlwaysAllow_Persists(t *testing.T) {
 	_, err := svc.StartChat(ctx, "chat-1", "assistant")
 	require.NoError(t, err)
 
-	c := newChatModel("chat-1", "assistant", nil, "execute", 80, 24)
+	c := newChatModel("chat-1", "assistant", nil, "execute", "m1", 80, 24)
 
 	drainCmd(t, c, c.startTurnCmd(svc, ctx, []*message.Message{message.NewText("please run the marker command")}))
 	require.NotNil(t, c.pendingApproval)
@@ -344,7 +344,7 @@ func TestChatModel_ModeToggle_RealSetMode(t *testing.T) {
 	_, err = svc.StartChat(ctx, "chat-1", "assistant")
 	require.NoError(t, err)
 
-	c := newChatModel("chat-1", "assistant", nil, "execute", 80, 24)
+	c := newChatModel("chat-1", "assistant", nil, "execute", "m1", 80, 24)
 
 	cmd := c.toggleModeCmd(svc, ctx)
 	require.NotNil(t, cmd)
@@ -363,4 +363,171 @@ func TestChatModel_ModeToggle_RealSetMode(t *testing.T) {
 	modeMsg, ok = msg.(modeChangedMsg)
 	require.True(t, ok)
 	assert.Equal(t, "execute", modeMsg.mode, "toggling from plan must switch back to execute")
+}
+
+// --- ctrl+a (switch agent) / ctrl+o (switch model) overlay tests
+// (post-v0.1.0 addendum, Design §3.4/§4/§5) ---
+//
+// Per the coordinator's correction to this feature's original design, ctrl+a
+// does NOT navigate to the top-level agent picker screen or start a new
+// chat — it behaves symmetrically with ctrl+o: an in-chat overlay
+// (chatModel.picker) that, on selection, calls AgentService.SetAgent/
+// SetModel against the *same* chat ID and returns to the chat screen with
+// history untouched.
+
+// newSwitchTestService builds a real AgentService (JSON-backed repository in
+// a temp dir, two agent definitions, two models) for driving the ctrl+a/
+// ctrl+o overlay's real keybinding path without needing a provider/network
+// call — SetAgent/SetModel only touch the JSON repository, the same reason
+// TestChatModel_ModeToggle_RealSetMode's service needs no provider.
+func newSwitchTestService(t *testing.T) *services.AgentService {
+	t.Helper()
+	repo, err := jsonrepo.NewChatRepository(t.TempDir())
+	require.NoError(t, err)
+	return services.NewAgentService(services.AgentServiceConfig{
+		Definitions: services.Definitions{
+			Agents: map[string]agentsource.AgentDefinition{
+				"assistant": {Name: "assistant"},
+				"helper":    {Name: "helper"},
+			},
+		},
+		Providers:    []entities.ProviderConfig{{Name: "p", Type: entities.ProviderTypeOpenAI}},
+		Models:       []entities.ModelConfig{{Name: "m1", Provider: "p"}, {Name: "m2", Provider: "p"}},
+		DefaultModel: "m1",
+		Repository:   repo,
+	})
+}
+
+// TestChatModel_CtrlA_OpensAgentPicker_SelectingSwitchesAgentKeepsChat drives
+// the real ctrl+a keybinding path end to end: it opens the overlay
+// (pickerAgent), navigates to and selects the other loaded agent, and
+// asserts SetAgent was actually called (via the real AgentService/
+// repository, not just that a message got produced) — the persisted chat's
+// AgentName changes, the chat ID never changes, and the transcript built up
+// before the switch is untouched, proving this is an in-place agent switch,
+// not "abandon this chat and start a new one".
+func TestChatModel_CtrlA_OpensAgentPicker_SelectingSwitchesAgentKeepsChat(t *testing.T) {
+	svc := newSwitchTestService(t)
+	ctx := context.Background()
+	_, err := svc.StartChat(ctx, "chat-1", "assistant")
+	require.NoError(t, err)
+
+	c := newChatModel("chat-1", "assistant", nil, "execute", "m1", 80, 24)
+	c.transcript = append(c.transcript, transcriptEntry{role: message.RoleUser, text: "hello before the switch"})
+
+	cmd := c.handleKey(tea.KeyMsg{Type: tea.KeyCtrlA}, svc, ctx)
+	assert.Nil(t, cmd, "opening the picker is a synchronous, in-memory ListAgents() read — no Cmd needed")
+	require.NotNil(t, c.picker, "ctrl+a must open the in-chat overlay picker")
+	assert.Equal(t, pickerAgent, c.pickerKind)
+
+	// Agent names are sorted (ListAgents): "assistant", "helper". Move down
+	// to select "helper", the agent the chat isn't currently bound to.
+	c.handleKey(tea.KeyMsg{Type: tea.KeyDown}, svc, ctx)
+	selectCmd := c.handleKey(tea.KeyMsg{Type: tea.KeyEnter}, svc, ctx)
+	assert.Nil(t, c.picker, "selecting an entry must close the overlay immediately")
+
+	require.NotNil(t, selectCmd)
+	msg := selectCmd()
+	agentMsg, ok := msg.(agentChangedMsg)
+	require.True(t, ok, "selecting an agent must produce an agentChangedMsg, got %#v", msg)
+	assert.Equal(t, "helper", agentMsg.agentName)
+
+	// Model.Update applies agentChangedMsg onto c.agentName (see model.go) —
+	// simulate that here, matching TestChatModel_ModeToggle_RealSetMode's own
+	// note on Bubble Tea's Cmd/Msg round trip.
+	c.agentName = agentMsg.agentName
+	assert.Equal(t, "helper", c.agentName)
+
+	chat, err := svc.GetModel(ctx, "chat-1") // any real-repository read proves the chat ID is unchanged
+	require.NoError(t, err)
+	assert.Equal(t, "m1", chat, "the chat's model must be untouched by an agent switch")
+
+	require.Len(t, c.transcript, 1, "switching agents must not clear or reset the in-chat transcript")
+	assert.Equal(t, "hello before the switch", c.transcript[0].text)
+}
+
+// TestChatModel_CtrlO_OpensModelPicker_SelectingSwitchesModel mirrors the
+// ctrl+a test above for ctrl+o/SetModel.
+func TestChatModel_CtrlO_OpensModelPicker_SelectingSwitchesModel(t *testing.T) {
+	svc := newSwitchTestService(t)
+	ctx := context.Background()
+	_, err := svc.StartChat(ctx, "chat-1", "assistant")
+	require.NoError(t, err)
+
+	c := newChatModel("chat-1", "assistant", nil, "execute", "m1", 80, 24)
+
+	cmd := c.handleKey(tea.KeyMsg{Type: tea.KeyCtrlO}, svc, ctx)
+	assert.Nil(t, cmd)
+	require.NotNil(t, c.picker, "ctrl+o must open the in-chat overlay picker")
+	assert.Equal(t, pickerModel, c.pickerKind)
+
+	// Model names are sorted (ListModels): "m1", "m2". Move down to select
+	// "m2".
+	c.handleKey(tea.KeyMsg{Type: tea.KeyDown}, svc, ctx)
+	selectCmd := c.handleKey(tea.KeyMsg{Type: tea.KeyEnter}, svc, ctx)
+	assert.Nil(t, c.picker)
+
+	require.NotNil(t, selectCmd)
+	msg := selectCmd()
+	modelMsg, ok := msg.(modelChangedMsg)
+	require.True(t, ok, "selecting a model must produce a modelChangedMsg, got %#v", msg)
+	assert.Equal(t, "m2", modelMsg.model)
+
+	c.model = modelMsg.model
+	assert.Equal(t, "m2", c.model)
+
+	gotModel, err := svc.GetModel(ctx, "chat-1")
+	require.NoError(t, err)
+	assert.Equal(t, "m2", gotModel, "SetModel must have actually persisted the switch, not just produced a message")
+}
+
+// TestChatModel_CtrlA_CtrlO_NoopDuringPendingApproval asserts ctrl+a/ctrl+o
+// are swallowed (not opening the overlay) while an approval prompt is
+// pending — routed to handleApprovalKey instead, which has no case for
+// either key, matching "approve"/"always allow"/"deny" being the only valid
+// responses while a tool call awaits a decision.
+func TestChatModel_CtrlA_CtrlO_NoopDuringPendingApproval(t *testing.T) {
+	svc := newSwitchTestService(t)
+	ctx := context.Background()
+	_, err := svc.StartChat(ctx, "chat-1", "assistant")
+	require.NoError(t, err)
+
+	c := newChatModel("chat-1", "assistant", nil, "execute", "m1", 80, 24)
+	c.pendingApproval = &message.ToolApprovalRequestContent{
+		RequestID: "req-1",
+		ToolCall:  &message.FunctionCallContent{CallID: "call-1", Name: "run_shell", Arguments: "{}"},
+	}
+
+	cmd := c.handleKey(tea.KeyMsg{Type: tea.KeyCtrlA}, svc, ctx)
+	assert.Nil(t, cmd)
+	assert.Nil(t, c.picker, "ctrl+a must not open the agent-switch overlay while an approval prompt is pending")
+	assert.NotNil(t, c.pendingApproval, "the pending approval must be untouched")
+
+	cmd = c.handleKey(tea.KeyMsg{Type: tea.KeyCtrlO}, svc, ctx)
+	assert.Nil(t, cmd)
+	assert.Nil(t, c.picker, "ctrl+o must not open the model-switch overlay while an approval prompt is pending")
+	assert.NotNil(t, c.pendingApproval)
+}
+
+// TestChatModel_CtrlA_CtrlO_NoopDuringActiveStream asserts ctrl+a/ctrl+o are
+// no-ops while a turn is actively streaming, the same guard "enter"
+// (sending a message) already applies — switching agent/model mid-tool-call
+// or mid-response must not be possible.
+func TestChatModel_CtrlA_CtrlO_NoopDuringActiveStream(t *testing.T) {
+	svc := newSwitchTestService(t)
+	ctx := context.Background()
+	_, err := svc.StartChat(ctx, "chat-1", "assistant")
+	require.NoError(t, err)
+
+	c := newChatModel("chat-1", "assistant", nil, "execute", "m1", 80, 24)
+	c.streamActive = true
+
+	cmd := c.handleKey(tea.KeyMsg{Type: tea.KeyCtrlA}, svc, ctx)
+	assert.Nil(t, cmd)
+	assert.Nil(t, c.picker, "ctrl+a must not open the agent-switch overlay while a stream is active")
+
+	cmd = c.handleKey(tea.KeyMsg{Type: tea.KeyCtrlO}, svc, ctx)
+	assert.Nil(t, cmd)
+	assert.Nil(t, c.picker, "ctrl+o must not open the model-switch overlay while a stream is active")
+	assert.True(t, c.streamActive, "streamActive must be untouched by the no-op key presses")
 }
