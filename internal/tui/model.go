@@ -303,9 +303,46 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		var cmd tea.Cmd
 		m.chat.spinner, cmd = m.chat.spinner.Update(msg)
 		return m, cmd
-	}
 
-	return m, nil
+	default:
+		// Fixes a long-standing bug present since ctrl+a/ctrl+o's overlay
+		// pickers were first introduced, not something new: bubbles/
+		// list.Model's own filtering is asynchronous — typing into an open
+		// filter updates FilterInput immediately, but list.Model.Update
+		// returns a Cmd (producing list.FilterMatchesMsg) that has to be
+		// run and fed back into that *same* list.Model before
+		// VisibleItems() actually reflects the query. Every case above is
+		// an exhaustive, explicit type switch, so any message type not
+		// named above — FilterMatchesMsg chief among them, but also
+		// whatever else bubbles/list or its FilterInput/paginator produce
+		// internally — fell through to a bare "return m, nil" and was
+		// silently dropped, no matter which list.Model it belonged to.
+		// Confirmed directly: draining a real "/", then "openai" keystroke
+		// sequence through an open picker without this case left every
+		// item visible regardless of the filter text typed, reproducing
+		// exactly the reported symptom. Route to whichever list.Model is
+		// currently active: the in-chat overlay picker if one is open
+		// (checked first — it can be open regardless of m.screen, since
+		// screen only distinguishes the top-level picker/history/chat
+		// views, not the chat-scoped overlay), else historyList/agentList
+		// depending on m.screen.
+		if m.chat != nil && m.chat.picker != nil {
+			var cmd tea.Cmd
+			*m.chat.picker, cmd = m.chat.picker.Update(msg)
+			return m, cmd
+		}
+		switch m.screen {
+		case screenHistory:
+			var cmd tea.Cmd
+			m.historyList, cmd = m.historyList.Update(msg)
+			return m, cmd
+		case screenAgentPicker:
+			var cmd tea.Cmd
+			m.agentList, cmd = m.agentList.Update(msg)
+			return m, cmd
+		}
+		return m, nil
+	}
 }
 
 // handleKey dispatches a key press to the active screen: global quit

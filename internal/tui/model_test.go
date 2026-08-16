@@ -12,6 +12,7 @@ import (
 	"sync/atomic"
 	"testing"
 
+	"github.com/charmbracelet/bubbles/list"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/microsoft/agent-framework-go/agent"
 	"github.com/microsoft/agent-framework-go/agent/harness/todo"
@@ -1136,4 +1137,125 @@ func TestModel_SecondExchange_DoesNotRetriggerTitleGeneration(t *testing.T) {
 		_, isBatch := msg.(tea.BatchMsg)
 		assert.False(t, isBatch, "a second turn's streamDoneMsg must not batch in generateTitleCmd again")
 	}
+}
+
+// ---------------------------------------------------------------------
+// list.Model filtering (post-v0.1.0 addendum: a long-standing bug, present
+// since ctrl+a/ctrl+o's overlay pickers were first introduced, not
+// something newly broken). bubbles/list.Model's own filtering is
+// asynchronous: typing into an open filter updates FilterInput
+// immediately, but list.Model.Update returns a Cmd (producing
+// list.FilterMatchesMsg) that has to be run and fed back into that *same*
+// list.Model before VisibleItems() reflects the query at all. Model.Update
+// is an exhaustive, explicit type switch with no default case routing
+// unrecognized messages anywhere, so FilterMatchesMsg was silently
+// dropped — every item stayed visible no matter what was typed, reproducing
+// the reported symptom exactly (filtering "openai" in the ctrl+o picker did
+// nothing).
+// ---------------------------------------------------------------------
+
+// driveKey simulates what the real bubbletea runtime does for one keypress:
+// dispatch it through Model.Update, then run the returned Cmd. The real
+// runtime specifically unpacks a tea.BatchMsg into its constituent Cmds and
+// feeds each resulting Msg back through Update individually — list.Model
+// batches its cursor-blink Cmd together with filterItems' Cmd, so without
+// unpacking, this test would never see the real list.FilterMatchesMsg at
+// all (mirrors drainCmd's own tea.BatchMsg handling, model_test.go). Only
+// one level deep, not a loop until cmd is nil: textinput's cursor-blink Cmd
+// re-arms itself forever via tea.Tick while focused, so looping would hang;
+// one level is enough for FilterMatchesMsg to make it back to the
+// list.Model, which is all these tests need.
+func driveKey(m Model, msg tea.Msg) Model {
+	next, cmd := m.Update(msg)
+	m = next.(Model)
+	if cmd == nil {
+		return m
+	}
+	resultMsg := cmd()
+	if batch, ok := resultMsg.(tea.BatchMsg); ok {
+		for _, sub := range batch {
+			if sub == nil {
+				continue
+			}
+			subMsg := sub()
+			if subMsg == nil {
+				continue
+			}
+			next, _ = m.Update(subMsg)
+			m = next.(Model)
+		}
+		return m
+	}
+	if resultMsg == nil {
+		return m
+	}
+	next, _ = m.Update(resultMsg)
+	return next.(Model)
+}
+
+func typeIntoFilter(t *testing.T, m Model, query string) Model {
+	t.Helper()
+	m = driveKey(m, tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("/")})
+	for _, r := range query {
+		m = driveKey(m, tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{r}})
+	}
+	return m
+}
+
+// TestChatModel_CtrlO_FilterActuallyNarrowsVisibleItems is the exact
+// reported bug: opening ctrl+o's model picker, pressing "/", and typing
+// "openai" must narrow VisibleItems() to matches, not leave every model
+// visible.
+func TestChatModel_CtrlO_FilterActuallyNarrowsVisibleItems(t *testing.T) {
+	repo, err := jsonrepo.NewChatRepository(t.TempDir())
+	require.NoError(t, err)
+	svc := services.NewAgentService(services.AgentServiceConfig{
+		Definitions: services.Definitions{Agents: map[string]agentsource.AgentDefinition{"assistant": {Name: "assistant"}}},
+		Providers: []entities.ProviderConfig{
+			{Name: "openai", Type: entities.ProviderTypeOpenAI},
+			{Name: "groq", Type: entities.ProviderTypeGroq},
+		},
+		Models: []entities.ModelConfig{
+			{Name: "openai", Provider: "openai", ModelName: "gpt-5.6"},
+			{Name: "groq/qwen", Provider: "groq", ModelName: "qwen"},
+			{Name: "groq/llama", Provider: "groq", ModelName: "llama"},
+		},
+		DefaultModel: "openai",
+		Repository:   repo,
+	})
+	ctx := context.Background()
+	_, err = svc.StartChat(ctx, "chat-1", "assistant")
+	require.NoError(t, err)
+
+	c := newChatModel("chat-1", "assistant", nil, "execute", "openai", 80, 24)
+	c.openPicker(svc, pickerModel)
+	require.Len(t, c.picker.Items(), 3)
+
+	m := typeIntoFilter(t, Model{svc: svc, ctx: ctx, screen: screenChat, chat: c}, "openai")
+
+	require.Equal(t, list.Filtering, m.chat.picker.FilterState())
+	visible := m.chat.picker.VisibleItems()
+	require.Len(t, visible, 1, "filtering \"openai\" must narrow the list down, not leave every model visible")
+	assert.Equal(t, "openai", visible[0].(modelPickerItem).name)
+}
+
+// TestModel_TopLevelAgentPicker_FilterActuallyNarrowsVisibleItems proves
+// the fix isn't scoped to just the chat-overlay picker — the same
+// FilterMatchesMsg-dropping bug affected the top-level agentList too, since
+// Model.Update's exhaustiveness was the root cause, not anything specific
+// to chatModel's overlay.
+func TestModel_TopLevelAgentPicker_FilterActuallyNarrowsVisibleItems(t *testing.T) {
+	m := NewModel(context.Background(), nil, map[string]agentsource.AgentDefinition{
+		"assistant": {Name: "assistant"},
+		"reviewer":  {Name: "reviewer"},
+		"writer":    {Name: "writer"},
+	}, "", "")
+	require.Len(t, m.agentList.Items(), 3)
+
+	m = typeIntoFilter(t, m, "review")
+
+	require.Equal(t, list.Filtering, m.agentList.FilterState())
+	visible := m.agentList.VisibleItems()
+	require.Len(t, visible, 1)
+	assert.Equal(t, "reviewer", visible[0].(agentItem).def.Name)
 }

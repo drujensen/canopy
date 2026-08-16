@@ -70,7 +70,7 @@ func run() error {
 	flag.StringVar(&storage, "storage", "file", `storage backend; "file" is the only supported value in v1 (Requirements FR15)`)
 	flag.BoolVar(&showVersion, "version", false, "print the version and exit")
 	flag.BoolVar(&enableOTel, "otel", false, "enable optional OpenTelemetry tracing (Design §3.10); also enabled implicitly when OTEL_EXPORTER_OTLP_ENDPOINT or OTEL_EXPORTER_OTLP_TRACES_ENDPOINT is set")
-	flag.BoolVar(&refreshProviders, "refresh-providers", false, "force a live re-fetch of the models.dev catalog, add any newly-detectable providers/models to providers.json, and refresh cost data on existing models (every other field of an existing entry is left untouched — Design §4 addendum)")
+	flag.BoolVar(&refreshProviders, "refresh-providers", false, "force a live re-fetch of the models.dev catalog: add newly-detectable providers, sync each already-configured provider's model list (add new, remove ones the catalog no longer lists) and refresh cost data — a provider not re-detected this run (env var unset, or manually added/self-hosted) is never touched (every field of an already-present provider stays untouched too — Design §4 addendum)")
 	flag.BoolVar(&continueLatest, "continue", false, "resume the most recently updated chat session (across any agent) instead of starting a new one or auto-resuming the last-used agent — Design §5 addendum")
 	flag.Parse()
 
@@ -163,19 +163,34 @@ func run() error {
 	// Explicit refresh (post-v0.1.0 addendum, Design §4 addendum):
 	// --refresh-providers forces a live re-fetch (bypasses the
 	// cache-freshness check entirely — FetchCached's maxAge<=0 contract) and
-	// re-runs detection, ADDING any newly-detectable providers/models to the
+	// re-runs detection, ADDING any newly-detectable providers to the
 	// existing file rather than regenerating it — an already-present
-	// provider, matched by Name, is never touched even if the catalog's data
-	// for it changed, since the user may have hand-edited it. This is the
-	// escape hatch for "I added a new API key to my environment after first
-	// run and want Canopy to notice without hand-editing JSON."
+	// provider itself, matched by Name (its BaseURL/APIKey/APIKeyEnv/
+	// TimeoutSeconds), is never touched even if the catalog's data for it
+	// changed, since the user may have hand-edited it. This is the escape
+	// hatch for "I added a new API key to my environment after first run
+	// and want Canopy to notice without hand-editing JSON."
 	//
-	// The one deliberate exception to "never touched" is per-model cost
-	// (updateExistingModelCosts): every existing model, even one whose
-	// provider was already configured and so skipped entirely by
-	// mergeNewProviders, gets its cost fields refreshed from the live
-	// catalog. See that function's doc comment for why cost specifically is
-	// safe to keep fresh where every other field on an existing entry isn't.
+	// A provider's *model list*, and per-model cost, are the deliberate
+	// exceptions to "never touched" — post-v0.1.0 addendum, "sync, not just
+	// add": models.dev listing more (or fewer) tool-call-capable models for
+	// an already-configured provider than it did when that provider was
+	// first configured is common (see mergeNewModelsForExistingProviders'
+	// doc comment for a real, confirmed case), so an already-known
+	// provider's model list is kept in sync both ways —
+	// mergeNewModelsForExistingProviders adds what's newly listed,
+	// removeStaleModelsForRedetectedProviders removes what's no longer
+	// listed — and updateExistingModelCosts refreshes cost on whatever
+	// remains. Unlike touching an existing model's own fields (ModelName,
+	// ContextWindowTokens, a hand-set cost override), adding or removing
+	// which models exist for a provider — and refreshing cost, metadata a
+	// user has no reason to hand-edit away from what the provider actually
+	// charges — can never clobber a hand-edit the same way overwriting a
+	// field would. Each function's own doc comment covers its specific
+	// safety reasoning, including why removal in particular is scoped only
+	// to providers this run actually re-detected (never a self-hosted or
+	// otherwise manually-added provider like a private Ollama server, whose
+	// models the catalog has no opinion on at all).
 	if refreshProviders {
 		catalog, _, err := modelsdev.FetchCached(detectCtx, modelsCachePath, 0)
 		if err != nil {
@@ -193,33 +208,52 @@ func run() error {
 		if err != nil {
 			return fmt.Errorf("re-reading provider config for --refresh-providers: %w", err)
 		}
-		added := mergeNewProviders(raw, detectedFile)
+		addedProviders := mergeNewProviders(raw, detectedFile)
+		addedModels := mergeNewModelsForExistingProviders(raw, detectedFile)
+		removedModels := removeStaleModelsForRedetectedProviders(raw, detectedFile)
 		updatedCosts := updateExistingModelCosts(raw, detectedFile)
 
-		if len(added) > 0 || updatedCosts > 0 {
+		if len(addedProviders) > 0 || len(addedModels) > 0 || len(removedModels) > 0 || updatedCosts > 0 {
 			if err := providerStore.Save(raw); err != nil {
 				return fmt.Errorf("saving refreshed provider config: %w", err)
 			}
 			// Reload (resolved) so this run's AgentService picks up the
-			// newly-added provider(s)/refreshed cost immediately, no restart
+			// added/removed model(s)/refreshed cost immediately, no restart
 			// needed — same as the zero-config first-run path below.
 			providersFile, err = providerStore.Load()
 			if err != nil {
 				return fmt.Errorf("reloading provider config after refresh: %w", err)
 			}
 		}
-		switch {
-		case len(added) > 0 && updatedCosts > 0:
-			fmt.Fprintf(os.Stderr, "canopy: --refresh-providers added %d new provider(s) to %s:\n  %s\ncanopy: --refresh-providers also refreshed cost data for %d existing model(s)\n",
-				len(added), providerStore.Path(), strings.Join(describeProviders(providersFile.Providers, added), "\n  "), updatedCosts)
-		case len(added) > 0:
-			fmt.Fprintf(os.Stderr, "canopy: --refresh-providers added %d new provider(s) to %s:\n  %s\n",
-				len(added), providerStore.Path(), strings.Join(describeProviders(providersFile.Providers, added), "\n  "))
-		case updatedCosts > 0:
-			fmt.Fprintf(os.Stderr, "canopy: --refresh-providers found no new providers, but refreshed cost data for %d existing model(s) in %s\n",
-				updatedCosts, providerStore.Path())
-		default:
-			fmt.Fprintln(os.Stderr, "canopy: --refresh-providers found no new providers or cost changes (already up to date, or no new provider env vars set)")
+
+		var notes []string
+		if len(addedProviders) > 0 {
+			notes = append(notes, fmt.Sprintf("added %d new provider(s):\n  %s",
+				len(addedProviders), strings.Join(describeProviders(providersFile.Providers, addedProviders), "\n  ")))
+		}
+		if len(addedModels) > 0 {
+			names := make([]string, len(addedModels))
+			for i, m := range addedModels {
+				names[i] = m.Name
+			}
+			notes = append(notes, fmt.Sprintf("added %d new model(s) for already-configured providers:\n  %s",
+				len(addedModels), strings.Join(names, "\n  ")))
+		}
+		if len(removedModels) > 0 {
+			names := make([]string, len(removedModels))
+			for i, m := range removedModels {
+				names[i] = m.Name
+			}
+			notes = append(notes, fmt.Sprintf("removed %d model(s) the catalog no longer lists:\n  %s",
+				len(removedModels), strings.Join(names, "\n  ")))
+		}
+		if updatedCosts > 0 {
+			notes = append(notes, fmt.Sprintf("refreshed cost data for %d existing model(s)", updatedCosts))
+		}
+		if len(notes) > 0 {
+			fmt.Fprintf(os.Stderr, "canopy: --refresh-providers %s (%s)\n", strings.Join(notes, "; "), providerStore.Path())
+		} else {
+			fmt.Fprintln(os.Stderr, "canopy: --refresh-providers found nothing to add, remove, or update (already up to date, or no new provider env vars set)")
 		}
 	}
 
@@ -446,8 +480,6 @@ func run() error {
 	return nil
 }
 
-// mergeNewProviders adds any provider (and its paired model, matched via
-// ModelConfig.Provider) from detected that isn't already present in dst,
 // computeStartAgent decides which agent (if any) this run should
 // auto-resume into (post-v0.1.0 addendum, Design §5's addendum), rather
 // than always showing the top-level agent picker:
@@ -499,6 +531,117 @@ func mergeNewProviders(dst *config.ProvidersFile, detected config.ProvidersFile)
 		added = append(added, p.Name)
 	}
 	return added
+}
+
+// mergeNewModelsForExistingProviders adds any detected model belonging to
+// an *already-configured* provider that isn't already present in
+// dst.Models — matched by (Provider, ModelName) via modelKey, the same
+// identity updateExistingModelCosts uses, not Name (a model added under an
+// existing provider before DetectProviders' "list every tool-call-capable
+// model, not just one" addendum existed, or hand-added under a different
+// display Name, must still be recognized as the same model rather than
+// duplicated).
+//
+// This is the gap mergeNewProviders' own "an already-present provider is
+// never touched" guarantee otherwise leaves: mergeNewProviders only ever
+// populates a provider's model list at the moment that provider itself is
+// first detected — a provider configured before models.dev listed as many
+// models for it as it does now (or configured by hand with just one model
+// to begin with) never grows its model list on a later --refresh-providers
+// run, no matter how many new models the catalog has added since, because
+// the provider itself was never "new" again. Confirmed against a live
+// catalog fetch: a provider hand-configured with a single model (e.g. an
+// early "deepseek"/"google"/"github-copilot" entry predating the "all
+// models" addendum) can permanently miss dozens of the catalog's other
+// tool-call-capable models for that same provider, indistinguishable in
+// the UI from a provider that simply doesn't have more models — ctrl+o
+// would show one oddly-named entry (Name matching the provider's own name,
+// not DetectProviders' "<provider>/<model-id>" scheme) instead of the full
+// list every other provider gets.
+//
+// Only providers still present in *both* dst and detected are eligible —
+// a provider whose env var is no longer set (so it didn't re-detect this
+// run) gets no new models added, the same "can't add what wasn't actually
+// re-detected" posture DetectProviders itself already takes. Returns the
+// newly added models, for the refresh summary message.
+func mergeNewModelsForExistingProviders(dst *config.ProvidersFile, detected config.ProvidersFile) []entities.ModelConfig {
+	existingProviders := make(map[string]bool, len(dst.Providers))
+	for _, p := range dst.Providers {
+		existingProviders[p.Name] = true
+	}
+	existingModels := make(map[modelKey]bool, len(dst.Models))
+	for _, m := range dst.Models {
+		existingModels[modelKey{m.Provider, m.ModelName}] = true
+	}
+
+	var added []entities.ModelConfig
+	for _, m := range detected.Models {
+		if !existingProviders[m.Provider] {
+			continue // a brand-new provider is mergeNewProviders' job, not this one's
+		}
+		key := modelKey{m.Provider, m.ModelName}
+		if existingModels[key] {
+			continue
+		}
+		dst.Models = append(dst.Models, m)
+		existingModels[key] = true
+		added = append(added, m)
+	}
+	return added
+}
+
+// removeStaleModelsForRedetectedProviders removes any dst.Models entry
+// whose provider was actually re-detected this run (present in
+// detected.Providers) but whose (Provider, ModelName) the catalog no
+// longer lists among that provider's currently tool-call-capable models —
+// deprecated, renamed, or dropped since it was added. This is the "sync,
+// not just add" half of --refresh-providers: without it, a provider's
+// model list only ever grows, even long after the catalog stops listing a
+// model at all.
+//
+// Scoping is the load-bearing part, and mirrors
+// mergeNewModelsForExistingProviders' own reasoning exactly: only a
+// provider actually re-detected this run — present in detected.Providers,
+// meaning its env var is currently set and models.dev has a live opinion
+// on it — is eligible. A provider not re-detected this run, for either
+// reason, is completely untouched:
+//
+//   - Its env var isn't currently set (e.g. this run happened in a shell
+//     that doesn't have it exported) — nothing was actually re-verified,
+//     so nothing should be concluded absent, the same "can't add what
+//     wasn't actually re-detected" posture mergeNewModelsForExistingProviders
+//     already takes for additions.
+//   - It was never a catalog provider to begin with — a self-hosted or
+//     otherwise manually-added provider (e.g. Ollama pointed at a private
+//     server, or any provider type DetectProviders' own catalog has no
+//     entry for at all). detected.Models can structurally never contain
+//     anything for a provider like this, so a naive "remove what's not in
+//     detected" without this scoping would delete every single one of its
+//     models on every --refresh-providers run — exactly the case flagged
+//     as needing to stay untouched.
+//
+// Returns the removed models, for the refresh summary message.
+func removeStaleModelsForRedetectedProviders(dst *config.ProvidersFile, detected config.ProvidersFile) []entities.ModelConfig {
+	redetectedProviders := make(map[string]bool, len(detected.Providers))
+	for _, p := range detected.Providers {
+		redetectedProviders[p.Name] = true
+	}
+	detectedKeys := make(map[modelKey]bool, len(detected.Models))
+	for _, m := range detected.Models {
+		detectedKeys[modelKey{m.Provider, m.ModelName}] = true
+	}
+
+	var removed []entities.ModelConfig
+	kept := dst.Models[:0]
+	for _, m := range dst.Models {
+		if redetectedProviders[m.Provider] && !detectedKeys[modelKey{m.Provider, m.ModelName}] {
+			removed = append(removed, m)
+			continue
+		}
+		kept = append(kept, m)
+	}
+	dst.Models = kept
+	return removed
 }
 
 // modelKey identifies a model independent of its user-chosen

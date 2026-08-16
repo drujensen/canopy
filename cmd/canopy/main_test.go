@@ -134,6 +134,155 @@ func TestMergeNewProviders_NothingNewIsANoOp(t *testing.T) {
 	assert.Equal(t, "gpt-4o", dst.Models[0].ModelName)
 }
 
+// TestMergeNewModelsForExistingProviders_AddsMissingModelsForKnownProvider
+// is the specific bug this function exists to fix: a provider configured
+// with only one model (e.g. an early "deepseek" entry predating
+// DetectProviders' "list every tool-call-capable model, not just one"
+// addendum) must pick up the catalog's other models for that same provider
+// on a later --refresh-providers run, even though mergeNewProviders itself
+// skips the provider entirely as "not new."
+func TestMergeNewModelsForExistingProviders_AddsMissingModelsForKnownProvider(t *testing.T) {
+	dst := &config.ProvidersFile{
+		Providers: []entities.ProviderConfig{{Name: "deepseek", Type: entities.ProviderTypeDeepSeek}},
+		Models: []entities.ModelConfig{
+			{Name: "deepseek", Provider: "deepseek", ModelName: "deepseek-v4-pro"},
+		},
+	}
+	detected := config.ProvidersFile{
+		Models: []entities.ModelConfig{
+			// Same model as the existing entry (different auto-generated
+			// Name) — must not be duplicated.
+			{Name: "deepseek/deepseek-v4-pro", Provider: "deepseek", ModelName: "deepseek-v4-pro", InputCostPerMillionTokens: 1},
+			// Genuinely new models the catalog now lists for this provider.
+			{Name: "deepseek/deepseek-v4-flash", Provider: "deepseek", ModelName: "deepseek-v4-flash"},
+			{Name: "deepseek/deepseek-chat", Provider: "deepseek", ModelName: "deepseek-chat"},
+			// A different provider entirely — must be ignored (that's
+			// mergeNewProviders' job, and this provider isn't in dst at all).
+			{Name: "openai/gpt-5", Provider: "openai", ModelName: "gpt-5"},
+		},
+	}
+
+	added := mergeNewModelsForExistingProviders(dst, detected)
+
+	require.Len(t, added, 2)
+	addedNames := []string{added[0].Name, added[1].Name}
+	assert.ElementsMatch(t, []string{"deepseek/deepseek-v4-flash", "deepseek/deepseek-chat"}, addedNames)
+
+	require.Len(t, dst.Models, 3, "the original model plus exactly the two new ones")
+	assert.Equal(t, "deepseek", dst.Models[0].Name, "the pre-existing model entry must be untouched, not replaced by the catalog's differently-named duplicate")
+}
+
+func TestMergeNewModelsForExistingProviders_IgnoresProvidersNotInDst(t *testing.T) {
+	dst := &config.ProvidersFile{
+		Providers: []entities.ProviderConfig{{Name: "openai", Type: entities.ProviderTypeOpenAI}},
+		Models:    []entities.ModelConfig{{Name: "openai", Provider: "openai", ModelName: "gpt-4o"}},
+	}
+	detected := config.ProvidersFile{
+		Models: []entities.ModelConfig{
+			{Name: "anthropic/claude", Provider: "anthropic", ModelName: "claude-opus"},
+		},
+	}
+
+	added := mergeNewModelsForExistingProviders(dst, detected)
+
+	assert.Empty(t, added, "a provider not already in dst is mergeNewProviders' job, not this one's")
+	assert.Len(t, dst.Models, 1)
+}
+
+func TestMergeNewModelsForExistingProviders_NothingNewIsANoOp(t *testing.T) {
+	dst := &config.ProvidersFile{
+		Providers: []entities.ProviderConfig{{Name: "openai", Type: entities.ProviderTypeOpenAI}},
+		Models:    []entities.ModelConfig{{Name: "openai", Provider: "openai", ModelName: "gpt-4o"}},
+	}
+	detected := config.ProvidersFile{
+		Models: []entities.ModelConfig{
+			{Name: "openai/gpt-4o", Provider: "openai", ModelName: "gpt-4o"},
+		},
+	}
+
+	added := mergeNewModelsForExistingProviders(dst, detected)
+
+	assert.Empty(t, added)
+	assert.Len(t, dst.Models, 1)
+}
+
+// ---------------------------------------------------------------------
+// removeStaleModelsForRedetectedProviders
+// ---------------------------------------------------------------------
+
+// TestRemoveStaleModelsForRedetectedProviders_RemovesModelTheCatalogDropped
+// is the "sync, not just add" behavior requested: a model the catalog no
+// longer lists for a provider that *was* re-detected this run must be
+// removed.
+func TestRemoveStaleModelsForRedetectedProviders_RemovesModelTheCatalogDropped(t *testing.T) {
+	dst := &config.ProvidersFile{
+		Providers: []entities.ProviderConfig{{Name: "openai", Type: entities.ProviderTypeOpenAI}},
+		Models: []entities.ModelConfig{
+			{Name: "openai/gpt-4o", Provider: "openai", ModelName: "gpt-4o"},
+			{Name: "openai/gpt-3-deprecated", Provider: "openai", ModelName: "gpt-3-deprecated"},
+		},
+	}
+	detected := config.ProvidersFile{
+		Providers: []entities.ProviderConfig{{Name: "openai", Type: entities.ProviderTypeOpenAI}},
+		Models: []entities.ModelConfig{
+			{Name: "openai/gpt-4o", Provider: "openai", ModelName: "gpt-4o"},
+			// gpt-3-deprecated is absent — the catalog no longer lists it.
+		},
+	}
+
+	removed := removeStaleModelsForRedetectedProviders(dst, detected)
+
+	require.Len(t, removed, 1)
+	assert.Equal(t, "openai/gpt-3-deprecated", removed[0].Name)
+	require.Len(t, dst.Models, 1)
+	assert.Equal(t, "openai/gpt-4o", dst.Models[0].Name, "the still-listed model must survive")
+}
+
+// TestRemoveStaleModelsForRedetectedProviders_NeverTouchesProviderNotRedetected
+// is the specific safety property requested: a provider not re-detected
+// this run — a self-hosted/manually-added provider like a private Ollama
+// server (never a models.dev catalog provider at all), or a real catalog
+// provider whose env var just isn't set this run — must have every one of
+// its models left completely alone, never treated as "missing" and removed.
+func TestRemoveStaleModelsForRedetectedProviders_NeverTouchesProviderNotRedetected(t *testing.T) {
+	dst := &config.ProvidersFile{
+		Providers: []entities.ProviderConfig{
+			{Name: "drujensen", Type: entities.ProviderTypeOllama, BaseURL: "ai.drujensen.com"},
+			{Name: "anthropic", Type: entities.ProviderTypeAnthropic},
+		},
+		Models: []entities.ModelConfig{
+			{Name: "ornith", Provider: "drujensen", ModelName: "ornith:35b"},
+			{Name: "qwen3.8", Provider: "drujensen", ModelName: "qwen3.8:latest"},
+			{Name: "anthropic/claude", Provider: "anthropic", ModelName: "claude-opus"},
+		},
+	}
+	// detected carries no "drujensen" provider at all (models.dev has never
+	// heard of it — self-hosted) and no "anthropic" provider either (its
+	// env var isn't set this particular run).
+	detected := config.ProvidersFile{}
+
+	removed := removeStaleModelsForRedetectedProviders(dst, detected)
+
+	assert.Empty(t, removed, "nothing may be removed when no provider was actually re-detected")
+	assert.Len(t, dst.Models, 3, "every model of every non-redetected provider must survive untouched")
+}
+
+func TestRemoveStaleModelsForRedetectedProviders_NothingStaleIsANoOp(t *testing.T) {
+	dst := &config.ProvidersFile{
+		Providers: []entities.ProviderConfig{{Name: "openai", Type: entities.ProviderTypeOpenAI}},
+		Models:    []entities.ModelConfig{{Name: "openai/gpt-4o", Provider: "openai", ModelName: "gpt-4o"}},
+	}
+	detected := config.ProvidersFile{
+		Providers: []entities.ProviderConfig{{Name: "openai", Type: entities.ProviderTypeOpenAI}},
+		Models:    []entities.ModelConfig{{Name: "openai/gpt-4o", Provider: "openai", ModelName: "gpt-4o"}},
+	}
+
+	removed := removeStaleModelsForRedetectedProviders(dst, detected)
+
+	assert.Empty(t, removed)
+	assert.Len(t, dst.Models, 1)
+}
+
 // TestUpdateExistingModelCosts_RefreshesCostOnAlreadyPresentModel is the
 // specific behavior requested against --refresh-providers' original
 // "existing entries are never touched" contract: cost specifically must be

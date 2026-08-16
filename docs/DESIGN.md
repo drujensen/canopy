@@ -420,6 +420,42 @@ has no pricing for at all, or a provider that isn't currently detectable) is lef
 untouched, cost included — this only ever refreshes toward fresher data Canopy actually has in
 hand, never clears a value to zero for absence of new data.
 
+Addendum (post-v0.1.0, model list sync): a real gap in the above, confirmed against a live catalog
+fetch — an already-configured provider's model *list* never grew on `--refresh-providers`, only its
+existing models' cost did. A provider hand-configured (or configured by an earlier, pre-"list every
+tool-call-capable model" version of `DetectProviders`) with just one model stayed stuck at one
+model forever, no matter how many more the catalog later listed for it: `mergeNewProviders` only
+ever populates a provider's model list at the moment that provider itself is first detected, and an
+already-present provider is skipped entirely by that function, models included. Confirmed live:
+`deepseek` (1 configured vs. 4 in the catalog), `google` (1 vs. 22), and `github-copilot` (1 vs. 33)
+were all silently missing the large majority of their available models — in `ctrl+o`, this looked
+like three oddly-named entries (`Name` matching the provider's own name, not `DetectProviders`'
+`"<provider>/<model-id>"` scheme) rather than the full list every freshly-auto-detected provider
+gets.
+
+Two new functions close this, both scoped to providers the models.dev catalog actually re-verified
+*this run* — present in `detected.Providers`, meaning the env var is currently set and the catalog
+has live data for it:
+
+- `mergeNewModelsForExistingProviders` adds any catalog model for an eligible provider not already
+  in `dst.Models` (matched by `(Provider, ModelName)`, the same `modelKey` `updateExistingModelCosts`
+  uses).
+- `removeStaleModelsForRedetectedProviders` — the "sync, not just add" half, added when explicitly
+  asked whether stale models get cleaned up too — removes any existing model for an eligible
+  provider whose `(Provider, ModelName)` the catalog no longer lists (deprecated, renamed, or
+  dropped).
+
+The re-detection scoping is load-bearing for removal specifically, not just a nicety: a provider
+*not* re-detected this run — its env var currently unset, or it was never a catalog provider at all
+(a self-hosted/manually-added provider, e.g. Ollama pointed at a private server) — is completely
+untouched by either function. `detected.Models` can structurally never contain anything for a
+provider the catalog has no opinion on, so without this scoping, a naive "remove what's not in
+detected" would delete *every* model of a self-hosted provider on every `--refresh-providers` run —
+exactly the case flagged as needing to stay untouched. Verified live: after the fix, `deepseek`/
+`google`/`github-copilot` (and, it turned out, `openai`, the same gap) synced to the catalog's full
+model counts, `drujensen` (a private Ollama server, 2 hand-configured models) was untouched, and a
+second run was a clean no-op.
+
 The table above ("Provider | Canopy implementation") is no longer a closed list at the dispatch
 level: `impl/providers.New`'s `default:` case now routes *any* unrecognized `cfg.Type` through the
 same generic OpenAI-compatible adapter as long as `cfg.BaseURL` is set — the auto-detected
@@ -637,6 +673,22 @@ italic) from a real transcript entry. It is never appended to `transcript` itsel
 part of what a turn sends to the model and never persisted; the very next `refreshViewport` call
 that has real content (the first user message, via `handleKey`'s `"enter"` case) simply omits it
 rather than needing an explicit "clear the greeting" step anywhere.
+
+Addendum (post-v0.1.0, picker filtering bug fix): `/`-filtering any `bubbles/list.Model`-backed
+picker — the top-level agent picker, ctrl+o's model picker, and every other in-chat overlay — did
+nothing: `FilterInput` updated and `FilterState()` correctly reported `Filtering`, but
+`VisibleItems()` never actually narrowed no matter what was typed. Root cause, confirmed directly:
+`bubbles/list.Model`'s filtering is asynchronous by design — typing changes `FilterInput`
+immediately, but `list.Model.Update` returns a `Cmd` (producing `list.FilterMatchesMsg`) that has to
+be run and fed back into that *same* `list.Model` before `VisibleItems()` reflects the query at all.
+`Model.Update` was (and, since ctrl+a/ctrl+o's overlay pickers were first introduced, always had
+been) an exhaustive, explicit type switch with no `default:` case — any message type not named
+above, `FilterMatchesMsg` chief among them, fell through to a bare `return m, nil` and was silently
+dropped. Fixed with a `default:` case routing an unrecognized message to whichever `list.Model` is
+currently active: the in-chat overlay picker (`chatModel.picker`) if one is open, else
+`historyList`/`agentList` depending on `m.screen`. Not scoped to ctrl+o specifically — the root
+cause was in `Model.Update` itself, so it affected every filterable list equally; the fix covers all
+of them the same way.
 
 Addendum (post-v0.1.0, provider retry/backoff): `impl/providers.maxProviderRetries`
 (`openaicompat.go`) makes retry-on-429 an explicit, uniform choice across all three provider
