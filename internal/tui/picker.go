@@ -48,14 +48,15 @@ type modelPickerItem struct {
 
 func (i modelPickerItem) Title() string { return i.name }
 
-// Description formats cost as "$<input>/$<output> per 1M tokens (req/resp)"
-// when at least one side is known, or "" (matching pickerItem's blank
-// Description, rather than a misleading "$0.00/$0.00") when a model's cost
-// is entirely unset — true for every self-hosted/local model (Ollama and
-// the like) and for any provider models.dev doesn't publish pricing for.
-// Costs are formatted with up to 2 decimal places, trimmed of a trailing
-// ".00" (most published per-million prices are whole or half dollars; a
-// forced two decimals would make "$2 in / $10 out" read as
+// Description formats cost as "$<input> in / $<output> out" (per million
+// request/response tokens — the unit is implied, not spelled out, to keep
+// the picker row short) when at least one side is known, or "" (matching
+// pickerItem's blank Description, rather than a misleading "$0/$0") when a
+// model's cost is entirely unset — true for every self-hosted/local model
+// (Ollama and the like) and for any provider models.dev doesn't publish
+// pricing for. Costs are formatted with up to 2 decimal places, trimmed of a
+// trailing ".00" (most published per-million prices are whole or half
+// dollars; a forced two decimals would make "$2 in / $10 out" read as
 // "$2.00 in / $10.00 out" for no benefit) via %g-style trimming done by hand
 // since Go's %g uses scientific notation past 6 significant digits, which a
 // price like 1234.5 would otherwise trigger.
@@ -63,8 +64,7 @@ func (i modelPickerItem) Description() string {
 	if i.inputCostPerMillion == 0 && i.outputCostPerMillion == 0 {
 		return ""
 	}
-	return fmt.Sprintf("$%s in / $%s out per 1M tokens (request/response)",
-		formatCost(i.inputCostPerMillion), formatCost(i.outputCostPerMillion))
+	return fmt.Sprintf("$%s in / $%s out", formatCost(i.inputCostPerMillion), formatCost(i.outputCostPerMillion))
 }
 
 func (i modelPickerItem) FilterValue() string { return i.name }

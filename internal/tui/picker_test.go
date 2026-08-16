@@ -43,7 +43,7 @@ func TestModelPickerItem_Description(t *testing.T) {
 
 	t.Run("both costs set", func(t *testing.T) {
 		item := modelPickerItem{name: "sonnet", inputCostPerMillion: 3, outputCostPerMillion: 15}
-		want := "$3 in / $15 out per 1M tokens (request/response)"
+		want := "$3 in / $15 out"
 		if got := item.Description(); got != want {
 			t.Errorf("Description() = %q, want %q", got, want)
 		}
@@ -51,7 +51,7 @@ func TestModelPickerItem_Description(t *testing.T) {
 
 	t.Run("only input cost set", func(t *testing.T) {
 		item := modelPickerItem{name: "weird", inputCostPerMillion: 1.5}
-		want := "$1.5 in / $0 out per 1M tokens (request/response)"
+		want := "$1.5 in / $0 out"
 		if got := item.Description(); got != want {
 			t.Errorf("Description() = %q, want %q", got, want)
 		}
