@@ -12,24 +12,34 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
+	"strings"
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/microsoft/agent-framework-go/agent"
 	"go.uber.org/zap"
 
+	"github.com/drujensen/canopy/internal/domain/entities"
 	"github.com/drujensen/canopy/internal/domain/services"
 	"github.com/drujensen/canopy/internal/impl/agentsource"
 	"github.com/drujensen/canopy/internal/impl/config"
 	"github.com/drujensen/canopy/internal/impl/logging"
 	"github.com/drujensen/canopy/internal/impl/mcpclient"
 	"github.com/drujensen/canopy/internal/impl/mcpsource"
+	"github.com/drujensen/canopy/internal/impl/modelsdev"
 	"github.com/drujensen/canopy/internal/impl/projectcontext"
 	jsonrepo "github.com/drujensen/canopy/internal/impl/repositories/json"
 	"github.com/drujensen/canopy/internal/impl/skillsource"
 	"github.com/drujensen/canopy/internal/impl/tracing"
 	"github.com/drujensen/canopy/internal/tui"
 )
+
+// modelsDevCacheMaxAge is how long a cached models.dev catalog fetch (Design
+// §4 addendum) is considered fresh enough to skip a live network round-trip
+// on ordinary startup — matches the predecessor aiagent project's refresh
+// interval for the same catalog.
+const modelsDevCacheMaxAge = 24 * time.Hour
 
 // version is Canopy's own version string (Requirements FR15's --version
 // flag). A package-level var, not a const, so a release build can override
@@ -48,16 +58,18 @@ func main() {
 
 func run() error {
 	var (
-		global      bool
-		storage     string
-		showVersion bool
-		enableOTel  bool
+		global           bool
+		storage          string
+		showVersion      bool
+		enableOTel       bool
+		refreshProviders bool
 	)
 	flag.BoolVar(&global, "global", false, "use ~/.canopy config/storage instead of a project-local .canopy directory")
 	flag.BoolVar(&global, "g", false, "shorthand for --global")
 	flag.StringVar(&storage, "storage", "file", `storage backend; "file" is the only supported value in v1 (Requirements FR15)`)
 	flag.BoolVar(&showVersion, "version", false, "print the version and exit")
 	flag.BoolVar(&enableOTel, "otel", false, "enable optional OpenTelemetry tracing (Design §3.10); also enabled implicitly when OTEL_EXPORTER_OTLP_ENDPOINT or OTEL_EXPORTER_OTLP_TRACES_ENDPOINT is set")
+	flag.BoolVar(&refreshProviders, "refresh-providers", false, "force a live re-fetch of the models.dev catalog and add any newly-detectable providers/models to providers.json (existing entries are never touched — Design §4 addendum)")
 	flag.Parse()
 
 	if showVersion {
@@ -125,20 +137,122 @@ func run() error {
 	if err != nil {
 		return fmt.Errorf("loading provider config: %w", err)
 	}
+
+	// models.dev catalog cache lives alongside providers.json — the same
+	// directory providerStore already resolved to, so this doesn't invent a
+	// fourth path-resolution scheme on top of --global/-g.
+	modelsCachePath := filepath.Join(filepath.Dir(providerStore.Path()), "models-cache.json")
+	detectCtx := context.Background()
+
+	// Explicit refresh (post-v0.1.0 addendum, Design §4 addendum):
+	// --refresh-providers forces a live re-fetch (bypasses the
+	// cache-freshness check entirely — FetchCached's maxAge<=0 contract) and
+	// re-runs detection, ADDING any newly-detectable providers/models to the
+	// existing file rather than regenerating it — an already-present
+	// provider, matched by Name, is never touched even if the catalog's data
+	// for it changed, since the user may have hand-edited it. This is the
+	// escape hatch for "I added a new API key to my environment after first
+	// run and want Canopy to notice without hand-editing JSON."
+	if refreshProviders {
+		catalog, _, err := modelsdev.FetchCached(detectCtx, modelsCachePath, 0)
+		if err != nil {
+			return fmt.Errorf("refreshing models.dev catalog: %w", err)
+		}
+		detectedFile, _, _ := config.DetectProviders(catalog, os.Environ())
+
+		// Merge into a fresh, UNRESOLVED read of what's actually on disk
+		// (LoadRaw, not the already-loaded providersFile above): providersFile
+		// went through Load's APIKeyEnv->APIKey resolution, and saving that
+		// back out would write a resolved literal secret into providers.json
+		// — exactly what APIKeyEnv exists to avoid. See ProviderStore.Load's
+		// doc comment.
+		raw, err := providerStore.LoadRaw()
+		if err != nil {
+			return fmt.Errorf("re-reading provider config for --refresh-providers: %w", err)
+		}
+		added := mergeNewProviders(raw, detectedFile)
+		if len(added) > 0 {
+			if err := providerStore.Save(raw); err != nil {
+				return fmt.Errorf("saving refreshed provider config: %w", err)
+			}
+			// Reload (resolved) so this run's AgentService picks up the
+			// newly-added provider(s) immediately, no restart needed — same
+			// as the zero-config first-run path below.
+			providersFile, err = providerStore.Load()
+			if err != nil {
+				return fmt.Errorf("reloading provider config after refresh: %w", err)
+			}
+			fmt.Fprintf(os.Stderr, "canopy: --refresh-providers added %d new provider(s) to %s:\n  %s\n",
+				len(added), providerStore.Path(), strings.Join(describeProviders(providersFile.Providers, added), "\n  "))
+		} else {
+			fmt.Fprintln(os.Stderr, "canopy: --refresh-providers found no new providers to add (already configured, or no new provider env vars set)")
+		}
+	}
+
+	// Zero-config first run (post-v0.1.0, Design §4 addendum): rather than
+	// hard-erroring when no providers/models are configured, try live
+	// auto-detection against whichever provider API-key env vars the user
+	// already has set (extremely common — OPENAI_API_KEY, ANTHROPIC_API_KEY,
+	// GEMINI_API_KEY, etc.) using the models.dev catalog — the same
+	// zero-manual-config spirit as agentsource.WriteDefault's default-agent
+	// feature above. A cached catalog fetch (24h freshness, see
+	// modelsDevCacheMaxAge) is used so this doesn't add a network
+	// round-trip to every ordinary startup once a fetch has happened once.
 	if len(providersFile.Providers) == 0 || len(providersFile.Models) == 0 {
-		return fmt.Errorf(
-			"no providers/models configured.\n\n"+
-				"Canopy looked for a provider config file at:\n"+
-				"  %s\n\n"+
-				"Create it with at least one provider and one model, e.g.:\n\n"+
-				"  {\n"+
-				"    \"providers\": [{\"name\": \"openai\", \"type\": \"openai\", \"api_key\": \"sk-...\"}],\n"+
-				"    \"models\": [{\"name\": \"gpt\", \"provider\": \"openai\", \"model_name\": \"gpt-4o-mini\"}]\n"+
-				"  }\n\n"+
-				"Pass --global/-g to use ~/.canopy/providers.json instead of a\n"+
-				"project-local .canopy/providers.json. See docs/DESIGN.md §4.",
-			providerStore.Path(),
-		)
+		catalog, _, catalogErr := modelsdev.FetchCached(detectCtx, modelsCachePath, modelsDevCacheMaxAge)
+		if catalogErr != nil {
+			return fmt.Errorf(
+				"no providers/models configured, and Canopy tried live auto-detection against "+
+					"https://models.dev but couldn't reach it: %v\n\n"+
+					"Canopy looked for a provider config file at:\n"+
+					"  %s\n\n"+
+					"Create it with at least one provider and one model, e.g.:\n\n"+
+					"  {\n"+
+					"    \"providers\": [{\"name\": \"openai\", \"type\": \"openai\", \"api_key\": \"sk-...\"}],\n"+
+					"    \"models\": [{\"name\": \"gpt\", \"provider\": \"openai\", \"model_name\": \"gpt-4o-mini\"}]\n"+
+					"  }\n\n"+
+					"Pass --global/-g to use ~/.canopy/providers.json instead of a\n"+
+					"project-local .canopy/providers.json. See docs/DESIGN.md §4.",
+				catalogErr, providerStore.Path(),
+			)
+		}
+
+		detectedFile, detectedNames, _ := config.DetectProviders(catalog, os.Environ())
+		if len(detectedNames) == 0 {
+			return fmt.Errorf(
+				"no providers/models configured. Canopy checked your environment for known provider "+
+					"API keys (using the live models.dev catalog) but found none set.\n\n"+
+					"Canopy checked these environment variable names:\n"+
+					"  %s\n\n"+
+					"Set one of these and run canopy again, or hand-write a provider config file at:\n"+
+					"  %s\n\n"+
+					"e.g.:\n\n"+
+					"  {\n"+
+					"    \"providers\": [{\"name\": \"openai\", \"type\": \"openai\", \"api_key\": \"sk-...\"}],\n"+
+					"    \"models\": [{\"name\": \"gpt\", \"provider\": \"openai\", \"model_name\": \"gpt-4o-mini\"}]\n"+
+					"  }\n\n"+
+					"Pass --global/-g to use ~/.canopy/providers.json instead of a\n"+
+					"project-local .canopy/providers.json. See docs/DESIGN.md §4.",
+				strings.Join(knownEnvVarNames(catalog), ", "), providerStore.Path(),
+			)
+		}
+
+		// detectedFile is pristine (DetectProviders never sets a literal
+		// APIKey, only APIKeyEnv), so saving it directly is safe. Reload
+		// afterward (resolved) rather than just assigning providersFile =
+		// &detectedFile, so this run's AgentService gets a real, populated
+		// APIKey the same way any config loaded from an existing file would
+		// — see ProviderStore.Load's doc comment on why Load's result and
+		// only Load's result should ever reach AgentService.
+		if err := providerStore.Save(&detectedFile); err != nil {
+			return fmt.Errorf("saving auto-detected provider config: %w", err)
+		}
+		providersFile, err = providerStore.Load()
+		if err != nil {
+			return fmt.Errorf("reloading auto-detected provider config: %w", err)
+		}
+		fmt.Fprintf(os.Stderr, "canopy: no providers/models configured; auto-detected %d provider(s) from your environment and saved to %s:\n  %s\n",
+			len(detectedNames), providerStore.Path(), strings.Join(describeProviders(providersFile.Providers, detectedNames), "\n  "))
 	}
 	// Judgment call: an AgentDefinition with no "model" frontmatter override
 	// falls back to the first configured model (ProvidersFile.Models is a
@@ -272,6 +386,74 @@ func run() error {
 		return fmt.Errorf("running the TUI: %w", err)
 	}
 	return nil
+}
+
+// mergeNewProviders adds any provider (and its paired model, matched via
+// ModelConfig.Provider) from detected that isn't already present in dst,
+// matched by ProviderConfig.Name — --refresh-providers' "additive, never
+// clobbers an existing entry" contract (Design §4 addendum). Returns the
+// names of providers actually added, for logging.
+func mergeNewProviders(dst *config.ProvidersFile, detected config.ProvidersFile) []string {
+	existing := make(map[string]bool, len(dst.Providers))
+	for _, p := range dst.Providers {
+		existing[p.Name] = true
+	}
+
+	var added []string
+	for _, p := range detected.Providers {
+		if existing[p.Name] {
+			continue
+		}
+		dst.Providers = append(dst.Providers, p)
+		for _, m := range detected.Models {
+			if m.Provider == p.Name {
+				dst.Models = append(dst.Models, m)
+			}
+		}
+		added = append(added, p.Name)
+	}
+	return added
+}
+
+// describeProviders renders "name (from ENV_VAR)" for each of names, in the
+// order given, looking up each provider's APIKeyEnv from providers — used
+// to tell the user which env var each auto-configured provider came from
+// without ever printing a key value.
+func describeProviders(providers []entities.ProviderConfig, names []string) []string {
+	byName := make(map[string]entities.ProviderConfig, len(providers))
+	for _, p := range providers {
+		byName[p.Name] = p
+	}
+	descriptions := make([]string, 0, len(names))
+	for _, name := range names {
+		p := byName[name]
+		if p.APIKeyEnv != "" {
+			descriptions = append(descriptions, fmt.Sprintf("%s (from %s)", p.Name, p.APIKeyEnv))
+		} else {
+			descriptions = append(descriptions, p.Name)
+		}
+	}
+	return descriptions
+}
+
+// knownEnvVarNames collects every env var name the live models.dev catalog
+// associates with any provider, deduplicated and sorted — used to tell the
+// user exactly what Canopy checked when auto-detection finds nothing to
+// configure, pulled live from the catalog rather than a hardcoded/stale
+// list.
+func knownEnvVarNames(catalog *modelsdev.Catalog) []string {
+	seen := make(map[string]bool)
+	var names []string
+	for _, p := range *catalog {
+		for _, name := range p.Env {
+			if !seen[name] {
+				seen[name] = true
+				names = append(names, name)
+			}
+		}
+	}
+	sort.Strings(names)
+	return names
 }
 
 // newFileLogger builds a production (structured JSON) zap.Logger writing to

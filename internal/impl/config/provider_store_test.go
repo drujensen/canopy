@@ -192,6 +192,95 @@ func TestProviderStore_SaveFailsWhenTargetPathIsADirectory(t *testing.T) {
 	assert.Contains(t, err.Error(), "rename")
 }
 
+// TestProviderStore_Load_ResolvesAPIKeyFromEnv asserts that a
+// ProviderConfig with APIKeyEnv set but no literal api_key in the on-disk
+// JSON gets APIKey populated from the named environment variable after
+// Load(), per entities.ProviderConfig's doc comment addendum.
+func TestProviderStore_Load_ResolvesAPIKeyFromEnv(t *testing.T) {
+	t.Setenv("SOME_TEST_VAR", "resolved-secret-value")
+
+	path := filepath.Join(t.TempDir(), "providers.json")
+	require.NoError(t, os.WriteFile(path, []byte(`{
+		"providers": [{"name": "p", "type": "openai", "api_key_env": "SOME_TEST_VAR"}],
+		"models": []
+	}`), 0o644))
+
+	store := NewProviderStore(path)
+	file, err := store.Load()
+	require.NoError(t, err)
+	require.Len(t, file.Providers, 1)
+	assert.Equal(t, "resolved-secret-value", file.Providers[0].APIKey)
+	assert.Equal(t, "SOME_TEST_VAR", file.Providers[0].APIKeyEnv)
+}
+
+// TestProviderStore_Load_LiteralAPIKeyWinsOverEnv asserts that a literal
+// api_key already present in the file is left untouched even when
+// api_key_env is also set — an explicit value is a deliberate override, not
+// something env resolution should clobber.
+func TestProviderStore_Load_LiteralAPIKeyWinsOverEnv(t *testing.T) {
+	t.Setenv("SOME_TEST_VAR", "should-not-be-used")
+
+	path := filepath.Join(t.TempDir(), "providers.json")
+	require.NoError(t, os.WriteFile(path, []byte(`{
+		"providers": [{"name": "p", "type": "openai", "api_key": "literal-key", "api_key_env": "SOME_TEST_VAR"}],
+		"models": []
+	}`), 0o644))
+
+	store := NewProviderStore(path)
+	file, err := store.Load()
+	require.NoError(t, err)
+	require.Len(t, file.Providers, 1)
+	assert.Equal(t, "literal-key", file.Providers[0].APIKey)
+}
+
+// TestProviderStore_LoadRaw_DoesNotResolveAPIKeyEnv is the regression test
+// for a real bug found during live verification: Load's result must never
+// be handed back to Save (it carries a resolved literal secret in memory),
+// and LoadRaw exists specifically so a caller that's about to modify and
+// re-save the file (cmd/canopy's --refresh-providers) has a way to read the
+// file without that resolution baked in, so a secret sourced from the
+// environment is never written to disk as a literal value.
+func TestProviderStore_LoadRaw_DoesNotResolveAPIKeyEnv(t *testing.T) {
+	t.Setenv("SOME_TEST_VAR", "resolved-secret-value")
+
+	path := filepath.Join(t.TempDir(), "providers.json")
+	require.NoError(t, os.WriteFile(path, []byte(`{
+		"providers": [{"name": "p", "type": "openai", "api_key_env": "SOME_TEST_VAR"}],
+		"models": []
+	}`), 0o644))
+
+	store := NewProviderStore(path)
+
+	raw, err := store.LoadRaw()
+	require.NoError(t, err)
+	require.Len(t, raw.Providers, 1)
+	assert.Empty(t, raw.Providers[0].APIKey, "LoadRaw must never resolve APIKeyEnv into APIKey")
+	assert.Equal(t, "SOME_TEST_VAR", raw.Providers[0].APIKeyEnv)
+
+	// Confirm Load (the resolving path) still resolves as expected, so the
+	// two methods' behavior is genuinely different, not just both no-ops.
+	resolved, err := store.Load()
+	require.NoError(t, err)
+	assert.Equal(t, "resolved-secret-value", resolved.Providers[0].APIKey)
+
+	// The specific regression: saving LoadRaw's result must never write a
+	// literal secret to disk.
+	require.NoError(t, store.Save(raw))
+	onDisk, err := os.ReadFile(path)
+	require.NoError(t, err)
+	assert.NotContains(t, string(onDisk), "resolved-secret-value")
+}
+
+// TestProviderStore_LoadRaw_MissingFileReturnsEmpty mirrors Load's "missing
+// file is not an error" contract.
+func TestProviderStore_LoadRaw_MissingFileReturnsEmpty(t *testing.T) {
+	store := NewProviderStore(filepath.Join(t.TempDir(), "providers.json"))
+	file, err := store.LoadRaw()
+	require.NoError(t, err)
+	assert.Empty(t, file.Providers)
+	assert.Empty(t, file.Models)
+}
+
 // TestProviderStore_SaveFailsWhenDirectoryNotWritable asserts Save's
 // os.CreateTemp error branch: a config directory that exists but isn't
 // writable (permission issue) fails clearly. Skipped when running as root,

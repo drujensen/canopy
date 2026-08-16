@@ -340,6 +340,43 @@ own config, distinct from the Claude-format files in §3.11: providers/models ar
 value-add over Claude Code (multi-provider support), so there's no existing format to be
 compatible with here.
 
+Addendum (post-v0.1.0): zero-config first run, mirroring §3.11's addendum for agents. Rather than
+hard-erroring when `providers.json` is empty/missing, `cmd/canopy`'s `run()` fetches the
+free, unauthenticated `https://models.dev/api.json` catalog (`impl/modelsdev`, 24h local cache at
+`<providers.json's directory>/models-cache.json` — no new path-resolution scheme) and calls
+`impl/config.DetectProviders(catalog, os.Environ())`. For each catalog provider whose associated
+API-key env var (`Env` in the catalog, e.g. `OPENAI_API_KEY`) is actually set, it builds a
+`ProviderConfig` carrying `APIKeyEnv` (the var's *name*) instead of a literal `APIKey`, paired with
+the most recently released tool-call-capable model the catalog lists for that provider (recency +
+`tool_call` filter, no hardcoded per-provider preferred-model list — deliberately generic so any
+provider the catalog adds later just works). `entities.ProviderConfig.APIKeyEnv` is resolved into
+`APIKey` by `ProviderStore.Load` via `os.Getenv`, in memory only, right after reading the file — a
+literal `APIKey` already present always wins, and the raw secret is never persisted to
+`providers.json`. If detection finds at least one provider, the result is saved and Canopy proceeds
+with it immediately, same as the default-agent feature; if the live fetch itself fails, the
+existing hard error's wording is extended to say so; if the fetch succeeds but nothing is detected,
+the hard error lists the exact env var names Canopy checked (pulled live from the catalog, not a
+stale hardcoded list). A `--refresh-providers` flag forces a live re-fetch (bypassing the 24h cache)
+and re-runs detection, **adding** any newly-detectable provider to the existing file — matched by
+`ProviderConfig.Name`, an already-present entry (even a hand-edited one) is never touched.
+
+The table above ("Provider | Canopy implementation") is no longer a closed list at the dispatch
+level: `impl/providers.New`'s `default:` case now routes *any* unrecognized `cfg.Type` through the
+same generic OpenAI-compatible adapter as long as `cfg.BaseURL` is set — the auto-detected
+`ProviderType` for a non-native catalog provider is just that provider's own catalog ID string
+(e.g. `"deepinfra"`, `"cerebras"`), which `New` has never seen a named const for and doesn't need
+one. Only an unrecognized type with no `BaseURL` is still a hard error (no endpoint to call). The 9
+named `ProviderType` consts are unchanged and still take the explicit native/named-compat paths in
+the switch when they match.
+
+Surprise vs. the predecessor aiagent project's version of this catalog: the live models.dev
+response has no `"type"` field at all (aiagent's struct carried one, always empty against real
+data), and several major, well-known providers — groq, togetherai (not `"together"` — the catalog's
+own ID differs from Canopy's `ProviderTypeTogether` const value), mistral, and xai among them — omit
+the `"api"` (base URL) field entirely, presumably because their consuming SDKs bake in a default
+base URL elsewhere. `DetectProviders` accounts for this: a non-native provider with no catalog base
+URL is skipped rather than emitting a config that would fail at dispatch time.
+
 ## 5. TUI
 
 The only frontend in v1 (Requirements §5). Existing aiagent TUI concepts (chat view, streaming

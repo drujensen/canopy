@@ -151,6 +151,22 @@ default "general" agent there on first run when nothing else exists, so a brand-
 with zero configuration — see `internal/impl/agentsource.WriteDefault` and DESIGN.md §3.11's
 addendum.
 
+Addendum (post-v0.1.0): FR1-FR3's "no providers/models configured" case no longer hard-errors
+either, on the same zero-config first-run principle as FR17's addendum above. Canopy fetches the
+free, unauthenticated models.dev catalog (`https://models.dev/api.json`, 24h-cached locally) and
+checks whether any provider's associated API-key environment variable (`OPENAI_API_KEY`,
+`ANTHROPIC_API_KEY`, `GEMINI_API_KEY`, etc. — whatever the live catalog says, never a hardcoded
+list) is already set. Any match becomes a `ProviderConfig` with `api_key_env` (the env var *name*)
+instead of a literal `api_key` — the real secret is resolved from the environment at load time,
+never written to `providers.json` — paired with the most recently released tool-call-capable model
+the catalog lists for that provider. See `internal/impl/modelsdev`, `config.DetectProviders`,
+`entities.ProviderConfig.APIKeyEnv`, and DESIGN.md §4's addendum. FR2's provider-adapter list is
+also no longer closed: `impl/providers.New` now routes *any* unrecognized provider type through the
+generic OpenAI-compatible adapter as long as a base URL is configured, not just the 6 named types —
+"support any provider," not just Canopy's original 9. A `--refresh-providers` flag forces a live
+re-check and additively appends any newly-detectable provider without touching what's already
+configured.
+
 ## 7. Non-functional requirements
 
 - **Security.** No API keys or secrets in logs by default. Bash/file tools retain input validation

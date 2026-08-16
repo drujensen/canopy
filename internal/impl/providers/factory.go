@@ -30,6 +30,18 @@ import (
 // ctx is used only to construct the Gemini client (genai.NewClient requires
 // one); the OpenAI and Anthropic clients are constructed synchronously and
 // ignore it.
+//
+// Dispatch (post-v0.1.0 addendum, Design §4): the 9 named ProviderType
+// consts still get their own explicit case below, same as before. Any other
+// cfg.Type — including one Canopy has never heard of, e.g. auto-detected
+// straight from the models.dev catalog's own provider ID string (see
+// config.DetectProviders) — now also succeeds via the generic
+// newOpenAICompatible path as long as cfg.BaseURL is set, on the same
+// rationale that already justified sharing that one path across DeepSeek,
+// Ollama, Groq, Mistral, Together, and xAI: the large majority of providers
+// only implement the OpenAI Chat Completions wire format. Only an
+// unrecognized type with no BaseURL is a real error — there's genuinely no
+// endpoint to call.
 func New(ctx context.Context, cfg entities.ProviderConfig, model entities.ModelConfig, agentCfg agent.Config) (*agent.Agent, error) {
 	switch cfg.Type {
 	case entities.ProviderTypeOpenAI:
@@ -50,7 +62,10 @@ func New(ctx context.Context, cfg entities.ProviderConfig, model entities.ModelC
 		return newOpenAICompatible(cfg, model, agentCfg)
 
 	default:
-		return nil, fmt.Errorf("providers: unrecognized provider type %q for provider %q", cfg.Type, cfg.Name)
+		if cfg.BaseURL != "" {
+			return newOpenAICompatible(cfg, model, agentCfg)
+		}
+		return nil, fmt.Errorf("providers: unrecognized provider type %q for provider %q (no base_url configured, so there's no endpoint to call)", cfg.Type, cfg.Name)
 	}
 }
 

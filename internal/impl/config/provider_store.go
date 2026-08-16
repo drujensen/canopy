@@ -85,7 +85,49 @@ func (s *ProviderStore) Path() string {
 // Load reads the provider/model config file. A missing file is not an
 // error — it returns an empty ProvidersFile, since a fresh install has no
 // config yet.
+//
+// For each loaded ProviderConfig with an empty APIKey and a non-empty
+// APIKeyEnv, Load resolves the real key from the named environment variable
+// (os.Getenv) and sets it on the in-memory struct — see
+// entities.ProviderConfig's doc comment addendum. This means the raw secret
+// is never read from providers.json for an env-sourced provider (only the
+// env var name is), and every downstream consumer just sees a populated
+// APIKey with no changes needed anywhere else. A ProviderConfig with a
+// literal APIKey already set is left untouched, even if APIKeyEnv also
+// happens to be set: an explicit value is a deliberate override.
+//
+// Because Load resolves secrets into memory, its result must never be
+// handed back to Save: doing so would write the resolved literal key back
+// to disk, defeating the entire point of APIKeyEnv. Any caller that reads
+// the file specifically to modify and re-save it (e.g. cmd/canopy's
+// --refresh-providers additive merge) must use LoadRaw instead.
 func (s *ProviderStore) Load() (*ProvidersFile, error) {
+	file, err := s.readFile()
+	if err != nil {
+		return nil, err
+	}
+	for i := range file.Providers {
+		p := &file.Providers[i]
+		if p.APIKey == "" && p.APIKeyEnv != "" {
+			p.APIKey = os.Getenv(p.APIKeyEnv)
+		}
+	}
+	return file, nil
+}
+
+// LoadRaw reads the provider/model config file exactly as it is on disk,
+// without Load's APIKeyEnv-to-APIKey resolution. Use this specifically when
+// the result may be written back out via Save (see Load's doc comment for
+// why reusing Load's result for that would leak a resolved secret onto
+// disk); use Load everywhere else, including for constructing runtime
+// provider clients.
+func (s *ProviderStore) LoadRaw() (*ProvidersFile, error) {
+	return s.readFile()
+}
+
+// readFile is Load and LoadRaw's shared "read and unmarshal, missing file
+// is not an error" logic.
+func (s *ProviderStore) readFile() (*ProvidersFile, error) {
 	data, err := os.ReadFile(s.path)
 	if err != nil {
 		if os.IsNotExist(err) {

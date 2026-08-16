@@ -161,7 +161,7 @@ func TestNew_OpenAICompatible_MissingBaseURL(t *testing.T) {
 
 // TestNew_UnrecognizedProviderType asserts a clear, specific error rather
 // than a panic or a silent default when cfg.Type doesn't match any known
-// provider.
+// provider and has no BaseURL — there's genuinely no endpoint to call.
 func TestNew_UnrecognizedProviderType(t *testing.T) {
 	cfg := entities.ProviderConfig{Name: "mystery", Type: entities.ProviderType("carrier-pigeon"), APIKey: "k"}
 	model := entities.ModelConfig{Name: "m", Provider: "mystery", ModelName: "whatever"}
@@ -169,6 +169,51 @@ func TestNew_UnrecognizedProviderType(t *testing.T) {
 	require.Error(t, err)
 	assert.Nil(t, a)
 	assert.Contains(t, err.Error(), "carrier-pigeon")
+}
+
+// TestNew_UnrecognizedProviderType_WithBaseURL asserts the generalized
+// fallback dispatch (post-v0.1.0 addendum, Design §4): a cfg.Type Canopy has
+// never heard of — e.g. one auto-detected straight from the models.dev
+// catalog's own provider ID string — still succeeds via the generic
+// OpenAI-compatible path as long as a BaseURL is configured, on the same
+// "assume OpenAI Chat Completions compatible" rationale as the 6 named
+// compat types.
+func TestNew_UnrecognizedProviderType_WithBaseURL(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(chatCompletionResponse("hello from an arbitrary catalog provider"))
+	}))
+	defer server.Close()
+
+	cfg := entities.ProviderConfig{
+		Name:    "some-new-provider",
+		Type:    entities.ProviderType("some-new-provider-id"),
+		APIKey:  "k",
+		BaseURL: server.URL + "/v1",
+	}
+	model := entities.ModelConfig{Name: "m", Provider: cfg.Name, ModelName: "whatever-model"}
+
+	a, err := New(context.Background(), cfg, model, agent.Config{Name: "a"})
+	require.NoError(t, err)
+	require.NotNil(t, a)
+
+	resp, err := a.RunText(context.Background(), "hi").Collect()
+	require.NoError(t, err)
+	assert.Equal(t, "hello from an arbitrary catalog provider", resp.String())
+}
+
+// TestNew_UnrecognizedProviderType_NoBaseURL is the explicit negative
+// counterpart to TestNew_UnrecognizedProviderType_WithBaseURL: no BaseURL
+// means no endpoint to call, so this still errors clearly rather than
+// silently succeeding or falling back to the real OpenAI endpoint.
+func TestNew_UnrecognizedProviderType_NoBaseURL(t *testing.T) {
+	cfg := entities.ProviderConfig{Name: "some-new-provider", Type: entities.ProviderType("some-new-provider-id"), APIKey: "k"}
+	model := entities.ModelConfig{Name: "m", Provider: cfg.Name, ModelName: "whatever-model"}
+	a, err := New(context.Background(), cfg, model, agent.Config{Name: "a"})
+	require.Error(t, err)
+	assert.Nil(t, a)
+	assert.Contains(t, err.Error(), "some-new-provider-id")
+	assert.Contains(t, err.Error(), "no base_url")
 }
 
 // TestNew_Anthropic asserts the Anthropic client/agent path constructs
