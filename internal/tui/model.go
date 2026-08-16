@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/charmbracelet/bubbles/list"
+	"github.com/charmbracelet/bubbles/spinner"
 	tea "github.com/charmbracelet/bubbletea"
 
 	"github.com/drujensen/canopy/internal/domain/services"
@@ -146,6 +147,20 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		return m, m.chat.handleStreamMsg(msg)
+
+	case spinner.TickMsg:
+		// Only keeps ticking while a turn is actually in flight — once
+		// streamActive flips false (finishStreaming, reached via
+		// handleStreamMsg's streamDoneMsg/streamErrMsg cases), this simply
+		// stops re-arming rather than needing an explicit "stop" message of
+		// its own (post-v0.1.0 addendum: the "still working" spinner,
+		// chat.go's View).
+		if m.chat == nil || !m.chat.streamActive {
+			return m, nil
+		}
+		var cmd tea.Cmd
+		m.chat.spinner, cmd = m.chat.spinner.Update(msg)
+		return m, cmd
 	}
 
 	return m, nil

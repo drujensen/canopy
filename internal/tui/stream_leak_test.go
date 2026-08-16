@@ -30,6 +30,7 @@ import (
 	"testing"
 	"time"
 
+	tea "github.com/charmbracelet/bubbletea"
 	"github.com/microsoft/agent-framework-go/message"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/goleak"
@@ -128,9 +129,12 @@ func TestStartTurn_NoLeak_ManyTurnsBackToBack(t *testing.T) {
 // second HTTP round trip — Bash/FileWrite are the only approval-gated core
 // tools, per AgentService's own buildTools doc comment, so file_read is the
 // simplest way to force a genuine second in-turn HTTP call without a user
-// decision in between). The second call returns 500, which must surface as
-// a streamErrMsg (not hang, not be swallowed), and startTurn's forwarding
-// goroutine for that turn must still exit cleanly.
+// decision in between). The second call returns 500 every time, which
+// openai-go retries (maxProviderRetries, providers/openaicompat.go: 5
+// retries with exponential backoff+jitter capped at 8s/attempt — a 500 is
+// one of its retryable statuses) before finally giving up and surfacing a
+// streamErrMsg (not hanging, not swallowed); startTurn's forwarding
+// goroutine for that turn must still exit cleanly once it does.
 func TestStartTurn_NoLeak_ErrorMidStream(t *testing.T) {
 	workDir := t.TempDir()
 	require.NoError(t, os.WriteFile(filepath.Join(workDir, "hello.txt"), []byte("hi"), 0o644))
@@ -158,7 +162,10 @@ func TestStartTurn_NoLeak_ErrorMidStream(t *testing.T) {
 
 	opts := goleak.IgnoreCurrent()
 
-	drainCmdWithTimeout(t, c, c.startTurnCmd(svc, ctx, []*message.Message{message.NewText("please read hello.txt")}), 10*time.Second)
+	// 30s, not 10s: openai-go's own retry backoff for the repeated 500s
+	// (5 retries, exponential up to 8s/attempt) can take up to roughly 15s
+	// cumulative on its own before the request finally gives up.
+	drainCmdWithTimeout(t, c, c.startTurnCmd(svc, ctx, []*message.Message{message.NewText("please read hello.txt")}), 30*time.Second)
 	require.GreaterOrEqual(t, atomic.LoadInt32(&callCount), int32(2), "the tool call must have triggered a second, failing HTTP round trip within the same turn")
 	require.Error(t, c.statusErr, "the second round trip's failure must surface as a streamErrMsg")
 
@@ -180,6 +187,16 @@ func TestStartTurn_NoLeak_ErrorMidStream(t *testing.T) {
 // rather than leaving it blocked forever on a channel send nobody reads
 // (which would be a genuine leak the doc comment's contract doesn't
 // cover).
+//
+// Post-v0.1.0 addendum ("esc" cancels the in-flight turn): the terminal
+// error this produces is context.Canceled, which handleStreamMsg's
+// streamErrMsg case now special-cases (errors.Is check, chat.go) — a
+// canceled turn folds a "Cancelled." system note into the transcript
+// instead of setting c.statusErr, on the reasoning that a user-initiated
+// cancellation isn't a failure worth pinning under the composer the way a
+// genuine provider error is. This test's real subject is unchanged (no
+// goroutine leak on a context-canceled mid-turn), so it now asserts on the
+// transcript note instead of statusErr.
 //
 // The handler waits on r.Context().Done() OR a bounded fallback timer,
 // deliberately not an unbounded wait: an earlier version of this test
@@ -236,7 +253,74 @@ func TestStartTurn_NoLeak_ContextCancelledMidTurn(t *testing.T) {
 
 	drainCmdWithTimeout(t, c, cmd, 10*time.Second)
 	<-cancelled
-	require.Error(t, c.statusErr, "a context cancellation mid-turn must surface as a streamErrMsg, not hang")
+	require.Nil(t, c.statusErr, "a user-initiated cancellation must not be shown as a turn error")
+	require.NotEmpty(t, c.transcript, "the cancellation must still be visibly acknowledged in the transcript")
+	require.Equal(t, "Cancelled.", c.transcript[len(c.transcript)-1].text)
+
+	settleHTTPGoroutines(closeServer)
+	goleak.VerifyNone(t, opts)
+}
+
+// TestChatModel_Esc_CancelsInFlightTurnViaHandleKey is
+// TestStartTurn_NoLeak_ContextCancelledMidTurn's counterpart for the actual
+// user-facing path (post-v0.1.0 addendum): rather than the test cancelling
+// svc's caller-supplied ctx directly, it drives a real "esc" tea.KeyMsg
+// through chatModel.handleKey — proving cancelTurn/streamCancel's own
+// per-turn context.WithCancel (derived from ctx inside startTurnCmd, not
+// ctx itself) is what actually gets cancelled, and that the whole path from
+// keypress to a cleanly-exiting forwarding goroutine works end to end, not
+// just the lower-level context-cancellation mechanics stream.go already
+// relies on.
+func TestChatModel_Esc_CancelsInFlightTurnViaHandleKey(t *testing.T) {
+	requestReceived := make(chan struct{}, 1)
+	handler := func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case requestReceived <- struct{}{}:
+		default:
+		}
+		select {
+		case <-r.Context().Done():
+		case <-time.After(3 * time.Second):
+		}
+	}
+	svc, closeServer := newLeakTestService(t, t.TempDir(), handler)
+
+	ctx := context.Background()
+	_, err := svc.StartChat(ctx, "chat-1", "assistant")
+	require.NoError(t, err)
+
+	c := newChatModel("chat-1", "assistant", nil, "execute", "m1", 80, 24)
+
+	opts := goleak.IgnoreCurrent()
+
+	c.handleKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("hi")}, svc, ctx) // textinput may return a cursor-blink cmd; irrelevant here
+	cmd := c.handleKey(tea.KeyMsg{Type: tea.KeyEnter}, svc, ctx)
+	require.True(t, c.streamActive, "starting a turn must set streamActive")
+	require.NotNil(t, c.streamCancel, "startTurnCmd must have stored a per-turn cancel func")
+
+	go func() {
+		select {
+		case <-requestReceived:
+		case <-time.After(5 * time.Second):
+			t.Error("provider handler never observed the request within 5s")
+			return
+		}
+		// The real, user-facing path: an "esc" keypress while streamActive,
+		// not calling the stored cancel func directly.
+		require.Nil(t, c.handleKey(tea.KeyMsg{Type: tea.KeyEsc}, svc, ctx))
+	}()
+
+	drainCmdWithTimeout(t, c, cmd, 10*time.Second)
+	require.False(t, c.streamActive, "the turn must have finished (cancelled) by the time drainCmd returns")
+	require.Nil(t, c.statusErr)
+	require.NotEmpty(t, c.transcript)
+	require.Equal(t, "Cancelled.", c.transcript[len(c.transcript)-1].text)
+
+	// esc is a safe no-op once nothing is in flight — must not panic on a
+	// nil streamCancel, and must not add another "Cancelled." entry.
+	transcriptLenBefore := len(c.transcript)
+	require.Nil(t, c.handleKey(tea.KeyMsg{Type: tea.KeyEsc}, svc, ctx))
+	require.Len(t, c.transcript, transcriptLenBefore, "esc while idle must be a pure no-op")
 
 	settleHTTPGoroutines(closeServer)
 	goleak.VerifyNone(t, opts)

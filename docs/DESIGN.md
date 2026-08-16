@@ -515,6 +515,50 @@ hand-rolled "reset in place" code path to keep in sync with that one. Guarded th
 Also addendum (post-v0.1.0): `ctrl+s` opens a read-only skills-browser overlay — see §3.11's own
 addendum for the full three-level skill design this exposes.
 
+Addendum (post-v0.1.0, in-turn UX): three related gaps closed together, all scoped to a single
+turn's lifecycle.
+
+- **`esc` cancels the in-flight turn.** `chatModel.startTurnCmd` derives a per-turn
+  `context.WithCancel(ctx)` (not `ctx` itself) and stores the cancel func on `streamCancel`;
+  `handleKey`'s new `"esc"` case just calls it (`cancelTurn`), a no-op when nothing is in flight.
+  Deliberately does nothing else — the resulting `context.Canceled` error still has to travel back
+  through `AgentService.RunMessagesStream`'s stream/finalize and arrive as this turn's own terminal
+  `streamErrMsg` on `streamCh` before `finishStreaming` actually resets `streamActive`/`streamCh`/
+  `streamCancel`, the same channel-ownership contract `stream_leak_test.go` already covers for
+  cancellation. `handleStreamMsg`'s `streamErrMsg` case now special-cases `errors.Is(err,
+  context.Canceled)`: a "Cancelled." system note in the transcript instead of setting `statusErr` —
+  a user-initiated cancel isn't a failure worth pinning under the composer.
+- **A spinner shows while a turn is in flight.** `chatModel.spinner` (`bubbles/spinner`, already a
+  sub-package of the already-required `bubbles` module — no new `go.mod` entry) replaces the
+  composer in `View` while `streamActive`, alongside an "esc to cancel" hint. Ticking it required
+  `tea.Batch(startTurnCmd(...), spinner.Tick)` at the two real interactive entry points
+  (`handleKey`'s `"enter"` case, `respondApproval`) — deliberately *not* inside `startTurnCmd`
+  itself, since `stream_leak_test.go`/`mcp_stream_test.go` call `startTurnCmd` directly and feed its
+  result into `drainCmd`, a hand-rolled synchronous test harness that didn't originally understand
+  `tea.BatchMsg`; `drainCmd` was taught to unwrap one level of batch (run every sub-`Cmd`, keep
+  draining whichever produced a real stream message, drop the rest) rather than routing every
+  `startTurnCmd` caller through `tea.Batch` and risking the same silent-truncation failure mode
+  elsewhere. `Model.Update` gained a `spinner.TickMsg` case that only keeps re-arming the tick while
+  `streamActive` stays true.
+- **A turn error only shows for one turn.** `statusErr` previously had no clearing path at all —
+  once set, it stayed pinned under the composer across every subsequent turn, success or failure,
+  until the whole chat was torn down. `startTurnCmd` now clears it unconditionally at the top,
+  before the new turn's own result can arrive — the one point both "next message sent" and "next
+  response received" are guaranteed to follow.
+
+Addendum (post-v0.1.0, provider retry/backoff): `impl/providers.maxProviderRetries`
+(`openaicompat.go`) makes retry-on-429 an explicit, uniform choice across all three provider
+families rather than silently inheriting whatever each vendored SDK defaults to. Confirmed directly
+against each SDK's own source: `openai-go`/`anthropic-sdk-go` both default to only 2 retries
+(`internal/requestconfig/requestconfig.go`'s `MaxRetries: 2`, retrying 408/409/429/5xx with
+exponential backoff+jitter, honoring a `Retry-After` header when the server sends one) —
+`openaiRetryOption()`/`anthropicoption.WithMaxRetries(maxProviderRetries)` bump both to 5 (applied
+at every construction site: `newOpenAINative`, `newAnthropic`, `newOpenAICompatible`, `newOllama`).
+`google.golang.org/genai` (Gemini) already defaults to 5 attempts including 429 in its retryable
+status codes (`common.go`'s `defaultRetryAttempts`/`defaultRetryHTTPStatusCodes`) and is left on its
+own default rather than duplicated — 5 elsewhere just matches it, so a 429 gets the same retry
+budget regardless of provider family.
+
 ## 6. Data model
 
 Much smaller than earlier drafts, because Agent/Skill configuration moved from database entities

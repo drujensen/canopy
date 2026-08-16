@@ -136,6 +136,56 @@ func TestChatModel_View_LongMultilineError_StaysOneLineAndKeepsSidebarVisible(t 
 	assert.Contains(t, view, "Mode: execute", "the sidebar's mode indicator must still render alongside a long status error")
 }
 
+// TestChatModel_View_StreamActive_ShowsSpinnerNotComposer asserts the
+// post-v0.1.0 "still working" indicator: while a turn is in flight, View
+// replaces the composer with a spinner + status line (and the esc-to-cancel
+// hint), and doesn't also render the composer's own placeholder text —
+// there should be exactly one bottom-area affordance, not both layered.
+func TestChatModel_View_StreamActive_ShowsSpinnerNotComposer(t *testing.T) {
+	c := newChatModel("chat-1", "assistant", nil, "execute", "m1", 80, 24)
+
+	idleView := c.View(80, 24)
+	assert.Contains(t, idleView, "Type a message", "the composer's placeholder must render while idle")
+	assert.NotContains(t, idleView, "Thinking", "no spinner/status text while idle")
+
+	c.streamActive = true
+	activeView := c.View(80, 24)
+	assert.Contains(t, activeView, "Thinking", "a visual indicator must render while a turn is in flight")
+	assert.Contains(t, activeView, "esc to cancel", "the indicator must tell the user how to cancel")
+	assert.NotContains(t, activeView, "Type a message", "the composer's placeholder must not render while streaming")
+}
+
+// TestChatModel_StartTurnCmd_ClearsPriorStatusErr asserts the post-v0.1.0
+// "an error should only show for one turn" behavior: a statusErr left over
+// from a previous turn's failure must be gone the instant the next turn
+// starts (startTurnCmd), not merely once that next turn itself finishes —
+// otherwise a fast-failing new turn could layer a fresh error on screen
+// alongside the stale one for a moment, or a canceled new turn could leave
+// the *old* error visible again.
+func TestChatModel_StartTurnCmd_ClearsPriorStatusErr(t *testing.T) {
+	svc, closeServer := newLeakTestService(t, t.TempDir(), func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(chatCompletionResponse("ok"))
+	})
+	t.Cleanup(closeServer)
+
+	ctx := context.Background()
+	_, err := svc.StartChat(ctx, "chat-1", "assistant")
+	require.NoError(t, err)
+
+	c := newChatModel("chat-1", "assistant", nil, "execute", "m1", 80, 24)
+	c.statusErr = fmt.Errorf("stale error from a previous turn")
+
+	// startTurnCmd itself, synchronously, before any stream event has been
+	// processed — proves the clear happens at turn-start, not as a side
+	// effect of the turn's own eventual success/failure.
+	cmd := c.startTurnCmd(svc, ctx, []*message.Message{message.NewText("hi")})
+	assert.Nil(t, c.statusErr, "statusErr must already be cleared once startTurnCmd returns, before the turn even completes")
+
+	drainCmd(t, c, cmd)
+	assert.Nil(t, c.statusErr, "a successful turn must not have re-introduced an error")
+}
+
 // TestModel_ModeIndicatorReflectsSwitch drives the top-level Model with a
 // synthetic modeChangedMsg (what toggleModeCmd's tea.Cmd produces once
 // AgentService.SetMode succeeds) and asserts both the chat's mode field and
@@ -219,12 +269,41 @@ func chatCompletionResponse(text string) map[string]any {
 // c.handleStreamMsg to obtain the next Cmd, the same loop Bubble Tea's
 // runtime performs — until a nil Cmd (or nil Msg, i.e. a closed channel)
 // ends the turn.
+//
+// handleKey's "enter" case and respondApproval (post-v0.1.0 addendum: the
+// "still working" spinner) return tea.Batch(startTurnCmd(...), spinner.Tick)
+// rather than startTurnCmd's bare Cmd, so cmd() can yield a tea.BatchMsg —
+// unlike every other Msg this loop sees, that's not something
+// c.handleStreamMsg understands (it only switches on streamChunkMsg/
+// streamDoneMsg/streamErrMsg), so it must be unwrapped here instead of fed
+// straight through: run every sub-Cmd once, keep draining whichever one
+// actually produced a real stream message, and silently drop the rest (the
+// spinner tick, whose own resulting spinner.TickMsg isn't relevant to any
+// test using this helper — none of them assert on spinner animation, only
+// on the underlying turn completing without hanging or leaking).
 func drainCmd(t *testing.T, c *chatModel, cmd tea.Cmd) {
 	t.Helper()
 	for cmd != nil {
 		msg := cmd()
 		if msg == nil {
 			return
+		}
+		if batch, ok := msg.(tea.BatchMsg); ok {
+			cmd = nil
+			for _, sub := range batch {
+				if sub == nil {
+					continue
+				}
+				subMsg := sub()
+				if subMsg == nil {
+					continue
+				}
+				switch subMsg.(type) {
+				case streamChunkMsg, streamDoneMsg, streamErrMsg:
+					cmd = c.handleStreamMsg(subMsg)
+				}
+			}
+			continue
 		}
 		cmd = c.handleStreamMsg(msg)
 	}

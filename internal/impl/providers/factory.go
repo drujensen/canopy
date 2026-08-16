@@ -87,7 +87,7 @@ func New(ctx context.Context, cfg entities.ProviderConfig, model entities.ModelC
 // OpenAI-compatible adapter below). cfg.BaseURL is honored when set (e.g.
 // pointing at Azure OpenAI or a test server) but is not required.
 func newOpenAINative(cfg entities.ProviderConfig, model entities.ModelConfig, agentCfg agent.Config) *agent.Agent {
-	opts := []openaioption.RequestOption{openaioption.WithAPIKey(cfg.APIKey)}
+	opts := []openaioption.RequestOption{openaioption.WithAPIKey(cfg.APIKey), openaiRetryOption()}
 	if cfg.BaseURL != "" {
 		opts = append(opts, openaioption.WithBaseURL(cfg.BaseURL))
 	}
@@ -101,7 +101,7 @@ func newOpenAINative(cfg entities.ProviderConfig, model entities.ModelConfig, ag
 
 // newAnthropic builds an Anthropic-backed agent via anthropicprovider.NewAgent.
 func newAnthropic(cfg entities.ProviderConfig, model entities.ModelConfig, agentCfg agent.Config) *agent.Agent {
-	opts := []anthropicoption.RequestOption{anthropicoption.WithAPIKey(cfg.APIKey)}
+	opts := []anthropicoption.RequestOption{anthropicoption.WithAPIKey(cfg.APIKey), anthropicoption.WithMaxRetries(maxProviderRetries)}
 	if cfg.BaseURL != "" {
 		opts = append(opts, anthropicoption.WithBaseURL(cfg.BaseURL))
 	}
@@ -116,6 +116,15 @@ func newAnthropic(cfg entities.ProviderConfig, model entities.ModelConfig, agent
 }
 
 // newGemini builds a Google Gemini-backed agent via geminiprovider.NewAgent.
+//
+// Retry-on-429/5xx is not configured explicitly here the way
+// openaiRetryOption/anthropicoption.WithMaxRetries are for the other two
+// provider families: google.golang.org/genai already defaults to 5 retry
+// attempts with exponential backoff+jitter, including 429 in its default
+// retryable status codes (common.go's defaultRetryAttempts/
+// defaultRetryHTTPStatusCodes) — the same budget openaiRetryOption's doc
+// comment explains OpenAI/Anthropic are bumped up to match, so nothing to
+// override here.
 //
 // The client is given an HTTPClient wrapping
 // newGeminiFunctionCallIDPatchingTransport (gemini_transport.go): real

@@ -2,10 +2,12 @@ package tui
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 
 	"github.com/charmbracelet/bubbles/list"
+	"github.com/charmbracelet/bubbles/spinner"
 	"github.com/charmbracelet/bubbles/textinput"
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
@@ -67,6 +69,23 @@ type chatModel struct {
 	// waitForStreamEvent after every non-terminal event.
 	streamCh chan tea.Msg
 
+	// streamCancel cancels the context the turn currently in flight (if any)
+	// was started with — set by startTurnCmd (a fresh context.WithCancel
+	// derived from the caller's long-lived ctx, one per turn) and called by
+	// finishStreaming unconditionally once the turn ends, however it ends
+	// (success, error, or a user-initiated "esc" cancellation below), so a
+	// canceled turn's derived context is always released rather than
+	// accumulating as a child of the program's long-lived context. nil
+	// whenever no turn is in flight.
+	streamCancel context.CancelFunc
+
+	// spinner animates while streamActive is true (post-v0.1.0 addendum: a
+	// visual "still working" indicator — see View's use of it in place of
+	// the composer during a turn). Ticked by Model.Update's spinner.TickMsg
+	// case (model.go), which only keeps re-arming the tick while
+	// streamActive stays true.
+	spinner spinner.Model
+
 	composer textinput.Model
 	viewport viewport.Model
 
@@ -110,12 +129,16 @@ func newChatModel(chatID, agentName string, todos []todo.Item, mode, model strin
 	composer.Focus()
 	composer.CharLimit = 4000
 
+	sp := spinner.New()
+	sp.Spinner = spinner.Dot
+
 	c := &chatModel{
 		chatID:    chatID,
 		agentName: agentName,
 		todos:     todos,
 		mode:      mode,
 		model:     model,
+		spinner:   sp,
 		composer:  composer,
 		viewport:  viewport.New(width, height),
 	}
@@ -157,6 +180,17 @@ func (c *chatModel) handleKey(msg tea.KeyMsg, svc *services.AgentService, ctx co
 	}
 
 	switch msg.String() {
+	case "esc":
+		// Cancels the in-flight turn (post-v0.1.0 addendum), returning
+		// control to the composer — see cancelTurn's doc comment for why
+		// this only needs to call streamCancel and not touch streamActive/
+		// statusErr/etc. directly: handleStreamMsg's streamErrMsg case,
+		// reached the moment the canceled turn's context.Canceled error
+		// arrives on the same channel every other terminal event already
+		// does, is what actually resets state. A no-op when no turn is
+		// active — esc has no other meaning on this screen.
+		c.cancelTurn()
+		return nil
 	case "ctrl+p":
 		return c.toggleModeCmd(svc, ctx)
 	case "ctrl+a":
@@ -204,7 +238,7 @@ func (c *chatModel) handleKey(msg tea.KeyMsg, svc *services.AgentService, ctx co
 		c.composer.Reset()
 		c.transcript = append(c.transcript, transcriptEntry{role: message.RoleUser, text: text})
 		c.refreshViewport()
-		return c.startTurnCmd(svc, ctx, []*message.Message{message.NewText(text)})
+		return tea.Batch(c.startTurnCmd(svc, ctx, []*message.Message{message.NewText(text)}), c.spinner.Tick)
 	}
 
 	if c.streamActive {
@@ -374,7 +408,7 @@ func (c *chatModel) respondApproval(svc *services.AgentService, ctx context.Cont
 	c.pendingApproval = nil
 	c.pendingApprovalTool = ""
 	approvalMsg := &message.Message{Role: message.RoleUser, Contents: []message.Content{content}}
-	return c.startTurnCmd(svc, ctx, []*message.Message{approvalMsg})
+	return tea.Batch(c.startTurnCmd(svc, ctx, []*message.Message{approvalMsg}), c.spinner.Tick)
 }
 
 // toggleModeCmd flips between "plan" and "execute" (Design §3.8's user
@@ -469,12 +503,64 @@ func (c *chatModel) startNewChatCmd(svc *services.AgentService, ctx context.Cont
 // startTurnCmd marks the chat as actively streaming and delegates to
 // startTurn (stream.go) to drive the turn against svc via
 // AgentService.RunMessagesStream.
+//
+// statusErr is cleared here (post-v0.1.0 addendum: "an error should only
+// show for one turn, clearing on the next message sent or received") —
+// starting a new turn is the one place both halves of that are guaranteed
+// to happen, since every new turn is either about to send a fresh message
+// or about to receive a fresh response. This is the only place statusErr is
+// ever cleared; a config action that can itself streamErrMsg (toggleModeCmd/
+// setModelCmd/setAgentCmd) does not start a turn and so does not clear a
+// pending turn error.
+//
+// ctx is not passed to startTurn directly: a fresh context.WithCancel
+// derived from it is, so a later "esc" (cancelTurn) has something to
+// cancel that affects only this one turn, not svc's other callers or the
+// program's long-lived ctx itself. finishStreaming always calls the
+// resulting cancel func once the turn ends, whichever way, so this never
+// leaks a canceled-but-uncollected child context.
+//
+// Deliberately returns the bare stream-wait Cmd, not batched with
+// c.spinner.Tick: the tests exercising this exact function directly
+// (stream_leak_test.go, mcp_stream_test.go) feed its result straight into
+// drainCmd, a hand-rolled synchronous test harness that only understands
+// this package's own streamChunkMsg/streamDoneMsg/streamErrMsg — a
+// tea.BatchMsg (what tea.Batch's Cmd produces) isn't one of those, so
+// batching here would make drainCmd return after the very first tick
+// without ever reading the real stream, silently orphaning startTurn's
+// forwarding goroutine (exactly the leak stream_leak_test.go exists to
+// catch). handleKey's "enter" case and respondApproval — the two real,
+// interactive entry points into this function — batch the spinner tick in
+// themselves instead, where the real Bubble Tea runtime (which does
+// understand tea.BatchMsg) is what ends up running it.
 func (c *chatModel) startTurnCmd(svc *services.AgentService, ctx context.Context, msgs []*message.Message) tea.Cmd {
 	c.streamActive = true
 	c.streaming.Reset()
-	ch, cmd := startTurn(ctx, svc, c.chatID, msgs)
+	c.statusErr = nil
+	turnCtx, cancel := context.WithCancel(ctx)
+	c.streamCancel = cancel
+	ch, cmd := startTurn(turnCtx, svc, c.chatID, msgs)
 	c.streamCh = ch
 	return cmd
+}
+
+// cancelTurn cancels the currently in-flight turn's context, if any (a
+// no-op when none is active). It deliberately does nothing else: the
+// canceled context.Canceled error still has to travel back through
+// AgentService.RunMessagesStream's stream/finalize and arrive as this same
+// turn's terminal streamErrMsg — see handleStreamMsg's streamErrMsg case,
+// which is what actually resets streamActive/streamCh/streamCancel via
+// finishStreaming and folds a "Cancelled." note into the transcript instead
+// of a raw error. Resetting state here too, ahead of that event, would let
+// the user start a second turn while the first turn's goroutine is still
+// running and still holds the only reference to the old streamCh — a
+// message send on that now-unwatched, unbuffered channel would block
+// forever (see stream_leak_test.go's goroutine-leak coverage for this
+// exact channel-ownership contract).
+func (c *chatModel) cancelTurn() {
+	if c.streamCancel != nil {
+		c.streamCancel()
+	}
 }
 
 // handleStreamMsg applies one streaming event (see stream.go) to the chat's
@@ -500,7 +586,16 @@ func (c *chatModel) handleStreamMsg(msg tea.Msg) tea.Cmd {
 		return nil
 	case streamErrMsg:
 		c.finishStreaming()
-		c.statusErr = msg.err
+		if errors.Is(msg.err, context.Canceled) {
+			// A user-initiated "esc" (cancelTurn) rather than a genuine
+			// failure — a "Cancelled." system note reads as an
+			// acknowledgment of what the user just did, not an error worth
+			// pinning under the composer the way a real provider failure
+			// is (statusErr stays nil).
+			c.transcript = append(c.transcript, transcriptEntry{system: true, text: "Cancelled."})
+		} else {
+			c.statusErr = msg.err
+		}
 		c.refreshViewport()
 		return nil
 	}
@@ -532,6 +627,10 @@ func (c *chatModel) applyUpdate(update *agent.ResponseUpdate) {
 
 // finishStreaming folds the accumulated streaming buffer into transcript as
 // a completed assistant entry and clears the in-flight streaming state.
+// Always releases streamCancel's context, however the turn ended (success,
+// error, or a user-initiated cancellation) — see startTurnCmd's doc comment
+// on why leaving that uncalled would leak a canceled-but-uncollected child
+// context.
 func (c *chatModel) finishStreaming() {
 	if c.streaming.Len() > 0 {
 		c.transcript = append(c.transcript, transcriptEntry{role: message.RoleAssistant, text: c.streaming.String()})
@@ -539,6 +638,10 @@ func (c *chatModel) finishStreaming() {
 	c.streaming.Reset()
 	c.streamActive = false
 	c.streamCh = nil
+	if c.streamCancel != nil {
+		c.streamCancel()
+		c.streamCancel = nil
+	}
 }
 
 // toolCallName extracts a human-readable tool name from a
@@ -600,9 +703,16 @@ func (c *chatModel) View(width, height int) string {
 	}
 
 	var bottom string
-	if c.pendingApproval != nil {
+	switch {
+	case c.pendingApproval != nil:
 		bottom = c.renderApprovalPrompt()
-	} else {
+	case c.streamActive:
+		// A visual "still working" indicator (post-v0.1.0 addendum) in
+		// place of the composer, which doesn't accept input while
+		// streamActive anyway (handleKey's own guard) — also doubles as
+		// the discoverability hint for "esc" now canceling the turn.
+		bottom = c.spinner.View() + " Thinking... (esc to cancel)"
+	default:
 		bottom = c.composer.View()
 	}
 
