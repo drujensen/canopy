@@ -145,6 +145,12 @@ because it's what makes existing Claude Code projects portable to Canopy (§6, F
 | FR19 | Canopy discovers and loads skills from `.claude/skills/*/SKILL.md` (project) and `~/.claude/skills/*/SKILL.md` (personal), matching the Agent Skills spec: YAML frontmatter (`name`, `description`) always available to the agent, full body loaded when the skill is relevant, supporting files in the skill's directory loaded on demand (progressive disclosure). |
 | FR20 | Canopy auto-loads project instructions from `CLAUDE.md` and/or `AGENTS.md` at the project root into the system prompt, matching Claude Code's project-instructions convention. |
 
+Addendum (post-v0.1.0): FR17's "no agent definitions found anywhere" case no longer hard-errors.
+Canopy also scans `~/.canopy/agents/*.md` as a third, lowest-precedence source, and auto-creates a
+default "general" agent there on first run when nothing else exists, so a brand-new install works
+with zero configuration — see `internal/impl/agentsource.WriteDefault` and DESIGN.md §3.11's
+addendum.
+
 ## 7. Non-functional requirements
 
 - **Security.** No API keys or secrets in logs by default. Bash/file tools retain input validation

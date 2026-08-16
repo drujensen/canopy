@@ -95,19 +95,25 @@ func run() error {
 		return fmt.Errorf("loading project instructions: %w", err)
 	}
 
+	// Zero-config first run (post-v0.1.0, docs/DESIGN.md §3.11 addendum):
+	// rather than hard-erroring when no agent definitions exist anywhere,
+	// auto-create a sensible default agent under ~/.canopy/agents (Canopy's
+	// own directory, deliberately not ~/.claude/agents — see
+	// agentsource.WriteDefault's doc comment) and fold it into this run's
+	// in-memory result so the picker has something to show without
+	// requiring a restart. A failure here (e.g. permission error creating
+	// ~/.canopy/agents) is a real startup error worth surfacing clearly,
+	// not a reason to silently proceed with zero agents.
 	if len(agents) == 0 {
-		return fmt.Errorf(
-			"no agent definitions found.\n\n"+
-				"Canopy looked for *.md files in:\n"+
-				"  - %s\n"+
-				"  - %s\n\n"+
-				"Add at least one agent definition (YAML frontmatter with \"name\" and\n"+
-				"\"description\", followed by the agent's instructions as the file body) to\n"+
-				"either location and run canopy again. See docs/DESIGN.md §3.11 / Claude\n"+
-				"Code's subagent format for the exact shape.",
-			filepath.Join(projectRoot, ".claude", "agents"),
-			filepath.Join(homeDir, ".claude", "agents"),
-		)
+		defaultDir := filepath.Join(homeDir, ".canopy", "agents")
+		if err := agentsource.WriteDefault(defaultDir); err != nil {
+			return fmt.Errorf("creating default agent: %w", err)
+		}
+		agents, err = agentsource.Load(projectRoot, homeDir)
+		if err != nil {
+			return fmt.Errorf("loading agent definitions: %w", err)
+		}
+		fmt.Fprintf(os.Stderr, "canopy: no agent definitions found; created a default \"general\" agent at %s\n", filepath.Join(defaultDir, "general.md"))
 	}
 
 	// --- Canopy's own provider/model config (Design §4) ---

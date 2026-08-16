@@ -305,6 +305,15 @@ not required for v1) and their output feeds `domain/services`' agent-constructio
 them touch `ChatRepository` — they're read-only against the project directory, matching how Claude
 Code itself treats these files as source-controlled project config, not application state.
 
+Addendum (post-v0.1.0): `impl/agentsource.Load` also scans `~/.canopy/agents/**/*.md` as a third
+source, lower-precedence than both project and personal `.claude/agents`. `cmd/canopy`'s `run()`
+calls the new `agentsource.WriteDefault` to generate a single default "general" agent there the
+first time `Load` returns zero definitions from all three sources, so a brand-new install has
+something to select in the TUI's picker instead of a hard startup error — Canopy's closest match to
+Claude Code's own no-file-required first-run experience given Canopy's picker-based UX. The
+directory is Canopy-specific (`~/.canopy`, not `~/.claude`) so the generated fallback never leaks
+into the user's real Claude Code config.
+
 ## 4. Provider adapter design (FR2)
 
 `impl/providers/factory.go` — one function, keyed on configured provider type:

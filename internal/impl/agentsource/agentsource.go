@@ -1,6 +1,13 @@
 // Package agentsource loads Claude Code-compatible subagent definitions from
-// .claude/agents/**/*.md (project root, recursive) and ~/.claude/agents/**/*.md
-// (personal, recursive). See docs/REQUIREMENTS.md FR17 and docs/DESIGN.md §3.11.
+// .claude/agents/**/*.md (project root, recursive), ~/.claude/agents/**/*.md
+// (personal, recursive), and ~/.canopy/agents/**/*.md (Canopy-generated
+// defaults, recursive). See docs/REQUIREMENTS.md FR17 and docs/DESIGN.md
+// §3.11.
+//
+// Addendum (post-v0.1.0): the third source, ~/.canopy/agents, exists so a
+// brand-new Canopy install has zero-config first-run behavior instead of a
+// hard error when no agent definitions exist anywhere — see WriteDefault and
+// cmd/canopy's run().
 package agentsource
 
 import (
@@ -32,14 +39,29 @@ type frontmatter struct {
 	Model       string `yaml:"model"`
 }
 
-// Load scans projectRoot/.claude/agents/**/*.md (recursive) and
-// homeDir/.claude/agents/**/*.md (recursive), parses each file's frontmatter and
-// body, and returns a map of agent name -> AgentDefinition. Project-level
-// definitions win name conflicts against personal ones. Missing directories are
-// not an error and simply contribute no definitions. A malformed file produces a
-// clear, specific error identifying the file and what's wrong (fail loud, per
+// Load scans three sources, in ascending precedence order:
+//
+//  1. homeDir/.canopy/agents/**/*.md (recursive) — Canopy-generated defaults
+//     (see WriteDefault).
+//  2. homeDir/.claude/agents/**/*.md (recursive) — personal, the user's real
+//     Claude Code config.
+//  3. projectRoot/.claude/agents/**/*.md (recursive) — project-level.
+//
+// Each file's frontmatter and body are parsed into an AgentDefinition; the
+// result is a map of agent name -> AgentDefinition. On a name conflict, the
+// higher-precedence source wins: project beats personal, and personal beats a
+// Canopy-generated default — so a user who defines their own agent of the
+// same name in either real Claude Code location automatically overrides the
+// generated fallback. Missing directories are not an error and simply
+// contribute no definitions. A malformed file produces a clear, specific
+// error identifying the file and what's wrong (fail loud, per
 // docs/DESIGN.md §8) rather than being silently skipped.
 func Load(projectRoot, homeDir string) (map[string]AgentDefinition, error) {
+	canopyDefaults, err := loadDir(filepath.Join(homeDir, ".canopy", "agents"))
+	if err != nil {
+		return nil, err
+	}
+
 	personal, err := loadDir(filepath.Join(homeDir, ".claude", "agents"))
 	if err != nil {
 		return nil, err
@@ -50,7 +72,10 @@ func Load(projectRoot, homeDir string) (map[string]AgentDefinition, error) {
 		return nil, err
 	}
 
-	result := make(map[string]AgentDefinition, len(personal)+len(project))
+	result := make(map[string]AgentDefinition, len(canopyDefaults)+len(personal)+len(project))
+	for name, def := range canopyDefaults {
+		result[name] = def
+	}
 	for name, def := range personal {
 		result[name] = def
 	}
@@ -149,6 +174,51 @@ func parseAgentFile(path string) (AgentDefinition, error) {
 		Instructions: strings.TrimSpace(body),
 		SourcePath:   path,
 	}, nil
+}
+
+// defaultAgentFilename is the file WriteDefault creates.
+const defaultAgentFilename = "general.md"
+
+// defaultAgentContent is the Canopy-generated fallback agent's full markdown
+// source: no "tools" field (omitted = inherit every available tool, matching
+// Claude Code's own default agent having no tool restrictions) and no
+// "model" field (falls back to AgentServiceConfig.DefaultModel).
+const defaultAgentContent = `---
+name: general
+description: A general-purpose coding and terminal assistant for everyday tasks — reading and editing files, running commands, searching the web — when no more specialized agent applies.
+---
+
+You are a general-purpose AI assistant for software engineering and terminal work, running directly in the user's own project directory. You have direct access to file, shell, and web tools — use them to actually read, edit, run, and search things rather than just describing what you would do.
+
+Be concise and direct. Favor taking action over narrating a plan when the request is clear. Confirm with the user before destructive or hard-to-reverse actions (deleting files, force-pushing, overwriting uncommitted work, and the like) when it isn't already clear that's what they want.
+`
+
+// WriteDefault writes a single default "general" agent definition file into
+// dir (the caller passes homeDir/.canopy/agents), creating dir if it doesn't
+// exist. It exists so a brand-new Canopy install has an agent to pick in the
+// TUI's picker without requiring the user to hand-write a .claude/agents/*.md
+// file first — see cmd/canopy's run() and this package's doc comment
+// addendum.
+//
+// Idempotent: if dir/general.md already exists — from a prior run, possibly
+// hand-edited by the user since — WriteDefault leaves it untouched and
+// returns nil rather than overwriting it.
+func WriteDefault(dir string) error {
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return fmt.Errorf("failed to create default agent directory %s: %w", dir, err)
+	}
+
+	path := filepath.Join(dir, defaultAgentFilename)
+	if _, err := os.Stat(path); err == nil {
+		return nil
+	} else if !os.IsNotExist(err) {
+		return fmt.Errorf("failed to stat default agent file %s: %w", path, err)
+	}
+
+	if err := os.WriteFile(path, []byte(defaultAgentContent), 0o644); err != nil {
+		return fmt.Errorf("failed to write default agent file %s: %w", path, err)
+	}
+	return nil
 }
 
 // splitFrontmatter separates a file's leading "---\n...\n---" YAML block from

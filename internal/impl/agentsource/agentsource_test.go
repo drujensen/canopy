@@ -130,6 +130,140 @@ Body.
 	assert.Contains(t, err.Error(), "description")
 }
 
+func TestLoad_CanopyDefaultSource(t *testing.T) {
+	projectRoot := t.TempDir()
+	homeDir := t.TempDir()
+
+	writeFile(t, filepath.Join(homeDir, ".canopy", "agents", "general.md"), `---
+name: general
+description: Canopy-generated default.
+---
+Default body.
+`)
+
+	defs, err := Load(projectRoot, homeDir)
+	require.NoError(t, err)
+	require.Len(t, defs, 1)
+	assert.Equal(t, "Canopy-generated default.", defs["general"].Description)
+	assert.Equal(t, "Default body.", defs["general"].Instructions)
+}
+
+func TestLoad_PersonalWinsOverCanopyDefault(t *testing.T) {
+	projectRoot := t.TempDir()
+	homeDir := t.TempDir()
+
+	writeFile(t, filepath.Join(homeDir, ".canopy", "agents", "general.md"), `---
+name: general
+description: Canopy-generated default.
+---
+Default body.
+`)
+	writeFile(t, filepath.Join(homeDir, ".claude", "agents", "general.md"), `---
+name: general
+description: User's real personal agent.
+---
+Personal body.
+`)
+
+	defs, err := Load(projectRoot, homeDir)
+	require.NoError(t, err)
+	require.Len(t, defs, 1)
+	assert.Equal(t, "User's real personal agent.", defs["general"].Description)
+	assert.Equal(t, "Personal body.", defs["general"].Instructions)
+}
+
+func TestLoad_ProjectWinsOverCanopyDefaultAndPersonal(t *testing.T) {
+	projectRoot := t.TempDir()
+	homeDir := t.TempDir()
+
+	writeFile(t, filepath.Join(homeDir, ".canopy", "agents", "general.md"), `---
+name: general
+description: Canopy-generated default.
+---
+Default body.
+`)
+	writeFile(t, filepath.Join(homeDir, ".claude", "agents", "general.md"), `---
+name: general
+description: Personal version.
+---
+Personal body.
+`)
+	writeFile(t, filepath.Join(projectRoot, ".claude", "agents", "general.md"), `---
+name: general
+description: Project version.
+---
+Project body.
+`)
+
+	defs, err := Load(projectRoot, homeDir)
+	require.NoError(t, err)
+	require.Len(t, defs, 1)
+	assert.Equal(t, "Project version.", defs["general"].Description)
+	assert.Equal(t, "Project body.", defs["general"].Instructions)
+}
+
+func TestLoad_CanopyDefaultCoexistsWithOtherNames(t *testing.T) {
+	projectRoot := t.TempDir()
+	homeDir := t.TempDir()
+
+	writeFile(t, filepath.Join(homeDir, ".canopy", "agents", "general.md"), `---
+name: general
+description: Canopy-generated default.
+---
+Default body.
+`)
+	writeFile(t, filepath.Join(projectRoot, ".claude", "agents", "reviewer.md"), `---
+name: reviewer
+description: Reviews code changes.
+---
+Reviewer body.
+`)
+
+	defs, err := Load(projectRoot, homeDir)
+	require.NoError(t, err)
+	require.Len(t, defs, 2)
+	assert.Contains(t, defs, "general")
+	assert.Contains(t, defs, "reviewer")
+}
+
+func TestWriteDefault_WritesLoadableAgent(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), ".canopy", "agents")
+
+	require.NoError(t, WriteDefault(dir))
+
+	path := filepath.Join(dir, "general.md")
+	_, err := os.Stat(path)
+	require.NoError(t, err)
+
+	defs, err := Load(t.TempDir(), filepath.Dir(filepath.Dir(dir)))
+	require.NoError(t, err)
+	require.Len(t, defs, 1)
+
+	def, ok := defs["general"]
+	require.True(t, ok)
+	assert.Equal(t, "general", def.Name)
+	assert.NotEmpty(t, def.Description)
+	assert.Nil(t, def.Tools)
+	assert.Empty(t, def.Model)
+	assert.NotEmpty(t, def.Instructions)
+}
+
+func TestWriteDefault_Idempotent(t *testing.T) {
+	dir := t.TempDir()
+
+	require.NoError(t, WriteDefault(dir))
+
+	path := filepath.Join(dir, "general.md")
+	custom := "---\nname: general\ndescription: Hand-edited by the user.\n---\nCustom body.\n"
+	require.NoError(t, os.WriteFile(path, []byte(custom), 0o644))
+
+	require.NoError(t, WriteDefault(dir))
+
+	got, err := os.ReadFile(path)
+	require.NoError(t, err)
+	assert.Equal(t, custom, string(got))
+}
+
 func TestLoad_MalformedFrontmatter_InvalidYAML(t *testing.T) {
 	projectRoot := t.TempDir()
 	homeDir := t.TempDir()
