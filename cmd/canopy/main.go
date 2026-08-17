@@ -31,6 +31,7 @@ import (
 	"github.com/drujensen/canopy/internal/impl/projectcontext"
 	jsonrepo "github.com/drujensen/canopy/internal/impl/repositories/json"
 	"github.com/drujensen/canopy/internal/impl/skillsource"
+	"github.com/drujensen/canopy/internal/impl/tools"
 	"github.com/drujensen/canopy/internal/impl/tracing"
 	"github.com/drujensen/canopy/internal/tui"
 )
@@ -111,23 +112,62 @@ func run() error {
 
 	// Zero-config first run (post-v0.1.0, docs/DESIGN.md §3.11 addendum):
 	// rather than hard-erroring when no agent definitions exist anywhere,
-	// auto-create a sensible default agent under ~/.canopy/agents (Canopy's
+	// auto-create Canopy's default agents under ~/.canopy/agents (Canopy's
 	// own directory, deliberately not ~/.claude/agents — see
-	// agentsource.WriteDefault's doc comment) and fold it into this run's
+	// agentsource.WriteDefaults' doc comment) and fold them into this run's
 	// in-memory result so the picker has something to show without
 	// requiring a restart. A failure here (e.g. permission error creating
 	// ~/.canopy/agents) is a real startup error worth surfacing clearly,
 	// not a reason to silently proceed with zero agents.
-	if len(agents) == 0 {
-		defaultDir := filepath.Join(homeDir, ".canopy", "agents")
-		if err := agentsource.WriteDefault(defaultDir); err != nil {
-			return fmt.Errorf("creating default agent: %w", err)
+	//
+	// The trigger is ~/.canopy/agents itself being missing or empty
+	// (dirMissingOrEmpty), not the total agent count across all
+	// three sources: a user with agents only in project/personal
+	// .claude/agents still gets Canopy's own defaults seeded into
+	// ~/.canopy/agents the first time it's missing/empty, and — since
+	// WriteDefaults is per-file idempotent — deleting one of the five files
+	// later (e.g. `execute.md`) regenerates just that file on the next run
+	// that finds the directory in that missing/empty state again. Once the
+	// directory has at least one file, this branch is skipped entirely, so
+	// a user's own edits or additions there are never touched.
+	defaultAgentsDir := filepath.Join(homeDir, ".canopy", "agents")
+	needsDefaultAgents, err := dirMissingOrEmpty(defaultAgentsDir)
+	if err != nil {
+		return fmt.Errorf("checking default agent directory %s: %w", defaultAgentsDir, err)
+	}
+	if needsDefaultAgents {
+		if err := agentsource.WriteDefaults(defaultAgentsDir); err != nil {
+			return fmt.Errorf("creating default agents: %w", err)
 		}
 		agents, err = agentsource.Load(projectRoot, homeDir)
 		if err != nil {
 			return fmt.Errorf("loading agent definitions: %w", err)
 		}
-		fmt.Fprintf(os.Stderr, "canopy: no agent definitions found; created a default \"general\" agent at %s\n", filepath.Join(defaultDir, "general.md"))
+		fmt.Fprintf(os.Stderr, "canopy: %s is missing or empty; created default agents (general, research, design, plan, execute) there\n", defaultAgentsDir)
+	}
+
+	// Same zero-config posture, for skills (post-v0.1.0 addendum): Canopy
+	// ships one default skill, mcp-server-setup, that helps a user find and
+	// configure MCP servers from public registries — genuinely useful with
+	// zero project-specific setup, the same reasoning that motivates
+	// default agents above. ~/.canopy/skills is a new third source
+	// skillsource.Load now scans (lowest precedence, mirroring
+	// ~/.canopy/agents), so this never shadows a project's or a user's own
+	// same-named skill.
+	defaultSkillsDir := filepath.Join(homeDir, ".canopy", "skills")
+	needsDefaultSkills, err := dirMissingOrEmpty(defaultSkillsDir)
+	if err != nil {
+		return fmt.Errorf("checking default skills directory %s: %w", defaultSkillsDir, err)
+	}
+	if needsDefaultSkills {
+		if err := skillsource.WriteDefaults(defaultSkillsDir); err != nil {
+			return fmt.Errorf("creating default skills: %w", err)
+		}
+		skills, err = skillsource.Load(projectRoot, homeDir)
+		if err != nil {
+			return fmt.Errorf("loading skills: %w", err)
+		}
+		fmt.Fprintf(os.Stderr, "canopy: %s is missing or empty; created default skill(s) (mcp-server-setup) there\n", defaultSkillsDir)
 	}
 
 	// --- Canopy's own provider/model config (Design §4) ---
@@ -159,6 +199,17 @@ func run() error {
 		fmt.Fprintln(os.Stderr, "canopy: warning: couldn't read last-used agent:", err)
 	}
 	startAgent := computeStartAgent(agents, lastUsedAgent)
+
+	// Same auto-resume posture, for the default model (post-v0.1.0
+	// addendum): last_model.json, read here so it's available once
+	// defaultModel is actually computed below (after --refresh-providers has
+	// finished mutating providersFile.Models). Reading it is best-effort,
+	// same as last_agent.json above.
+	lastModelPath := filepath.Join(filepath.Dir(providerStore.Path()), "last_model.json")
+	lastUsedModel, err := config.LoadLastModel(lastModelPath)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "canopy: warning: couldn't read last-used model:", err)
+	}
 
 	// Explicit refresh (post-v0.1.0 addendum, Design §4 addendum):
 	// --refresh-providers forces a live re-fetch (bypasses the
@@ -262,7 +313,7 @@ func run() error {
 	// auto-detection against whichever provider API-key env vars the user
 	// already has set (extremely common — OPENAI_API_KEY, ANTHROPIC_API_KEY,
 	// GEMINI_API_KEY, etc.) using the models.dev catalog — the same
-	// zero-manual-config spirit as agentsource.WriteDefault's default-agent
+	// zero-manual-config spirit as agentsource.WriteDefaults' default-agents
 	// feature above. A cached catalog fetch (24h freshness, see
 	// modelsDevCacheMaxAge) is used so this doesn't add a network
 	// round-trip to every ordinary startup once a fetch has happened once.
@@ -323,14 +374,20 @@ func run() error {
 			len(detectedNames), providerStore.Path(), strings.Join(describeProviders(providersFile.Providers, detectedNames), "\n  "))
 	}
 	// Judgment call: an AgentDefinition with no "model" frontmatter override
-	// falls back to the first configured model (ProvidersFile.Models is a
+	// falls back to computeDefaultModel's resolution — the last model the
+	// user actually switched to (post-v0.1.0 addendum, fixing a real bug:
+	// every new chat used to always fall back to providersFile.Models[0],
+	// silently discarding whatever the user had switched to via ctrl+o the
+	// moment they started a fresh chat/session, since a per-chat
+	// Chat.ModelOverride only ever applies to the one chat it was set on) —
+	// or, absent one, the first configured model (ProvidersFile.Models is a
 	// JSON array, so "first" is whatever order the user's config file lists
-	// them in) rather than requiring every deployment to additionally
+	// them in), rather than requiring every deployment to additionally
 	// designate one model as "default" in a currently-nonexistent config
 	// field. Not documented anywhere in Design/Requirements as *the* answer
 	// — flagged here as this phase's specific choice, easy to revisit if a
 	// real default-model config field gets added later.
-	defaultModel := providersFile.Models[0].Name
+	defaultModel := computeDefaultModel(providersFile.Models, lastUsedModel)
 
 	// --- Chat storage (Design §6/§2's "repositories/json") ---
 	//
@@ -421,6 +478,17 @@ func run() error {
 		fmt.Fprintln(os.Stderr, "canopy: warning:", mcpErr)
 	}
 
+	// WebSearchBackend, zero-config: wired from TAVILY_API_KEY the same way
+	// providers auto-detect from *_API_KEY env vars (see detect.go). Left nil
+	// when unset — ToolsConfig.WebSearchBackend's doc comment covers the
+	// self-hosted tools.NewSearXNGBackend alternative for a deployment that
+	// wants a different provider. An agent whose tools: frontmatter names
+	// WebSearch will hard-error at every turn until TAVILY_API_KEY is set.
+	var webSearchBackend tools.WebSearchBackend
+	if apiKey := os.Getenv("TAVILY_API_KEY"); apiKey != "" {
+		webSearchBackend = tools.NewTavilyBackend(tools.TavilyBackendConfig{APIKey: apiKey})
+	}
+
 	svc := services.NewAgentService(services.AgentServiceConfig{
 		Definitions: services.Definitions{
 			Agents:              agents,
@@ -434,21 +502,17 @@ func run() error {
 		Repository:   repo,
 		MCPTools:     mcpRegistry.Tools(),
 		Tools: services.ToolsConfig{
-			WorkingRoot: projectRoot,
-			BashTimeout: 2 * time.Minute,
-			// WebSearchBackend is intentionally left nil: Canopy ships no
-			// default search backend (see ToolsConfig.WebSearchBackend's
-			// doc comment and tools.NewSearXNGBackend, which needs a
-			// self-hosted SearXNG instance's URL this command has no way
-			// to discover on its own). A deployment that wants the
-			// web-search tool configures one via a later flag/config
-			// field — a real gap, not an oversight, and flagged as such
-			// rather than silently wired to nothing.
+			WorkingRoot:      projectRoot,
+			BashTimeout:      2 * time.Minute,
+			WebSearchBackend: webSearchBackend,
 		},
 		Logger:      slogLogger,
 		Middlewares: middlewares,
 		RecordLastAgent: func(agentName string) error {
 			return config.SaveLastAgent(lastAgentPath, agentName)
+		},
+		RecordLastModel: func(modelName string) error {
+			return config.SaveLastModel(lastModelPath, modelName)
 		},
 	})
 
@@ -480,6 +544,26 @@ func run() error {
 	return nil
 }
 
+// dirMissingOrEmpty reports whether dir is missing entirely or exists but
+// contains no entries at all — the shared trigger condition for
+// auto-creating Canopy's default agents (~/.canopy/agents) and default
+// skills (~/.canopy/skills), see the zero-config first-run blocks in run()
+// and agentsource.WriteDefaults/skillsource.WriteDefaults. A directory that
+// exists with at least one entry, however it got there, is left alone: this
+// check only asks "is the directory empty," not "did everything in it load
+// successfully," so a user's own edits or unrelated files there never
+// trigger a rewrite.
+func dirMissingOrEmpty(dir string) (bool, error) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return true, nil
+		}
+		return false, fmt.Errorf("failed to read %s: %w", dir, err)
+	}
+	return len(entries) == 0, nil
+}
+
 // computeStartAgent decides which agent (if any) this run should
 // auto-resume into (post-v0.1.0 addendum, Design §5's addendum), rather
 // than always showing the top-level agent picker:
@@ -487,7 +571,7 @@ func run() error {
 //  1. lastUsed, if it still names an entry in agents — the common case
 //     once at least one prior session has picked an agent.
 //  2. Otherwise "general", if that's a configured agent — matching
-//     agentsource.WriteDefault's own choice of default agent name, so a
+//     agentsource.WriteDefaults' own choice of default agent name, so a
 //     brand-new install (which has no last-used record yet) still starts
 //     with zero friction rather than a picker showing a single obvious
 //     choice.
@@ -505,6 +589,34 @@ func computeStartAgent(agents map[string]agentsource.AgentDefinition, lastUsed s
 		return "general"
 	}
 	return ""
+}
+
+// computeDefaultModel decides AgentServiceConfig.DefaultModel (post-v0.1.0
+// addendum, fixing a real bug — see its call site's own comment), mirroring
+// computeStartAgent's exact shape for the model equivalent:
+//
+//  1. lastUsed, if it still names an entry in models — the common case once
+//     at least one prior session has switched models via ctrl+o. A model
+//     that's since been removed (a provider dropped, or --refresh-providers
+//     pruning a stale model) doesn't match here, so this falls through to 2
+//     rather than resolving to a ModelConfig.Name nothing can actually use.
+//  2. Otherwise models[0].Name — the exact behavior before this addendum,
+//     preserved as the fallback for a brand-new install with no last-used
+//     model recorded yet.
+//
+// models is assumed non-empty: every call site only reaches this after the
+// zero-config auto-detection block above has already guaranteed at least
+// one provider/model exists, the same invariant the pre-addendum
+// `providersFile.Models[0].Name` line relied on.
+func computeDefaultModel(models []entities.ModelConfig, lastUsed string) string {
+	if lastUsed != "" {
+		for _, m := range models {
+			if m.Name == lastUsed {
+				return lastUsed
+			}
+		}
+	}
+	return models[0].Name
 }
 
 // mergeNewProviders adds any provider (and its paired model, matched via

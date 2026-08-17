@@ -93,7 +93,9 @@ Give this real time — it's the phase that actually earns "as good as Claude Co
   `Chat.SessionState` blob (Phase 1) so "always allow" survives a restart.
 - **Todo (FR11):** wire `agent/harness/todo`.
 - **Mode (FR12):** wire `agent/harness/agentmode` (default plan/execute); decide and implement how
-  plan mode restricts mutating tools (Design §3.8's flagged open point).
+  plan mode restricts mutating tools (Design §3.8's flagged open point). **Superseded
+  (post-v0.1.0):** `agentmode` was removed and replaced by four SDLC-persona agents switched via
+  the ordinary agent picker — see DESIGN.md §3.8's addendum.
 
 **Exit criteria:** all four work end-to-end against a real provider: a session compacts under
 load, an approval rule persists across a process restart, a todo list updates as the agent works,

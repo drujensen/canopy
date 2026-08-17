@@ -45,7 +45,7 @@ loop, and this is what Canopy is actually building:
   semantics (§6, FR5).
 - **Progress visibility** — a todo/plan list the agent maintains and the user can see (§6, FR11).
 - **Mode separation** — a "plan" mode that can't mutate anything vs. an "execute" mode that can
-  (§6, FR12).
+  (§6, FR12; superseded post-v0.1.0 by the 4-persona SDLC agent workflow — see FR12's row in §6).
 - **Subagent dispatch used for context isolation**, not workflow composition (§6, FR9).
 - **Reading the same project configuration Claude Code reads** — agents, skills, MCP servers,
   project instructions — so the harness quality isn't undercut by every project needing bespoke
@@ -87,7 +87,8 @@ because it's what makes existing Claude Code projects portable to Canopy (§6, F
    skills (`.claude/skills/*/SKILL.md`), MCP servers (`.mcp.json`), and project instructions
    (`CLAUDE.md`/`AGENTS.md`) — §6, FR17–FR20.
 7. **Loop quality**: compaction, approvals with standing rules, todo/progress tracking, plan/execute
-   mode — all first-class and visible in the TUI (unchanged from prior drafts, §6 FR5/FR10–FR12).
+   mode — all first-class and visible in the TUI (unchanged from prior drafts, §6 FR5/FR10–FR12;
+   the plan/execute mode half of FR12 is superseded post-v0.1.0 — see FR12's row in §6).
 8. **Dynamic subagent dispatch**, not a graph engine (unchanged, §6 FR9).
 9. **Faster and lighter than Claude Code** at the things that are directly comparable: process
    startup time, idle memory footprint, and binary distribution (a single static binary, no
@@ -135,9 +136,9 @@ because it's what makes existing Claude Code projects portable to Canopy (§6, F
 | FR9 | A single agent can invoke another configured agent as a tool call at runtime, on its own judgment, to work a subtask in an isolated context and return a clean result — MAF-Go's `tool/agenttool`, the Task-tool equivalent. No predefined graph, no fixed topology. |
 | FR10 | Long conversations are automatically compacted before they threaten the model's context window (sliding window and/or summarization), using MAF-Go's `agent/compaction` package. |
 | FR11 | Agents can maintain and surface a todo/progress list during multi-step tasks, using MAF-Go's `agent/harness/todo`; the TUI renders the current list live. |
-| FR12 | Agents can operate in distinct modes (at minimum plan vs. execute), using MAF-Go's `agent/harness/agentmode`; the TUI shows the current mode and lets the user switch it. |
+| FR12 | ~~Agents can operate in distinct modes (at minimum plan vs. execute), using MAF-Go's `agent/harness/agentmode`; the TUI shows the current mode and lets the user switch it.~~ **Superseded (post-v0.1.0):** replaced by four SDLC-persona agents (`research`, `design`, `plan`, `execute`) switched via the existing agent picker (FR9's `ctrl+a`), not a separate mode toggle — see DESIGN.md §3.8's addendum for the full rationale and DESIGN.md §3.11's addendum for the four agents themselves. |
 | FR13 | Chat history persists per session across turns and process restarts, via a JSON-backed `HistoryProvider`/`ChatRepository`. |
-| FR14 | Session-scoped state from FR5/FR11/FR12 (approval rules, todo items, current mode) persists as one serialized `*agent.Session` blob on the Chat record (see DESIGN.md), so it survives a restart. |
+| FR14 | Session-scoped state from FR5/FR11 (approval rules, todo items) persists as one serialized `*agent.Session` blob on the Chat record (see DESIGN.md), so it survives a restart. (Post-v0.1.0: this blob also carried FR12's mode state before FR12 was superseded — an old chat's now-orphaned mode key persists harmlessly alongside the rest, per DESIGN.md §3.8's addendum.) |
 | FR15 | The CLI supports at minimum: default TUI mode, `--storage=file` (the only supported value in v1, but the flag stays for forward compatibility with FR-deferred mongo support), `--global`/`-g`, `--version`. |
 | FR16 | Structured logging (zap) captures run, middleware, and provider diagnostics; API keys and full sensitive payloads are never logged by default. |
 | FR17 | Canopy discovers and loads agent definitions from `.claude/agents/*.md` (project, recursive) and `~/.claude/agents/*.md` (personal, recursive), parsing YAML frontmatter (`name`, `description` required; `tools`, `model` optional) with the markdown body as the system prompt — the same format and locations Claude Code uses, so an existing project's subagents load unmodified. Project-level definitions win name conflicts with personal ones. |
@@ -146,10 +147,25 @@ because it's what makes existing Claude Code projects portable to Canopy (§6, F
 | FR20 | Canopy auto-loads project instructions from `CLAUDE.md` and/or `AGENTS.md` at the project root into the system prompt, matching Claude Code's project-instructions convention. |
 
 Addendum (post-v0.1.0): FR17's "no agent definitions found anywhere" case no longer hard-errors.
-Canopy also scans `~/.canopy/agents/*.md` as a third, lowest-precedence source, and auto-creates a
-default "general" agent there on first run when nothing else exists, so a brand-new install works
-with zero configuration — see `internal/impl/agentsource.WriteDefault` and DESIGN.md §3.11's
-addendum.
+Canopy also scans `~/.canopy/agents/*.md` as a third, lowest-precedence source, and auto-creates
+Canopy's default agents there whenever that directory is missing or empty, so a brand-new install
+works with zero configuration and a later-deleted default agent regenerates on the next run — see
+`internal/impl/agentsource.WriteDefaults`, `cmd/canopy.canopyAgentsDirNeedsDefaults`, and
+DESIGN.md §3.11's addendum.
+
+Addendum (post-v0.1.0): FR12's plan/execute mode toggle is superseded by four SDLC-persona agents —
+`research` (Product Owner, produces `docs/REQUIREMENTS.md`), `design` (Architect/UX, produces
+`docs/DESIGN.md`), `plan` (Project Manager, produces `docs/PLAN.md`), and `execute` (Developer,
+implements `PLAN.md`'s stories) — auto-created the same zero-config way FR17's addendum above
+describes for the `general` agent, and switched the same way any other agent is (FR9's `ctrl+a`
+picker). This directly answers the underlying need FR12 originally named (agents operating
+differently depending on what stage of work they're doing) with Canopy's own agent-definition
+mechanism (FR17) rather than a separate mode primitive — one mechanism instead of two doing
+overlapping jobs. `research`/`design`/`plan` all depend on `WebSearch` actually working, which
+FR4's originally-unwired `WebSearchBackend` now supports zero-config via a `TAVILY_API_KEY`
+environment variable (`internal/impl/tools/tavily_backend.go`) — see DESIGN.md §3.2's addendum.
+Full rationale, the four agents' tool allowlists, and the backward-compatibility story for chats
+persisted before this change: DESIGN.md §3.8's addendum.
 
 Addendum (post-v0.1.0): FR1-FR3's "no providers/models configured" case no longer hard-errors
 either, on the same zero-config first-run principle as FR17's addendum above. Canopy fetches the
@@ -181,6 +197,24 @@ reuse. The TUI also gained `ctrl+s`, a read-only skills browser (DESIGN.md §5's
 top-level agent picker (DESIGN.md §5's addendum) — both are TUI-only additions with no new FR
 number of their own, extensions of FR8's chat-screen UX and FR19's skill support respectively.
 
+Addendum (post-v0.1.0): FR19 gained a third, lowest-precedence source — `~/.canopy/skills`,
+mirroring FR17's own `~/.canopy/agents` addendum — and Canopy now auto-creates one default skill
+there, `mcp-server-setup`, the same zero-config-first-run posture as the default agents: helping a
+user find and configure MCP servers from public registries is broadly useful with no
+project-specific setup, directly reinforcing FR6/FR18's "MCP is the extensibility mechanism"
+design. See `internal/impl/skillsource.WriteDefaults` and DESIGN.md §3.11's addendum.
+
+Addendum (post-v0.1.0), bugfix: the SDLC agents' generated `tools:` allowlist (FR12's addendum
+above) originally also named `Skill`, which — like `WebSearch` — is only actually available once
+at least one skill is loaded. Because `buildTopLevelTools`'s "wrap every other agent as a
+subagent-dispatch tool" step used to treat a failure building *any* other agent as fatal, this
+broke starting *every* agent on an install with zero skills configured, not just selecting
+`research`/`design`/`plan` directly. Fixed two ways: `Skill` was dropped from the three agents'
+`tools:` lines (none of their system prompts referenced it), and — the more general fix —
+`buildTopLevelTools` now logs and skips a misconfigured *other* agent rather than failing the
+whole build; an agent's own unavailable tool still fails loudly when that agent is selected
+directly. See DESIGN.md §3.4's addendum.
+
 ## 7. Non-functional requirements
 
 - **Security.** No API keys or secrets in logs by default. Bash/file tools retain input validation
@@ -208,8 +242,9 @@ number of their own, extensions of FR8's chat-screen UX and FR19's skill support
 ## 8. Risks / open questions
 
 - **MAF-Go is public preview** — pin version, re-evaluate on upgrade. The loop-quality subsystems
-  (`agent/compaction`, `agent/harness/{toolapproval,todo,agentmode}`) are the least stable surface
-  within an already-preview framework.
+  (`agent/compaction`, `agent/harness/{toolapproval,todo}`) are the least stable surface within an
+  already-preview framework. (Post-v0.1.0: `agentmode` was in this list too, before FR12 was
+  superseded — Canopy no longer imports it.)
 - **Claude Code's file formats are not all a versioned, stable spec.** Agent Skills became an open
   spec in December 2025 and is the most stable of the three; the subagent markdown frontmatter and
   `.mcp.json` schema are documented but not formally versioned. Canopy should implement against
@@ -233,7 +268,10 @@ number of their own, extensions of FR8's chat-screen UX and FR19's skill support
 - Approval prompts support "approve once" and "always allow," and "always allow" survives a
   restart.
 - A multi-step task shows a live todo/progress list in the TUI.
-- A user can see and switch the agent's current mode (plan vs. execute) in the TUI.
+- ~~A user can see and switch the agent's current mode (plan vs. execute) in the TUI.~~
+  **Superseded (post-v0.1.0):** a user switches between the `research`/`design`/`plan`/`execute`
+  SDLC-persona agents via the same agent picker used for any other agent (see FR12's addendum
+  in §6).
 - A parent agent can dispatch a subtask to another configured agent as a tool call and get back a
   clean result without polluting its own conversation context.
 - Canopy's core tool set plus any configured MCP servers cover what a Claude Code session in the

@@ -125,3 +125,121 @@ Body.
 	assert.Contains(t, err.Error(), path)
 	assert.Contains(t, err.Error(), "name")
 }
+
+// TestLoad_CanopyDefaultSource covers the third, lowest-precedence source
+// (post-v0.1.0 addendum, mirroring agentsource's ~/.canopy/agents tier).
+func TestLoad_CanopyDefaultSource(t *testing.T) {
+	projectRoot := t.TempDir()
+	homeDir := t.TempDir()
+
+	writeFile(t, filepath.Join(homeDir, ".canopy", "skills", "canopy-default", "SKILL.md"), `---
+name: canopy-default
+description: A Canopy-generated default skill.
+---
+Default body.
+`)
+
+	defs, err := Load(projectRoot, homeDir)
+	require.NoError(t, err)
+	require.Len(t, defs, 1)
+	assert.Equal(t, "canopy-default", defs["canopy-default"].Name)
+}
+
+// TestLoad_PersonalWinsOverCanopyDefault and
+// TestLoad_ProjectWinsOverCanopyDefaultAndPersonal assert the precedence
+// order Load's own doc comment describes: canopy-default < personal <
+// project, mirroring agentsource_test.go's equivalent coverage.
+func TestLoad_PersonalWinsOverCanopyDefault(t *testing.T) {
+	projectRoot := t.TempDir()
+	homeDir := t.TempDir()
+
+	writeFile(t, filepath.Join(homeDir, ".canopy", "skills", "shared-name", "SKILL.md"), `---
+name: shared-name
+description: Canopy default version.
+---
+Default body.
+`)
+	writeFile(t, filepath.Join(homeDir, ".claude", "skills", "shared-name", "SKILL.md"), `---
+name: shared-name
+description: Personal version.
+---
+Personal body.
+`)
+
+	defs, err := Load(projectRoot, homeDir)
+	require.NoError(t, err)
+	require.Len(t, defs, 1)
+	assert.Equal(t, "Personal version.", defs["shared-name"].Description)
+}
+
+func TestLoad_ProjectWinsOverCanopyDefaultAndPersonal(t *testing.T) {
+	projectRoot := t.TempDir()
+	homeDir := t.TempDir()
+
+	writeFile(t, filepath.Join(homeDir, ".canopy", "skills", "shared-name", "SKILL.md"), `---
+name: shared-name
+description: Canopy default version.
+---
+Default body.
+`)
+	writeFile(t, filepath.Join(homeDir, ".claude", "skills", "shared-name", "SKILL.md"), `---
+name: shared-name
+description: Personal version.
+---
+Personal body.
+`)
+	writeFile(t, filepath.Join(projectRoot, ".claude", "skills", "shared-name", "SKILL.md"), `---
+name: shared-name
+description: Project version.
+---
+Project body.
+`)
+
+	defs, err := Load(projectRoot, homeDir)
+	require.NoError(t, err)
+	require.Len(t, defs, 1)
+	assert.Equal(t, "Project version.", defs["shared-name"].Description)
+}
+
+// TestWriteDefaults_WritesLoadableSkill asserts the generated
+// mcp-server-setup skill is well-formed enough for Load to parse it
+// successfully, with a non-empty description (level-1 catalog entry) and
+// body (level-2/3 content).
+func TestWriteDefaults_WritesLoadableSkill(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), ".canopy", "skills")
+
+	require.NoError(t, WriteDefaults(dir))
+
+	path := filepath.Join(dir, "mcp-server-setup", "SKILL.md")
+	_, err := os.Stat(path)
+	require.NoError(t, err)
+
+	defs, err := Load(t.TempDir(), filepath.Dir(filepath.Dir(dir)))
+	require.NoError(t, err)
+	require.Len(t, defs, 1)
+
+	def, ok := defs["mcp-server-setup"]
+	require.True(t, ok)
+	assert.Equal(t, "mcp-server-setup", def.Name)
+	assert.NotEmpty(t, def.Description)
+	assert.NotEmpty(t, def.Body)
+	assert.Contains(t, def.Body, ".mcp.json")
+}
+
+// TestWriteDefaults_Idempotent mirrors agentsource's own idempotency
+// contract: an already-existing default skill file is left untouched.
+func TestWriteDefaults_Idempotent(t *testing.T) {
+	dir := t.TempDir()
+
+	require.NoError(t, WriteDefaults(dir))
+
+	path := filepath.Join(dir, "mcp-server-setup", "SKILL.md")
+	custom := "---\nname: mcp-server-setup\ndescription: Hand-edited by the user.\n---\nCustom body.\n"
+	require.NoError(t, os.WriteFile(path, []byte(custom), 0o644))
+
+	require.NoError(t, WriteDefaults(dir))
+
+	got, err := os.ReadFile(path)
+	require.NoError(t, err)
+	assert.Equal(t, custom, string(got), "an already-existing default skill file must be left untouched")
+}

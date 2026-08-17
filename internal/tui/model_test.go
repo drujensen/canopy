@@ -39,7 +39,7 @@ import (
 // before being folded into the transcript once a terminal streamDoneMsg
 // arrives.
 func TestChatModel_StreamedContentAccumulates(t *testing.T) {
-	c := newChatModel("chat-1", "assistant", nil, "execute", "m1", 80, 24)
+	c := newChatModel("chat-1", "assistant", nil, "m1", 80, 24)
 
 	cmd := c.handleStreamMsg(streamChunkMsg{update: &agent.ResponseUpdate{
 		Contents: message.Contents{&message.TextContent{Text: "Hello"}},
@@ -60,7 +60,6 @@ func TestChatModel_StreamedContentAccumulates(t *testing.T) {
 	c.handleStreamMsg(streamDoneMsg{result: &services.RunResult{
 		Response: &agent.Response{},
 		Todos:    nil,
-		Mode:     "execute",
 	}})
 
 	require.Len(t, c.transcript, 1)
@@ -73,7 +72,7 @@ func TestChatModel_StreamedContentAccumulates(t *testing.T) {
 // TestChatModel_TodoPanelReflectsRunResult proves the live todo panel
 // (Design §3.7) renders whatever Todos a turn's RunResult carries.
 func TestChatModel_TodoPanelReflectsRunResult(t *testing.T) {
-	c := newChatModel("chat-1", "assistant", nil, "execute", "m1", 80, 24)
+	c := newChatModel("chat-1", "assistant", nil, "m1", 80, 24)
 
 	c.handleStreamMsg(streamDoneMsg{result: &services.RunResult{
 		Response: &agent.Response{},
@@ -81,7 +80,6 @@ func TestChatModel_TodoPanelReflectsRunResult(t *testing.T) {
 			{ID: 1, Title: "Write the report", IsComplete: false},
 			{ID: 2, Title: "Send the email", IsComplete: true},
 		},
-		Mode: "execute",
 	}})
 
 	require.Len(t, c.todos, 2)
@@ -95,7 +93,7 @@ func TestChatModel_TodoPanelReflectsRunResult(t *testing.T) {
 // carrying a *message.ToolApprovalRequestContent and asserts the approval
 // prompt (Design §3.6) becomes visible, pre-empting the composer.
 func TestChatModel_ApprovalPromptAppears(t *testing.T) {
-	c := newChatModel("chat-1", "assistant", nil, "execute", "m1", 80, 24)
+	c := newChatModel("chat-1", "assistant", nil, "m1", 80, 24)
 
 	req := &message.ToolApprovalRequestContent{
 		RequestID: "req-1",
@@ -120,12 +118,12 @@ func TestChatModel_ApprovalPromptAppears(t *testing.T) {
 // to be handed straight to lipgloss.Render with no wrapping/clipping,
 // growing the rendered view taller than resize's fixed viewport/composer
 // budget accounts for and, in a real terminal, scrolling the
-// sidebar/mode-indicator/transcript above it out of view. Asserts the
+// sidebar/transcript above it out of view. Asserts the
 // rendered view's error line is clamped to the chat's main-column width (so
-// it can't add unbudgeted rows) and that the sidebar's mode indicator is
+// it can't add unbudgeted rows) and that the sidebar's agent indicator is
 // still present in the same render.
 func TestChatModel_View_LongMultilineError_StaysOneLineAndKeepsSidebarVisible(t *testing.T) {
-	c := newChatModel("chat-1", "assistant", nil, "execute", "m1", 80, 24)
+	c := newChatModel("chat-1", "assistant", nil, "m1", 80, 24)
 	c.statusErr = fmt.Errorf("error: POST \"https://api.example.com/v1/chat/completions\": 429 Too Many Requests {\n  \"error\": {\n    \"message\": \"You exceeded your current quota, please check your plan and billing details. For more information on this error, see: https://platform.openai.com/docs/guides/error-codes/api-errors.\",\n    \"type\": \"insufficient_quota\",\n    \"param\": null,\n    \"code\": \"insufficient_quota\"\n  }\n}")
 
 	view := c.View(80, 24)
@@ -134,7 +132,34 @@ func TestChatModel_View_LongMultilineError_StaysOneLineAndKeepsSidebarVisible(t 
 	for _, line := range strings.Split(view, "\n") {
 		assert.LessOrEqual(t, len([]rune(line)), 80, "no rendered line (including the error line) should exceed the requested width")
 	}
-	assert.Contains(t, view, "Mode: execute", "the sidebar's mode indicator must still render alongside a long status error")
+	assert.Contains(t, view, "Agent: assistant", "the sidebar's agent indicator must still render alongside a long status error")
+}
+
+// TestChatModel_View_LongTranscriptLine_WordWraps is a regression test for a
+// real reported bug: transcript text (a long assistant reply, a pasted user
+// message, a long skill body shown via ctrl+s) was rendered with no width
+// constraint at all — renderEntry just concatenated label+text straight into
+// the viewport, so any line longer than the terminal's width ran off-screen
+// unreadably instead of wrapping. Asserts every rendered line stays within
+// the requested total width and that none of the original words were
+// dropped or corrupted by wrapping.
+func TestChatModel_View_LongTranscriptLine_WordWraps(t *testing.T) {
+	c := newChatModel("chat-1", "assistant", nil, "m1", 80, 24)
+	longLine := "This is a single very long line of assistant response text with no embedded newlines at all that must be word-wrapped to fit the available viewport width instead of running off the edge of the terminal and becoming unreadable to the user."
+	c.transcript = append(c.transcript, transcriptEntry{role: message.RoleAssistant, text: longLine})
+	c.refreshViewport()
+
+	view := c.View(80, 24)
+
+	for _, line := range strings.Split(view, "\n") {
+		assert.LessOrEqual(t, len([]rune(line)), 80, "no rendered line should exceed the requested total width")
+	}
+	// Every word from the original text must still be present somewhere in
+	// the rendered view — wrapping must break lines at spaces, never drop or
+	// mangle the actual words.
+	for _, word := range strings.Fields(longLine) {
+		assert.Contains(t, view, word, "wrapping must not drop or corrupt words from the original text")
+	}
 }
 
 // TestChatModel_EmptyTranscript_ShowsGreeting_ClearedByFirstMessage asserts
@@ -145,7 +170,7 @@ func TestChatModel_View_LongMultilineError_StaysOneLineAndKeepsSidebarVisible(t 
 // case's own refreshViewport call already replaces it, no separate
 // "clear the greeting" step needed anywhere.
 func TestChatModel_EmptyTranscript_ShowsGreeting_ClearedByFirstMessage(t *testing.T) {
-	c := newChatModel("chat-1", "assistant", nil, "execute", "m1", 80, 24)
+	c := newChatModel("chat-1", "assistant", nil, "m1", 80, 24)
 
 	assert.Contains(t, c.viewport.View(), defaultGreeting, "an empty chat must show the greeting rather than a blank scrollback")
 	assert.Empty(t, c.transcript, "the greeting must never be appended to transcript")
@@ -163,7 +188,7 @@ func TestChatModel_EmptyTranscript_ShowsGreeting_ClearedByFirstMessage(t *testin
 // hint), and doesn't also render the composer's own placeholder text —
 // there should be exactly one bottom-area affordance, not both layered.
 func TestChatModel_View_StreamActive_ShowsSpinnerNotComposer(t *testing.T) {
-	c := newChatModel("chat-1", "assistant", nil, "execute", "m1", 80, 24)
+	c := newChatModel("chat-1", "assistant", nil, "m1", 80, 24)
 
 	idleView := c.View(80, 24)
 	assert.Contains(t, idleView, "Type a message", "the composer's placeholder must render while idle")
@@ -194,7 +219,7 @@ func TestChatModel_StartTurnCmd_ClearsPriorStatusErr(t *testing.T) {
 	_, err := svc.StartChat(ctx, "chat-1", "assistant")
 	require.NoError(t, err)
 
-	c := newChatModel("chat-1", "assistant", nil, "execute", "m1", 80, 24)
+	c := newChatModel("chat-1", "assistant", nil, "m1", 80, 24)
 	c.statusErr = fmt.Errorf("stale error from a previous turn")
 
 	// startTurnCmd itself, synchronously, before any stream event has been
@@ -205,25 +230,6 @@ func TestChatModel_StartTurnCmd_ClearsPriorStatusErr(t *testing.T) {
 
 	drainCmd(t, c, cmd)
 	assert.Nil(t, c.statusErr, "a successful turn must not have re-introduced an error")
-}
-
-// TestModel_ModeIndicatorReflectsSwitch drives the top-level Model with a
-// synthetic modeChangedMsg (what toggleModeCmd's tea.Cmd produces once
-// AgentService.SetMode succeeds) and asserts both the chat's mode field and
-// the rendered mode indicator (Design §3.8) reflect the switch.
-func TestModel_ModeIndicatorReflectsSwitch(t *testing.T) {
-	m := Model{
-		screen: screenChat,
-		chat:   newChatModel("chat-1", "assistant", nil, "execute", "m1", 80, 24),
-		width:  80, height: 24,
-	}
-	assert.Contains(t, m.View(), "Mode: execute")
-
-	updated, cmd := m.Update(modeChangedMsg{mode: "plan"})
-	assert.Nil(t, cmd)
-	next := updated.(Model)
-	assert.Equal(t, "plan", next.chat.mode)
-	assert.Contains(t, next.View(), "Mode: plan")
 }
 
 // TestModel_NoAgentsConfigured_ShowsActionableMessage covers the picker
@@ -484,7 +490,7 @@ func TestChatModel_ApprovalFlow_ApproveOnce_DoesNotPersist(t *testing.T) {
 	_, err := svc.StartChat(ctx, "chat-1", "assistant")
 	require.NoError(t, err)
 
-	c := newChatModel("chat-1", "assistant", nil, "execute", "m1", 80, 24)
+	c := newChatModel("chat-1", "assistant", nil, "m1", 80, 24)
 
 	drainCmd(t, c, c.startTurnCmd(svc, ctx, []*message.Message{message.NewText("please run the marker command")}))
 	require.NotNil(t, c.pendingApproval, "the first run_shell request must surface an approval prompt")
@@ -510,7 +516,7 @@ func TestChatModel_ApprovalFlow_AlwaysAllow_Persists(t *testing.T) {
 	_, err := svc.StartChat(ctx, "chat-1", "assistant")
 	require.NoError(t, err)
 
-	c := newChatModel("chat-1", "assistant", nil, "execute", "m1", 80, 24)
+	c := newChatModel("chat-1", "assistant", nil, "m1", 80, 24)
 
 	drainCmd(t, c, c.startTurnCmd(svc, ctx, []*message.Message{message.NewText("please run the marker command")}))
 	require.NotNil(t, c.pendingApproval)
@@ -525,44 +531,6 @@ func TestChatModel_ApprovalFlow_AlwaysAllow_Persists(t *testing.T) {
 	assert.Nil(t, c.pendingApproval, "always-allow must have installed a standing rule that auto-approves the second request")
 	_, statErr = os.Stat(marker)
 	assert.NoError(t, statErr, "the tool must have executed again automatically under the standing rule")
-}
-
-// TestChatModel_ModeToggle_RealSetMode exercises toggleModeCmd against a
-// real AgentService (SetMode only touches the JSON repository, no provider
-// call needed), proving the ctrl+p keybinding produces the modeChangedMsg
-// Model.Update expects, with the correct next mode.
-func TestChatModel_ModeToggle_RealSetMode(t *testing.T) {
-	repo, err := jsonrepo.NewChatRepository(t.TempDir())
-	require.NoError(t, err)
-	svc := services.NewAgentService(services.AgentServiceConfig{
-		Definitions: services.Definitions{
-			Agents: map[string]agentsource.AgentDefinition{"assistant": {Name: "assistant"}},
-		},
-		Repository: repo,
-	})
-	ctx := context.Background()
-	_, err = svc.StartChat(ctx, "chat-1", "assistant")
-	require.NoError(t, err)
-
-	c := newChatModel("chat-1", "assistant", nil, "execute", "m1", 80, 24)
-
-	cmd := c.toggleModeCmd(svc, ctx)
-	require.NotNil(t, cmd)
-	msg := cmd()
-	modeMsg, ok := msg.(modeChangedMsg)
-	require.True(t, ok)
-	assert.Equal(t, "plan", modeMsg.mode)
-
-	// c.mode itself is only updated by Model.Update on receipt of
-	// modeChangedMsg (see model.go) — toggleModeCmd reads c.mode as it was
-	// when the Cmd was constructed, matching Bubble Tea's own "Cmds close
-	// over model state at construction time" pattern. Simulate that receipt
-	// here before toggling again.
-	c.mode = modeMsg.mode
-	msg = c.toggleModeCmd(svc, ctx)()
-	modeMsg, ok = msg.(modeChangedMsg)
-	require.True(t, ok)
-	assert.Equal(t, "execute", modeMsg.mode, "toggling from plan must switch back to execute")
 }
 
 // --- ctrl+a (switch agent) / ctrl+o (switch model) overlay tests
@@ -612,7 +580,7 @@ func TestChatModel_CtrlA_OpensAgentPicker_SelectingSwitchesAgentKeepsChat(t *tes
 	_, err := svc.StartChat(ctx, "chat-1", "assistant")
 	require.NoError(t, err)
 
-	c := newChatModel("chat-1", "assistant", nil, "execute", "m1", 80, 24)
+	c := newChatModel("chat-1", "assistant", nil, "m1", 80, 24)
 	c.transcript = append(c.transcript, transcriptEntry{role: message.RoleUser, text: "hello before the switch"})
 
 	cmd := c.handleKey(tea.KeyMsg{Type: tea.KeyCtrlA}, svc, ctx)
@@ -654,7 +622,7 @@ func TestChatModel_CtrlO_OpensModelPicker_SelectingSwitchesModel(t *testing.T) {
 	_, err := svc.StartChat(ctx, "chat-1", "assistant")
 	require.NoError(t, err)
 
-	c := newChatModel("chat-1", "assistant", nil, "execute", "m1", 80, 24)
+	c := newChatModel("chat-1", "assistant", nil, "m1", 80, 24)
 
 	cmd := c.handleKey(tea.KeyMsg{Type: tea.KeyCtrlO}, svc, ctx)
 	assert.Nil(t, cmd)
@@ -692,7 +660,7 @@ func TestChatModel_CtrlA_CtrlO_NoopDuringPendingApproval(t *testing.T) {
 	_, err := svc.StartChat(ctx, "chat-1", "assistant")
 	require.NoError(t, err)
 
-	c := newChatModel("chat-1", "assistant", nil, "execute", "m1", 80, 24)
+	c := newChatModel("chat-1", "assistant", nil, "m1", 80, 24)
 	c.pendingApproval = &message.ToolApprovalRequestContent{
 		RequestID: "req-1",
 		ToolCall:  &message.FunctionCallContent{CallID: "call-1", Name: "run_shell", Arguments: "{}"},
@@ -719,7 +687,7 @@ func TestChatModel_CtrlA_CtrlO_NoopDuringActiveStream(t *testing.T) {
 	_, err := svc.StartChat(ctx, "chat-1", "assistant")
 	require.NoError(t, err)
 
-	c := newChatModel("chat-1", "assistant", nil, "execute", "m1", 80, 24)
+	c := newChatModel("chat-1", "assistant", nil, "m1", 80, 24)
 	c.streamActive = true
 
 	cmd := c.handleKey(tea.KeyMsg{Type: tea.KeyCtrlA}, svc, ctx)
@@ -748,7 +716,7 @@ func TestModel_CtrlN_StartsGenuinelyNewChat_ResetsState(t *testing.T) {
 	_, err := svc.StartChat(ctx, "chat-1", "assistant")
 	require.NoError(t, err)
 
-	c := newChatModel("chat-1", "assistant", nil, "execute", "m1", 80, 24)
+	c := newChatModel("chat-1", "assistant", nil, "m1", 80, 24)
 	c.transcript = append(c.transcript, transcriptEntry{role: message.RoleUser, text: "hello before new chat"})
 	c.todos = []todo.Item{{ID: 1, Title: "leftover todo"}}
 	c.pendingApproval = nil // starts nil; asserted below on the fresh chat too
@@ -765,8 +733,7 @@ func TestModel_CtrlN_StartsGenuinelyNewChat_ResetsState(t *testing.T) {
 	assert.NotEqual(t, "chat-1", startedMsg.chatID, "ctrl+n must generate a genuinely new chat ID, not reuse the old one")
 	assert.Equal(t, "assistant", startedMsg.agentName, "the new chat must keep the current agent — ctrl+n must not force the user back through the agent picker")
 	assert.Empty(t, startedMsg.todos, "a brand-new chat must start with no leftover todos")
-	assert.Equal(t, "execute", startedMsg.mode, "a brand-new chat must start in the default mode, not whatever the old chat's mode was")
-	assert.Equal(t, "m1", startedMsg.model, "a brand-new chat with no override must resolve to the agent's normal model")
+	assert.Equal(t, "m1", startedMsg.model, "the new chat must carry over the old chat's active model")
 
 	updated, updCmd := m.Update(startedMsg)
 	assert.Nil(t, updCmd)
@@ -777,7 +744,6 @@ func TestModel_CtrlN_StartsGenuinelyNewChat_ResetsState(t *testing.T) {
 	assert.Empty(t, next.chat.todos, "a genuinely new chat must start with no leftover todos")
 	assert.Nil(t, next.chat.pendingApproval, "a genuinely new chat must start with no pending approval")
 	assert.False(t, next.chat.streamActive)
-	assert.Equal(t, "execute", next.chat.mode)
 	assert.Equal(t, "m1", next.chat.model)
 
 	// Prove it's a new chat file, not the old one rewritten: the old chat ID
@@ -785,6 +751,41 @@ func TestModel_CtrlN_StartsGenuinelyNewChat_ResetsState(t *testing.T) {
 	oldStillModel, err := svc.GetModel(ctx, "chat-1")
 	require.NoError(t, err)
 	assert.Equal(t, "m1", oldStillModel, "the old chat must still exist, untouched, under its own ID")
+}
+
+// TestModel_CtrlN_CarriesOverSwitchedModel is a regression test for a real
+// reported bug: ctrl+n's new chat always resolved to
+// AgentServiceConfig.DefaultModel — the model last used as of process
+// *startup* — instead of whatever the user had actually switched to via
+// ctrl+o earlier in the running session, because a fresh chat's
+// ModelOverride starts empty and DefaultModel never changes after
+// construction. Switches the current chat to a non-default model first,
+// then asserts ctrl+n's new chat picks up that switched-to model, not
+// DefaultModel — mirroring how ctrl+n already carries over the current
+// agent instead of falling back to some session-wide default agent.
+func TestModel_CtrlN_CarriesOverSwitchedModel(t *testing.T) {
+	svc := newSwitchTestService(t) // DefaultModel: "m1", also configures "m2"
+	ctx := context.Background()
+	_, err := svc.StartChat(ctx, "chat-1", "assistant")
+	require.NoError(t, err)
+	require.NoError(t, svc.SetModel(ctx, "chat-1", "m2"), "simulate the user switching models via ctrl+o earlier in the session")
+
+	c := newChatModel("chat-1", "assistant", nil, "m2", 80, 24)
+
+	cmd := c.handleKey(tea.KeyMsg{Type: tea.KeyCtrlN}, svc, ctx)
+	require.NotNil(t, cmd)
+	msg := cmd()
+	startedMsg, ok := msg.(chatStartedMsg)
+	require.True(t, ok)
+	require.NoError(t, startedMsg.err)
+
+	assert.Equal(t, "m2", startedMsg.model, "ctrl+n's new chat must carry over the switched-to model, not fall back to DefaultModel (\"m1\")")
+
+	// Also confirm it's a real, persisted override on the new chat, not just
+	// a value that happened to be in the returned message.
+	persistedModel, err := svc.GetModel(ctx, startedMsg.chatID)
+	require.NoError(t, err)
+	assert.Equal(t, "m2", persistedModel)
 }
 
 // TestChatModel_CtrlN_NoopDuringActiveStream asserts ctrl+n does not
@@ -796,7 +797,7 @@ func TestChatModel_CtrlN_NoopDuringActiveStream(t *testing.T) {
 	_, err := svc.StartChat(ctx, "chat-1", "assistant")
 	require.NoError(t, err)
 
-	c := newChatModel("chat-1", "assistant", nil, "execute", "m1", 80, 24)
+	c := newChatModel("chat-1", "assistant", nil, "m1", 80, 24)
 	c.streamActive = true
 
 	cmd := c.handleKey(tea.KeyMsg{Type: tea.KeyCtrlN}, svc, ctx)
@@ -814,7 +815,7 @@ func TestChatModel_CtrlN_NoopDuringPendingApproval(t *testing.T) {
 	_, err := svc.StartChat(ctx, "chat-1", "assistant")
 	require.NoError(t, err)
 
-	c := newChatModel("chat-1", "assistant", nil, "execute", "m1", 80, 24)
+	c := newChatModel("chat-1", "assistant", nil, "m1", 80, 24)
 	c.pendingApproval = &message.ToolApprovalRequestContent{
 		RequestID: "req-1",
 		ToolCall:  &message.FunctionCallContent{CallID: "call-1", Name: "run_shell", Arguments: "{}"},
@@ -864,7 +865,7 @@ func TestChatModel_CtrlS_OpensSkillsBrowser_SelectingShowsRealBody(t *testing.T)
 	_, err := svc.StartChat(ctx, "chat-1", "assistant")
 	require.NoError(t, err)
 
-	c := newChatModel("chat-1", "assistant", nil, "execute", "m1", 80, 24)
+	c := newChatModel("chat-1", "assistant", nil, "m1", 80, 24)
 
 	cmd := c.handleKey(tea.KeyMsg{Type: tea.KeyCtrlS}, svc, ctx)
 	assert.Nil(t, cmd, "opening the skills browser is a synchronous, in-memory ListSkills() read — no Cmd needed")
@@ -892,7 +893,7 @@ func TestChatModel_CtrlS_NoSkillsConfigured_ShowsSensibleMessage(t *testing.T) {
 	_, err := svc.StartChat(ctx, "chat-1", "assistant")
 	require.NoError(t, err)
 
-	c := newChatModel("chat-1", "assistant", nil, "execute", "m1", 80, 24)
+	c := newChatModel("chat-1", "assistant", nil, "m1", 80, 24)
 
 	cmd := c.handleKey(tea.KeyMsg{Type: tea.KeyCtrlS}, svc, ctx)
 	assert.Nil(t, cmd)
@@ -911,7 +912,7 @@ func TestChatModel_CtrlS_EscCancelsWithNoChange(t *testing.T) {
 	_, err := svc.StartChat(ctx, "chat-1", "assistant")
 	require.NoError(t, err)
 
-	c := newChatModel("chat-1", "assistant", nil, "execute", "m1", 80, 24)
+	c := newChatModel("chat-1", "assistant", nil, "m1", 80, 24)
 	c.handleKey(tea.KeyMsg{Type: tea.KeyCtrlS}, svc, ctx)
 	require.NotNil(t, c.picker)
 
@@ -930,7 +931,7 @@ func TestChatModel_CtrlS_NoopDuringActiveStream(t *testing.T) {
 	_, err := svc.StartChat(ctx, "chat-1", "assistant")
 	require.NoError(t, err)
 
-	c := newChatModel("chat-1", "assistant", nil, "execute", "m1", 80, 24)
+	c := newChatModel("chat-1", "assistant", nil, "m1", 80, 24)
 	c.streamActive = true
 
 	cmd := c.handleKey(tea.KeyMsg{Type: tea.KeyCtrlS}, svc, ctx)
@@ -1010,7 +1011,7 @@ func TestChatModel_CtrlH_OpensOverlay_SelectingResumesToDifferentChat(t *testing
 	_, err = svc.StartChat(ctx, "chat-b", "assistant")
 	require.NoError(t, err)
 
-	c := newChatModel("chat-b", "assistant", nil, "execute", "m1", 80, 24)
+	c := newChatModel("chat-b", "assistant", nil, "m1", 80, 24)
 
 	loadCmd := c.handleKey(tea.KeyMsg{Type: tea.KeyCtrlH}, svc, ctx)
 	require.NotNil(t, loadCmd)
@@ -1086,12 +1087,12 @@ func TestModel_FirstExchangeCompletes_TriggersTitleGeneration(t *testing.T) {
 	}
 	require.NoError(t, repo.Update(ctx, chat))
 
-	c := newChatModel("chat-1", "assistant", nil, "execute", model.Name, 80, 24)
+	c := newChatModel("chat-1", "assistant", nil, model.Name, 80, 24)
 	c.transcript = []transcriptEntry{{role: message.RoleUser, text: "what is 6*7?"}}
 	require.False(t, c.titleAttempted)
 
 	m := Model{svc: svc, ctx: ctx, screen: screenChat, chat: c}
-	next, cmd := m.Update(streamDoneMsg{result: &services.RunResult{Response: &agent.Response{}, Mode: "execute"}})
+	next, cmd := m.Update(streamDoneMsg{result: &services.RunResult{Response: &agent.Response{}}})
 	m = next.(Model)
 	require.True(t, m.chat.titleAttempted, "titleAttempted must flip the moment the first exchange is detected, not after generation completes")
 	require.NotNil(t, cmd)
@@ -1121,7 +1122,7 @@ func TestModel_FirstExchangeCompletes_TriggersTitleGeneration(t *testing.T) {
 // first — a second streamDoneMsg on the same chatModel must not re-batch
 // generateTitleCmd.
 func TestModel_SecondExchange_DoesNotRetriggerTitleGeneration(t *testing.T) {
-	c := newChatModel("chat-1", "assistant", nil, "execute", "m1", 80, 24)
+	c := newChatModel("chat-1", "assistant", nil, "m1", 80, 24)
 	c.titleAttempted = true
 	c.transcript = []transcriptEntry{
 		{role: message.RoleUser, text: "first"},
@@ -1130,7 +1131,7 @@ func TestModel_SecondExchange_DoesNotRetriggerTitleGeneration(t *testing.T) {
 	}
 
 	m := Model{screen: screenChat, chat: c}
-	next, cmd := m.Update(streamDoneMsg{result: &services.RunResult{Response: &agent.Response{}, Mode: "execute"}})
+	next, cmd := m.Update(streamDoneMsg{result: &services.RunResult{Response: &agent.Response{}}})
 	m = next.(Model)
 	if cmd != nil {
 		msg := cmd()
@@ -1227,7 +1228,7 @@ func TestChatModel_CtrlO_FilterActuallyNarrowsVisibleItems(t *testing.T) {
 	_, err = svc.StartChat(ctx, "chat-1", "assistant")
 	require.NoError(t, err)
 
-	c := newChatModel("chat-1", "assistant", nil, "execute", "openai", 80, 24)
+	c := newChatModel("chat-1", "assistant", nil, "openai", 80, 24)
 	c.openPicker(svc, pickerModel)
 	require.Len(t, c.picker.Items(), 3)
 

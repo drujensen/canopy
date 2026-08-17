@@ -66,9 +66,47 @@ const chatHistorySourceID = "canopy-chat-history"
 // (created by the caller, e.g. domain/services, before the first Run) —
 // ChatHistoryProvider does not create chats itself, only reads and updates
 // one that's already there.
+//
+// One instance is constructed fresh per outer turn (impl/harness.Build,
+// called from domain/services.AgentService.buildTopLevelAgent once per
+// RunMessages/RunMessagesStream call) and then reused for the *entire*
+// duration of that one a.Run call — see persistedThisTurn's own doc comment
+// for why that lifetime matters.
 type ChatHistoryProvider struct {
 	chatID     string
 	repository interfaces.ChatRepository
+
+	// persistedThisTurn deduplicates Invoked across agent/harness/
+	// toolapproval's internal auto-approval loop (Config.Middlewares'
+	// toolapproval.New — see harness.WireLoopQuality and
+	// RemoveOrphanedApprovalRequests' doc comment for the sibling bug found
+	// in the same area): that loop makes one complete, independent invoke()
+	// round trip — its own Invoking reload *and* its own Invoked persist —
+	// per newly-issued tool call, not one combined round trip for the whole
+	// outer turn. Its own *message.Message slice for the turn (the
+	// original new messages the caller passed to a.Run, e.g. the user's
+	// own new text message) is a single Go slice built once, reused
+	// unchanged across every one of those internal next() calls — so
+	// without deduplication, each internal round treats it as "new" all
+	// over again (Invoked's existing SourceTypeHistoryProvider filter only
+	// catches content loaded by *that same round's own* Invoking call, not
+	// content already persisted by an *earlier* round of the same turn),
+	// and Invoked re-appends and re-persists it every single time. A real
+	// user report confirmed this directly: a chat resumed via --continue
+	// showed one typed message duplicated up to 8 times, tracking the
+	// number of internal auto-approval rounds that turn happened to make.
+	//
+	// Keyed by *message.Message pointer identity, not content: since the
+	// framework hands back the exact same Go objects across every internal
+	// round of one outer turn, pointer identity is both sufficient and the
+	// only correct way to distinguish "the same message object, seen
+	// again" from "a different message that just happens to have the same
+	// text" (e.g. the user genuinely typing "try again" twice in
+	// unrelated, separate turns must not be deduplicated against each
+	// other). Scoped to this ChatHistoryProvider instance's lifetime — one
+	// outer turn, per the type's own doc comment — so it can never
+	// suppress a message that's genuinely new in a *later*, separate turn.
+	persistedThisTurn map[*message.Message]bool
 }
 
 var _ agent.HistoryProvider = (*ChatHistoryProvider)(nil)
@@ -76,7 +114,7 @@ var _ agent.HistoryProvider = (*ChatHistoryProvider)(nil)
 // NewChatHistoryProvider returns a ChatHistoryProvider bound to one chat ID
 // and repository.
 func NewChatHistoryProvider(chatID string, repository interfaces.ChatRepository) *ChatHistoryProvider {
-	return &ChatHistoryProvider{chatID: chatID, repository: repository}
+	return &ChatHistoryProvider{chatID: chatID, repository: repository, persistedThisTurn: make(map[*message.Message]bool)}
 }
 
 // Invoking loads the bound chat's stored messages and returns them prepended
@@ -118,10 +156,10 @@ func (p *ChatHistoryProvider) Invoked(ctx context.Context, invoked agent.Invoked
 	// invoked.RequestMessages is the *post*-Invoking message set: loaded
 	// history (see the chatHistorySourceID doc comment above for why that
 	// must be filtered out here rather than re-appended) plus the new turn's
-	// messages plus, as of Phase 5's compaction/todo/agentmode wiring
+	// messages plus, as of Phase 5's compaction/todo wiring
 	// (impl/harness.WireLoopQuality), whatever those context providers
-	// injected this turn — a todo-list summary message, a mode-change
-	// notification, a compaction summary group, etc. (agent/context.go's
+	// injected this turn — a todo-list summary message, a compaction summary
+	// group, etc. (agent/context.go's
 	// invoke() captures requestMessages *after* the context-provider Invoking
 	// loop runs, so those injected messages land in RequestMessages too).
 	// Those are transient, regenerated-per-turn scaffolding, not real
@@ -132,14 +170,39 @@ func (p *ChatHistoryProvider) Invoked(ctx context.Context, invoked agent.Invoked
 	// chat.Messages to keep working correctly on reload — it keeps its own
 	// view (which groups are excluded) in session state, not by mutating
 	// what's persisted here.
+	//
+	// persistedThisTurn additionally deduplicates by pointer identity — see
+	// that field's own doc comment for why toolapproval's internal
+	// auto-approval loop can call Invoked multiple times for the *same*
+	// outer turn, each time resending the same original *message.Message
+	// objects as if they were new.
 	for _, m := range invoked.RequestMessages {
 		if m == nil || m.Source.Type == agent.SourceTypeHistoryProvider || m.Source.Type == agent.SourceTypeContextProvider {
 			continue
 		}
+		if p.persistedThisTurn[m] {
+			continue
+		}
+		p.persistedThisTurn[m] = true
 		chat.Messages = append(chat.Messages, m)
 	}
-	chat.Messages = append(chat.Messages, invoked.ResponseMessages...)
+	for _, m := range invoked.ResponseMessages {
+		if m == nil || p.persistedThisTurn[m] {
+			continue
+		}
+		p.persistedThisTurn[m] = true
+		chat.Messages = append(chat.Messages, m)
+	}
 	chat.UpdatedAt = time.Now().UTC()
+
+	// Repair on every single persist, not just once per outer turn — see
+	// RemoveOrphanedApprovalRequests' doc comment (approval_repair.go) for
+	// why toolapproval's internal auto-approval loop calls Invoked multiple
+	// times per turn, and why an orphan left behind by one of those internal
+	// calls has to be caught right here to stop a *later* internal call in
+	// the *same* turn from reloading it and failing before AgentService ever
+	// gets control back.
+	RemoveOrphanedApprovalRequests(chat)
 
 	if err := p.repository.Update(ctx, chat); err != nil {
 		return fmt.Errorf("chat history provider: updating chat %q: %w", p.chatID, err)

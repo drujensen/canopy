@@ -3,7 +3,6 @@ package tui
 import (
 	"context"
 	"fmt"
-	"sort"
 	"time"
 
 	"github.com/charmbracelet/bubbles/list"
@@ -43,7 +42,7 @@ type Model struct {
 
 	width, height int
 
-	// fatalErr is a picker-level error (StartChat/GetTodos/GetMode failing
+	// fatalErr is a picker-level error (StartChat/GetTodos failing
 	// for the picked agent) shown instead of transitioning to the chat
 	// screen.
 	fatalErr error
@@ -107,7 +106,7 @@ func newChatID(agentName string) string {
 // instead — see the resumeChatID field's own doc comment for the priority
 // between the two. The Model still always starts constructed on
 // screenAgentPicker/with agentList populated regardless: starting or
-// resuming a chat is I/O (AgentService.StartChat/GetChat/GetTodos/GetMode)
+// resuming a chat is I/O (AgentService.StartChat/GetChat/GetTodos)
 // that can't happen synchronously inside NewModel, so Init defers to the
 // exact same startChatCmd/resumeChatCmd -> chatStartedMsg path a manual
 // picker selection or ctrl+h already uses — the picker screen is simply
@@ -117,7 +116,7 @@ func NewModel(ctx context.Context, svc *services.AgentService, agents map[string
 	for name := range agents {
 		names = append(names, name)
 	}
-	sort.Strings(names)
+	agentsource.SortNames(names)
 
 	items := make([]list.Item, 0, len(names))
 	for _, name := range names {
@@ -198,7 +197,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.fatalErr = msg.err
 			return m, nil
 		}
-		m.chat = newChatModel(msg.chatID, msg.agentName, msg.todos, msg.mode, msg.model, m.width, m.height)
+		m.chat = newChatModel(msg.chatID, msg.agentName, msg.todos, msg.model, m.width, m.height)
 		if len(msg.messages) > 0 {
 			// A resume (ctrl+h/--continue, resumeChatCmd), not a genuinely
 			// new chat — seed the transcript from prior history instead of
@@ -245,12 +244,6 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.historyList.SetSize(m.width, m.height)
 		m.screen = screenHistory
 		return m, cmd
-
-	case modeChangedMsg:
-		if m.chat != nil {
-			m.chat.mode = msg.mode
-		}
-		return m, nil
 
 	case modelChangedMsg:
 		if m.chat != nil {
@@ -347,7 +340,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 // handleKey dispatches a key press to the active screen: global quit
 // (ctrl+c) first, then picker navigation/selection or chat-screen handling
-// (composer editing, approval-prompt decisions, mode switch).
+// (composer editing, approval-prompt decisions, agent/model switch).
 func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	if msg.String() == "ctrl+c" {
 		return m, tea.Quit
@@ -408,7 +401,7 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 }
 
 // startChatCmd starts a brand-new chat bound to agentName (AgentService.
-// StartChat) and seeds it with its (freshly initialized) Todos/Mode
+// StartChat) and seeds it with its (freshly initialized) Todos
 // snapshot. Picking a *specific* prior chat to resume instead — the gap
 // this doc comment used to flag — is resumeChatCmd (stream.go, post-v0.1.0
 // addendum: ctrl+h/--continue), reachable via screenHistory/chatModel's
@@ -425,15 +418,11 @@ func (m Model) startChatCmd(agentName string) tea.Cmd {
 		if err != nil {
 			return chatStartedMsg{err: fmt.Errorf("loading todos: %w", err)}
 		}
-		mode, err := svc.GetMode(ctx, chatID)
-		if err != nil {
-			return chatStartedMsg{err: fmt.Errorf("loading mode: %w", err)}
-		}
 		model, err := svc.GetModel(ctx, chatID)
 		if err != nil {
 			return chatStartedMsg{err: fmt.Errorf("loading model: %w", err)}
 		}
-		return chatStartedMsg{chatID: chatID, agentName: agentName, todos: todos, mode: mode, model: model}
+		return chatStartedMsg{chatID: chatID, agentName: agentName, todos: todos, model: model}
 	}
 }
 

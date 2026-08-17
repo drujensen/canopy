@@ -4,6 +4,7 @@ import (
 	"testing"
 
 	"github.com/microsoft/agent-framework-go/agent"
+	"github.com/microsoft/agent-framework-go/agent/harness/agentmode"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -45,6 +46,41 @@ func TestLoadSession_InvalidJSON(t *testing.T) {
 	_, err := harness.LoadSession(chat)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "chat-1")
+}
+
+// TestLoadSession_TolerantOfOrphanedAgentModeState is a backward-compat
+// regression test: a chat persisted before mode/agentmode.Provider was
+// removed from this package's wiring may still carry a stale
+// "agentModeState" key in its SessionState blob (see agentmode.go's own
+// stateKey constant). agent.Session's state is a generic, unvalidated
+// map[string]*stateValue with no required-key schema, and nothing in this
+// package's current wiring reads or writes that key anymore, so it must
+// ride along as harmless, orphaned data — LoadSession must still succeed,
+// and a round trip back through SerializeSession must not choke on or drop
+// it either.
+func TestLoadSession_TolerantOfOrphanedAgentModeState(t *testing.T) {
+	session := &agent.Session{}
+	// Simulate a session that still has agentmode's own key set, the way a
+	// pre-removal chat's persisted SessionState would — using the real
+	// agentmode.Provider (still vendored, just no longer wired by this
+	// package) rather than hand-rolling the key's internal JSON shape.
+	modeProvider := agentmode.New(agentmode.Config{DefaultMode: "execute"})
+	require.NoError(t, modeProvider.SetMode("plan", agent.WithSession(session)))
+
+	data, err := harness.SerializeSession(session)
+	require.NoError(t, err)
+	require.Contains(t, string(data), "agentModeState", "the orphaned key must actually be present in the fixture for this test to mean anything")
+
+	chat := &entities.Chat{ID: "chat-1", SessionState: data}
+	loaded, err := harness.LoadSession(chat)
+	require.NoError(t, err, "an orphaned agentModeState key must not break LoadSession")
+	require.NotNil(t, loaded)
+
+	// A round trip back through SerializeSession must also succeed and keep
+	// carrying the orphaned key along untouched, not drop or corrupt it.
+	roundTripped, err := harness.SerializeSession(loaded)
+	require.NoError(t, err)
+	assert.Contains(t, string(roundTripped), "agentModeState")
 }
 
 // TestSerializeSession_NilSession asserts a nil session marshals as a fresh

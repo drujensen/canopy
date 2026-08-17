@@ -78,7 +78,7 @@ func TestAgentService_BuildInstructions_NoSkillsNoInstructions_StillEmpty(t *tes
 func TestAgentService_BuildTools_SkillTool_PresentWhenSkillsLoaded(t *testing.T) {
 	svc := &AgentService{defs: Definitions{Skills: testSkills()}}
 
-	got, err := svc.buildTools(agentsource.AgentDefinition{Name: "a"}, "execute")
+	got, err := svc.buildTools(agentsource.AgentDefinition{Name: "a"})
 	require.NoError(t, err)
 	assert.True(t, containsToolName(got, "Skill"), "the Skill tool must be present when skills are loaded")
 }
@@ -89,7 +89,7 @@ func TestAgentService_BuildTools_SkillTool_PresentWhenSkillsLoaded(t *testing.T)
 func TestAgentService_BuildTools_SkillTool_AbsentWhenNoSkills(t *testing.T) {
 	svc := &AgentService{}
 
-	got, err := svc.buildTools(agentsource.AgentDefinition{Name: "a"}, "execute")
+	got, err := svc.buildTools(agentsource.AgentDefinition{Name: "a"})
 	require.NoError(t, err)
 	assert.False(t, containsToolName(got, "Skill"), "no Skill tool should be offered when no skills are loaded")
 }

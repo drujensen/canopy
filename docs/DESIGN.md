@@ -33,7 +33,8 @@ that use them. Canopy imports none of them, and imports none of `workflow`, `wor
 agentworkflow`, or `workflow/checkpoint` either (no graph engine — REQUIREMENTS.md §5).
 
 Packages Canopy imports from MAF-Go: `agent`, `tool`, `message`, `agent/compaction`,
-`agent/harness/{loop,toolautocall,toolapproval,todo,agentmode}`,
+`agent/harness/{loop,toolautocall,toolapproval,todo}` (post-v0.1.0: `agentmode` was imported here
+too, before §3.8's addendum superseded it),
 `provider/{openaiprovider,anthropicprovider,geminiprovider}`,
 `tool/{mcptool,shelltool,functool,agenttool}`, `provider/otelprovider` (Plan Phase 7, §3.10 —
 optional OTel tracing middleware; only reached when a caller explicitly enables tracing, see
@@ -55,8 +56,9 @@ internal/
   impl/
     providers/        # builds agent.ProviderConfig per configured provider (§4)
     tools/             # narrow core set: shell, file read/write/search, directory, web search/fetch
-    harness/           # wires agent/harness/{loop,toolautocall,toolapproval,todo,agentmode}
+    harness/           # wires agent/harness/{loop,toolautocall,toolapproval,todo}
                         # and agent/compaction into each *agent.Agent at construction time
+                        # (post-v0.1.0: agentmode was wired here too — see §3.8's addendum)
     agentsource/       # NEW — loads .claude/agents/*.md (§3.11)
     skillsource/       # NEW — loads .claude/skills/*/SKILL.md (§3.11)
     mcpsource/         # NEW — loads .mcp.json, constructs tool/mcptool clients (§3.11)
@@ -64,7 +66,7 @@ internal/
     repositories/
       json/            # ChatRepository only, in v1
     config/            # .env / flags; small flat-JSON provider/model config (§4, §6)
-  tui/                 # bubbletea: chat view + approval prompts, todo panel, mode indicator
+  tui/                 # bubbletea: chat view + approval prompts, todo panel
 ```
 
 No `ui/` (web) package in v1 — deferred per REQUIREMENTS.md §5, and no `mongo` package under
@@ -158,13 +160,28 @@ gets no tool offering nothing to look up. Not approval-gated, the same tier as `
 §3.11's own addendum below for the full three-level design as implemented, including level 3's
 path-confinement decision.
 
+Addendum (post-v0.1.0): `ToolsConfig.WebSearchBackend` — the `WebSearchBackend` interface this
+section always described — went from always `nil` (no default search backend ever wired in
+`cmd/canopy`) to conditionally wired from a `TAVILY_API_KEY` environment variable, the same
+zero-config env-var pattern `impl/config/detect.go` already uses for provider auto-detection. New
+file `internal/impl/tools/tavily_backend.go` (`NewTavilyBackend`), a second concrete
+`WebSearchBackend` alongside the existing self-hostable `NewSearXNGBackend` — `POST
+https://api.tavily.com/search` with a bearer `Authorization` header, parsing `results[].{title,
+url, content}` into `WebSearchResult{Title, URL, Snippet}` the same shape SearXNG's backend
+produces. Chosen because the 4-persona SDLC agents (see §3.11's addendum below) all genuinely rely
+on `WebSearch` working out of the box, and Tavily needs only an API key (no self-hosted instance to
+stand up first) to get there. An agent whose `tools:` frontmatter names `WebSearch` still
+hard-errors at every turn if `TAVILY_API_KEY` isn't set — a real, known first-run gap for a user
+who adopts the SDLC agents without setting the key, not new error-handling code.
+
 ### 3.3 The agentic loop
 
 `agent/harness/loop` and `toolautocall` provide the run loop and automatic tool-call
 execution/feedback (wired in by default via the per-provider constructors unless
 `DisableFuncAutoCall` is set). Canopy's `impl/harness` configures which middlewares attach to each
-`*agent.Agent` at construction time; it does not reimplement any control flow. §3.5–§3.8 cover the
-rest of `agent/harness`.
+`*agent.Agent` at construction time; it does not reimplement any control flow. §3.5–§3.7 cover the
+rest of `agent/harness` (§3.8 formerly did too, before it was superseded — see that section's
+addendum).
 
 ### 3.4 Dynamic subagent dispatch — Claude Code's Task tool, equivalent (FR9)
 
@@ -185,6 +202,22 @@ context" behavior as Claude Code's Task tool, for free.
 Agents available for dispatch are exactly the agent definitions `agentsource` loads (§3.11) —
 there's no separate "subagent registry"; any loaded agent can be either the top-level agent the
 user is talking to, or a tool another agent calls, depending on how it's invoked.
+
+**Bugfix addendum (post-v0.1.0).** `AgentService.buildTopLevelTools` (the function that assembles
+def's own tools plus one `agenttool.New`-wrapped subagent tool per *other* loaded agent) used to
+propagate a failure building any other agent as a hard error, aborting def's own construction
+entirely — so one agent definition referencing an unavailable tool (`WebSearch` with no
+`WebSearchBackend` configured, `Skill` with zero skills loaded) broke starting *every* agent,
+including ones with nothing wrong with them, since every agent's construction eagerly tries to
+wrap every other one. This surfaced in practice via the SDLC agents (§3.11's addendum): their
+generated `tools:` allowlist originally named `Skill`, which isn't available until at least one
+skill is loaded, so any zero-skills install couldn't start `general` (or anything else) at all.
+Fixed by making the wrap-every-other-agent loop non-fatal: a subagent that fails to build is
+logged (`AgentService`'s own `Logger`, if set) and skipped, not propagated — the same "one broken
+piece doesn't stop the rest" posture Requirements §7 already establishes for a failed MCP server
+connection. def's *own* tool list still fails loudly (a user directly selecting a misconfigured
+agent deserves an immediate, clear error) — only the eager background-wrapping step became
+resilient.
 
 ### 3.5 Context compaction (FR10)
 
@@ -226,6 +259,63 @@ future calls. State lives on `*agent.Session` (§3.9) under its own key.
 TUI renders a pending approval request as a prompt with "approve once" / "always allow this
 tool" — Claude Code's two-tier permission model.
 
+**Bugfix addenda (post-v0.1.0): two confirmed agent-framework-go bugs in this exact area, both
+fixed at Canopy's own boundary with the framework (`domain/services.AgentService` and
+`impl/harness.ChatHistoryProvider`) rather than patching the vendored framework itself.**
+Both follow the same shape: `toolautocall`'s own request/response reconciliation
+(`extractAndRemoveToolApprovalRequestsAndResponses`) requires every non-`InformationalOnly`
+`ToolApprovalRequestContent` anywhere in a turn's message history to have a matching
+`ToolApprovalResponseContent`, and errors loudly (`"ToolApprovalRequestContent found with
+ToolCall.CallID(s) '...' that have no matching ToolApprovalResponseContent"`) the instant it finds
+one that doesn't — by design, this validation is meant to catch a genuinely malformed request, not
+framework bookkeeping gaps of the framework's own making.
+
+1. **`withReconstructedApprovalFunctionCalls`** (`agent_service.go`) works around `toolautocall`
+   never re-adding a matching `*message.FunctionCallContent` alongside the
+   `*message.FunctionResultContent` it reconstructs for an approved/rejected call — confirmed by
+   dumping the raw HTTP request body a real approval-then-continue turn produces (a `"tool"` role
+   message with no preceding matching `"assistant"` tool-call message, malformed by both the
+   OpenAI and Gemini API's own contract). Fixed by synthesizing and prepending an
+   `InformationalOnly` assistant message carrying that `FunctionCallContent` before every `a.Run`
+   call whose new `msgs` answer a pending approval. Also repairs a related empty-`CallID` wrinkle
+   specific to pre-`gemini_transport.go`-fix persisted chats. See the function's own doc comment
+   for the full empirical trail (this is the most heavily-annotated function in the codebase for a
+   reason — the framework interaction here is genuinely subtle).
+2. **`harness.RemoveOrphanedApprovalRequests`** (`impl/harness/approval_repair.go`) fixes a second,
+   distinct bug, found from two real user reports of the same symptom: under a standing "always
+   approve" rule, the *first* auto-approved tool call in a turn persists a correctly matched
+   request+response pair, but every auto-approved call *after* that first one in the *same* turn
+   persists only the request — its response, though the call demonstrably executed (confirmed via a
+   real HTTP-call-count assertion in the regression test), never lands in `Chat.Messages` at all.
+   That orphaned request then breaks *every* subsequent turn on the chat, forever, the moment
+   `toolautocall`'s validation sees it again.
+   
+   The first fix attempt lived entirely in `domain/services.AgentService` (repairing before/after
+   each outer `RunMessages`/`RunMessagesStream` call) and turned out to be *insufficient*: a second
+   real report reproduced with the failing call's ID absent from the persisted chat file entirely —
+   proof the failure happened *inside* a still-running `a.Run` call, never returning control to
+   `AgentService` at all. Root cause: `toolapproval`'s internal auto-approval loop doesn't make one
+   combined invoke() round trip for a whole turn — it makes one *complete, independent* invoke()
+   round trip (its own `HistoryProvider.Invoking` reload and `Invoked` persist) *per newly-issued
+   tool call*. A long enough chain of auto-approved calls within a single turn means a *later*
+   internal round reloads history that a *slightly earlier* internal round (of the very same turn)
+   already left orphaned, and fails right there — a point `AgentService`'s own before/after repair
+   can never reach.
+   
+   Fixed by moving the repair into `impl/harness.ChatHistoryProvider.Invoked` itself (still exported
+   as `harness.RemoveOrphanedApprovalRequests` so `AgentService` can also call it) — the one place
+   that genuinely runs on *every* individual persist, including the ones nested inside
+   `toolapproval`'s internal loop, mid-turn. Repairing right before each persist stops an orphan
+   from ever surviving long enough for a later internal round of the *same* turn to trip over it.
+   `AgentService.RunMessages`/`RunMessagesStream` still additionally call the same function
+   before/after the outer turn — that's what self-heals a chat *already* left broken by an
+   older binary, a case the per-persist repair alone can't reach (it only ever sees what a *live*
+   run passes through it). Repairing by removal rather than fabricating a matching response is the
+   safer choice in both places: the request is stale bookkeeping noise by the time it's found (the
+   underlying call already ran to completion, which is how its request ever became visible in
+   history in the first place — there is no real approval decision left outstanding for a human or
+   a standing rule to make).
+
 ### 3.7 Todo / progress tracking (FR11)
 
 `agent/harness/todo` — a `ContextProvider` exposing five tools directly to the model (`todos_add`
@@ -240,10 +330,42 @@ func (p *Provider) GetRemainingItems(opts ...agent.Option) []Item
 `impl/harness` attaches `todo.New(nil)`; the TUI reads `GetAllItems`/`GetRemainingItems` to render
 a live panel. No aiagent todo tool is ported — this replaces it outright.
 
-### 3.8 Mode switching (FR12)
+### 3.8 Mode switching (FR12) — superseded (post-v0.1.0)
 
-`agent/harness/agentmode` — a `ContextProvider` tracking a named mode (defaults to plan/execute),
-state on `*agent.Session` (§3.9):
+**Superseded by the 4-persona SDLC agent workflow.** Everything below this line describes the
+original plan/execute mode design as it shipped through Plan Phase 8; it has been removed from the
+codebase (`agent/harness/agentmode` is no longer imported anywhere in Canopy) and replaced outright
+by four ordinary agent definitions — `research`, `design`, `plan`, `execute` — switched via the
+same `ctrl+a` agent picker every other agent already uses (§3.4/§5), not a separate mode
+keybinding. See §3.11's addendum below for the new agents themselves, and REQUIREMENTS.md's FR12
+row for the requirements-level version of this note. This section is kept, not deleted, per this
+document's own addendum convention — a reader following the original Phase 5 design should be able
+to see what changed and why, not just find the section gone.
+
+**Why replace it instead of extending it.** In practice, the user's actual planning workflow is a
+fixed four-stage pipeline — research/requirements, design/architecture, project planning, then
+execution — not a binary plan/execute toggle. Each stage needs a genuinely different persona,
+system prompt, and tool set (a requirements-gathering stage has no business running `Bash`; an
+execute stage needs everything). Canopy's agent-definition system (§3.11) already gives each agent
+its own system prompt and its own `tools:` allowlist — precisely the mechanism plan mode was
+reinventing at the mode level instead of the agent level. Once that was recognized, the mode system
+became redundant: withholding `Bash`/`FileWrite` via `isPlanModeRestricted` (a runtime toggle) and
+withholding them via an agent definition's `tools:` frontmatter (a static, per-persona allowlist)
+were doing the same job, and the agent-level version composes with everything else in §3.11 (the
+`ctrl+a` picker, per-agent subagent dispatch, per-agent `model:` overrides) for free.
+
+**Backward compatibility.** `agent.Session`'s state is a generic, unvalidated
+`map[string]*stateValue` (§3.9) — `agentmode` was the only code that ever read or wrote its
+`"agentModeState"` key. A chat persisted before this change, with that key still sitting in its
+`SessionState` blob, keeps loading and running fine: the key simply rides along as harmless,
+orphaned data on every future re-serialize, since nothing looks for it anymore. Proven by a
+regression test (`internal/impl/harness/session_test.go`) that round-trips a session carrying that
+orphaned key through `LoadSession`/`SerializeSession`.
+
+---
+
+Original design (superseded, kept for history): `agent/harness/agentmode` — a `ContextProvider`
+tracking a named mode (defaults to plan/execute), state on `*agent.Session` (§3.9):
 
 ```go
 type Mode struct { Name, Description string }
@@ -257,18 +379,41 @@ equivalent); the TUI also calls `SetMode` directly on a user keybinding. Plan mo
 with §3.6 (mutating tools stay approval-required or withheld while planning) — the exact
 mechanism is `impl/harness`'s to define, flagged for Plan Phase 5.
 
-### 3.9 History and sessions — one mechanism persists §3.6–§3.8's state
+### 3.9 History and sessions — one mechanism persists §3.6/§3.7's state
 
 `agent.HistoryProvider` backed by `ChatRepository` (JSON, v1) handles chat history (FR13).
 Separately, `agent.Session` is a key/value bag scoped to one conversation, explicitly built to be
 persisted — its doc comment: *"a Session can be serialized and deserialized directly with
-`encoding/json`, so that it can be saved in a persistent store."* `toolapproval`, `todo`, and
-`agentmode` all store their state via `session.Get`/`session.Set`, each under its own key in that
-one `Session` — none expose a separate store hook of their own. So the integration point is a
-single one: after each `Agent.Run`, `impl/harness` serializes the `*agent.Session`
-(`json.Marshal`) onto the Chat record's `SessionState []byte` field (§6); before the next run, it
-deserializes and passes it via `agent.WithSession(session)`. One write/read path covers approvals,
-todos, and mode together (FR14).
+`encoding/json`, so that it can be saved in a persistent store."* `toolapproval` and `todo` both
+store their state via `session.Get`/`session.Set`, each under its own key in that one `Session` —
+neither exposes a separate store hook of its own. So the integration point is a single one: after
+each `Agent.Run`, `impl/harness` serializes the `*agent.Session` (`json.Marshal`) onto the Chat
+record's `SessionState []byte` field (§6); before the next run, it deserializes and passes it via
+`agent.WithSession(session)`. One write/read path covers approvals and todos together (FR14).
+(Post-v0.1.0: this blob was also where `agentmode`'s mode state lived, under its own
+`"agentModeState"` key — see §3.8's addendum on why that's superseded and why an old chat's
+now-orphaned key is harmless.)
+
+**Bugfix addendum (post-v0.1.0), found in the same investigation as §3.6's two approval bugs but
+distinct from both:** a real user report — a chat resumed via `--continue` showed one typed message
+duplicated up to 8 times in the rendered transcript. Root cause is the same underlying framework
+behavior §3.6's `harness.RemoveOrphanedApprovalRequests` addendum documents: `toolapproval`'s
+internal auto-approval loop makes one complete, independent `invoke()` round trip — including its
+own `ChatHistoryProvider.Invoked` persist call — per newly-issued tool call within a *single* outer
+turn, and resends the exact same `*message.Message` objects (the turn's actual new messages, e.g.
+the user's own typed text) unchanged on every one of those internal rounds. `Invoked`'s existing
+`SourceTypeHistoryProvider` filter only recognizes content loaded by *that same round's own*
+`Invoking` call as "already history" — it has no way to know a message was already persisted by an
+*earlier* round of the *same* turn, so it re-appends and re-persists it every time.
+
+Fixed by giving `ChatHistoryProvider` per-instance state: a `persistedThisTurn
+map[*message.Message]bool`, keyed by pointer identity (not content — the user typing the same words
+twice in two genuinely separate turns must never be deduplicated against each other; pointer
+identity can only match when the framework hands back the literal same Go object). This is safe to
+scope to the instance itself specifically because one `ChatHistoryProvider` is constructed fresh per
+outer turn (`impl/harness.Build`, called once per `AgentService.RunMessages`/`RunMessagesStream`
+call) and reused for that turn's entire `a.Run` duration, including every internal `toolapproval`
+round — exactly the lifetime the dedup needs, no more and no less.
 
 ### 3.10 Structured output, observability
 
@@ -318,12 +463,73 @@ Code itself treats these files as source-controlled project config, not applicat
 
 Addendum (post-v0.1.0): `impl/agentsource.Load` also scans `~/.canopy/agents/**/*.md` as a third
 source, lower-precedence than both project and personal `.claude/agents`. `cmd/canopy`'s `run()`
-calls the new `agentsource.WriteDefault` to generate a single default "general" agent there the
-first time `Load` returns zero definitions from all three sources, so a brand-new install has
-something to select in the TUI's picker instead of a hard startup error — Canopy's closest match to
-Claude Code's own no-file-required first-run experience given Canopy's picker-based UX. The
-directory is Canopy-specific (`~/.canopy`, not `~/.claude`) so the generated fallback never leaks
-into the user's real Claude Code config.
+calls `agentsource.WriteDefaults` to generate Canopy's default agents there so a brand-new install
+has something to select in the TUI's picker instead of a hard startup error — Canopy's closest
+match to Claude Code's own no-file-required first-run experience given Canopy's picker-based UX.
+The directory is Canopy-specific (`~/.canopy`, not `~/.claude`) so the generated fallback never
+leaks into the user's real Claude Code config. Each file is independently idempotent (an
+already-existing file is left untouched, a missing one is filled in).
+
+The trigger (`canopyAgentsDirNeedsDefaults`) is `~/.canopy/agents` itself being missing or
+containing zero files — not the total agent count across all three sources. This is a deliberate
+choice over the simpler "`Load` returned zero definitions from anywhere" check this addendum
+originally described: gating on the *directory's* own state means a `~/.canopy/agents` emptied
+back down to zero files regenerates the full default set on the next run, while a directory that
+already has at least one file — Canopy's own defaults, hand-authored agents, anything — is never
+touched, regardless of whether the user also has agents configured elsewhere in project/personal
+`.claude/agents`.
+
+Addendum (post-v0.1.0): `agentsource.WriteDefaults` was extended from writing one file
+(`general.md`) to writing five, replacing §3.8's superseded plan/execute mode toggle with four
+SDLC-persona agents, each an ordinary `agentsource.AgentDefinition` — no new mechanism, just more
+`.md` files under the same `~/.canopy/agents/` tier, switchable via the same `ctrl+a` picker every
+agent already uses:
+
+| Agent      | Persona            | Reads                          | Produces               | Tools                                                              |
+|------------|---------------------|---------------------------------|-------------------------|---------------------------------------------------------------------|
+| `research` | Product Owner       | (user, web)                     | `docs/REQUIREMENTS.md` | `FileRead, FileWrite, FileSearch, DirectoryList, WebFetch, WebSearch` |
+| `design`   | Architect / UX      | `REQUIREMENTS.md`               | `docs/DESIGN.md`       | same as `research`                                                   |
+| `plan`     | Project Manager     | `REQUIREMENTS.md`, `DESIGN.md`  | `docs/PLAN.md`         | same as `research`                                                   |
+| `execute`  | Developer           | `PLAN.md` (+ the other two)     | working code, tests    | *(no `tools:` line — inherits everything, including `Bash`)*         |
+
+`research`/`design`/`plan` deliberately omit `Bash` — each is a documentation-producing stage, and
+Design/Requirements/Plan documents don't need shell access to write; `execute` is the one stage
+that does real implementation work, so it inherits the full tool set the way `general` always has.
+All four get `WebSearch` (per the explicit design goal that each stage does real research, not just
+writes from what it already knows) — see §4's Tavily addendum below for the concrete backend this
+now resolves to. Each stage's system prompt tells the user which agent to switch to next
+(`ctrl+a`) once its own document is judged complete; there's no automatic hand-off, matching every
+other agent-to-agent transition in Canopy today (always a user action, never implicit). `general`
+is unchanged and still the right choice for work that isn't part of this SDLC flow. Every loaded
+agent (these four included) is automatically also a subagent-dispatch tool for every other agent
+(§3.4) with no opt-out — `execute`'s own system prompt leans on this directly, telling it that it
+can dispatch itself or `general` for isolated sub-tasks.
+
+**Bugfix (same addendum):** `research`/`design`/`plan`'s `tools:` line originally also named
+`Skill`, matching `coreToolNames`' full eight-entry list. That was wrong: `Skill` (like
+`WebSearch`) is only constructed into `coreTools()`'s available map when at least one skill is
+actually loaded (`len(s.defs.Skills) > 0` — see §3.2's Skill-tool addendum), and `buildTools`'
+explicit-allowlist branch treats naming an unavailable tool as a hard error, by design (proven by
+`TestAgentService_BuildTools`'s "explicit WebSearch without a configured backend is an error"
+case). Because every agent eagerly builds every *other* agent as a subagent-dispatch tool at
+construction time (`buildTopLevelTools`'s wrap-every-other-agent loop, above), this didn't just
+break selecting `research`/`design`/`plan` directly — it broke starting *any* agent, including
+`general`, on any install with zero skills configured (the common case for a fresh install with no
+`.claude/skills` directory yet). Fixed by dropping `Skill` from all three `tools:` lines; none of
+the three personas' system prompts ever referenced the Skill tool in the first place, so nothing
+about their actual behavior changes.
+
+**Picker order.** `ListAgents` (used by both the top-level picker and the in-chat `ctrl+a` overlay
+— §5) and the top-level picker's own `NewModel` both sort agent names via a new
+`agentsource.SortNames`, not plain alphabetical `sort.Strings`, so the five default agents actually
+read as a pipeline instead of scattering alphabetically (`design, execute, general, plan,
+research`): `general` first, then `research -> design -> plan -> execute` in that fixed order.
+This is deliberately name-keyed (a small `map[string]int` of the five known names, checked at sort
+time), not a config field or a required naming scheme — a project's own custom agents, or one of
+these five renamed by a user, simply aren't in that map and fall back to plain alphabetical order
+after the known ones, exactly like `sort.Strings` would already do for names `SortNames` has never
+heard of. Renaming a default agent is an ordinary, fully supported edit: nothing panics, nothing
+needs updating elsewhere, the renamed agent just stops sorting to a fixed pipeline position.
 
 Addendum (post-v0.1.0): `impl/skillsource`'s progressive disclosure, described above in the
 original text of this section but never actually wired into `domain/services` until now, is
@@ -360,6 +566,27 @@ implemented as follows.
   entry (`showSkill`) via the new read-only `AgentService.ListSkills()`/`GetSkillBody()`. Zero
   skills loaded produces a brief "No skills configured." transcript entry rather than a silent,
   unexplained no-op.
+
+Addendum (post-v0.1.0): `skillsource.Load` gained a third, lowest-precedence source —
+`~/.canopy/skills/*/SKILL.md` — mirroring `agentsource.Load`'s own `~/.canopy/agents` addendum
+exactly, down to the same precedence rule (project beats personal beats Canopy-generated default)
+and the same `skillsource.WriteDefaults` idempotency contract (an already-existing skill's
+`SKILL.md` is left untouched; a missing one is written). `cmd/canopy`'s `run()` calls it under the
+identical `dirMissingOrEmpty` trigger the default-agents block uses (§3.11's earlier addendum,
+above the SDLC-agent table) — shared logic, not a parallel reimplementation — so deleting the
+skill later regenerates it the same way deleting a default agent file does.
+
+Canopy ships one default skill this way: `mcp-server-setup`, which helps a user find an MCP server
+from a public registry/directory (the official `modelcontextprotocol/servers` repo, Smithery,
+Glama, PulseMCP, or a targeted web search) and write the resulting entry into `.mcp.json` (§3.11's
+`impl/mcpsource` section above) — useful with zero project-specific setup, the same reasoning that
+motivates the default SDLC agents. Because level 1 (name+description) is always in every agent's
+system prompt regardless of that agent's own `tools:` allowlist (`skillsCatalog`, above), every
+agent — including `research`/`design`/`plan`, which don't list `Skill` in their allowlist — still
+*knows* this skill exists; only agents whose tool list actually includes `Skill` (`general` and
+`execute`, both via the "no `tools:` line, inherit everything" path) can invoke it to fetch the
+full body and act on it, which fits: adding a new tool integration is execution/tooling work, not
+something a requirements/design/planning stage needs to do itself.
 
 ## 4. Provider adapter design (FR2)
 
@@ -517,7 +744,6 @@ response rendering) port over consuming `agent.ResponseStream`. New/changed:
 
 - Approval-prompt component: one-off vs. always-allow (§3.6).
 - Live todo panel (§3.7).
-- Mode indicator/switcher in the status line (§3.8).
 - Agent picker sourced from `agentsource` (§3.11) instead of a database-backed agent list.
 - No web UI, no `ui/` package, no WebSocket streaming — deferred (Requirements §5). When it comes
   back, it's an additive frontend consuming the same `domain/services` the TUI does; nothing in
@@ -533,8 +759,9 @@ change, and `buildTopLevelAgent` already re-resolves both fresh on every turn, s
 message is driven by the switched agent/model with the full prior transcript intact. Both
 keybindings are no-ops while a tool-approval prompt is pending or a turn is actively streaming, the
 same guard `enter` (sending a message) already applies. The sidebar gained `Agent: ...` and
-`Model: ...` lines next to the existing `Mode: ...` line, each with its own `(ctrl+x to switch)`
-hint.
+`Model: ...` lines, each with its own `(ctrl+x to switch)` hint. (Post-v0.1.0: a third `Mode: ...`
+line with a `ctrl+p` hint lived here too, before §3.8's addendum superseded it — the sidebar now
+shows only Agent/Model plus the live todo panel.)
 
 Addendum (post-v0.1.0): `ctrl+n`, pressed from the chat screen, starts a genuinely new chat —
 `AgentService.StartChat` with a freshly minted chat ID (the same `<agent>-<UnixNano>` scheme the
@@ -544,12 +771,41 @@ there is only one ID-generation scheme) bound to the *current* chat's agent (`ch
 force the top-level picker screen). It reuses the existing `chatStartedMsg`/`Model.Update` path a
 fresh pick from the picker screen already produces — `Model.Update` discards the old `*chatModel`
 entirely and constructs a brand-new one via `newChatModel`, so transcript/streaming/pending-approval
-reset to zero values and todos/mode/model are seeded fresh from the new, empty chat, with no second,
+reset to zero values and todos/model are seeded fresh from the new, empty chat, with no second,
 hand-rolled "reset in place" code path to keep in sync with that one. Guarded the same way
 `ctrl+a`/`ctrl+o` are: a no-op while a turn is actively streaming or a tool approval is pending.
 
 Also addendum (post-v0.1.0): `ctrl+s` opens a read-only skills-browser overlay — see §3.11's own
 addendum for the full three-level skill design this exposes.
+
+**Bugfix addendum (post-v0.1.0).** `SetModel`'s `Chat.ModelOverride` is scoped to the one chat it
+was set on, by design — but restarting Canopy without `--continue` doesn't resume that chat, it
+starts a *brand-new* one (via `computeStartAgent`'s auto-resume-agent, not auto-resume-chat), so a
+new chat's `ModelOverride` starts empty and resolves through `resolveModelName`'s next fallback:
+the agent's own `model:` frontmatter (none of the default agents set one), then
+`AgentServiceConfig.DefaultModel`. Before this fix, `DefaultModel` was always
+`providersFile.Models[0].Name` — whichever model happened to sort first in `providers.json`, not
+necessarily one the user ever chose — so a model switched to via `ctrl+o`, used for a while, then
+abandoned by restarting, silently reverted on the very next session. Fixed the same way
+`last_agent.json` already solves the equivalent problem for agents: `AgentService.SetModel` now
+calls a new `AgentServiceConfig.RecordLastModel` callback (mirroring `RecordLastAgent` exactly,
+including its best-effort "logged, never propagated" failure contract) on every successful switch;
+`cmd/canopy`'s `run()` persists it to a new sibling file, `last_model.json`, and reads it back via
+a new `computeDefaultModel(models, lastUsed)` helper (mirroring `computeStartAgent`'s exact
+shape) to compute `DefaultModel`: the last-used model if it's still configured, otherwise
+`models[0].Name` as before.
+
+**Follow-up bugfix (post-v0.1.0), same area.** The fix above only helps across a process
+*restart* — `AgentServiceConfig.DefaultModel` is read once at construction and never changes for
+the life of the running `AgentService`, so `ctrl+n` (start a genuinely new chat, same session)
+still fell back to whatever `DefaultModel` was at *startup*, ignoring a `ctrl+o` switch made
+earlier in that same session. `chatModel.startNewChatCmd` already carries the current chat's
+`agentName` over onto the new chat; it now also carries over the current chat's active `model` the
+same way, via an explicit `SetModel` call right after `StartChat` (which, as a side effect, also
+records it as the new last-used model — so a following restart picks up the same value too, not
+just same-session `ctrl+n`). Genuinely new agent-facing behavior, not just an implementation
+detail: `ctrl+n`'s new chat now always starts on the model the user was actually last using, the
+same guarantee it already gave for agent.
 
 Addendum (post-v0.1.0, in-turn UX): three related gaps closed together, all scoped to a single
 turn's lifecycle.
@@ -614,10 +870,10 @@ its full prior transcript, not just started fresh.
   (already existed, previously unused by AgentService's exported surface) into `[]ChatSummary`
   (ID/Title/AgentName/UpdatedAt), sorted most-recently-updated first — the one place recency
   ordering is computed, shared by ctrl+h and `--continue`. `AgentService.GetChat` exposes the full
-  `*entities.Chat` (Messages included) — unlike every other accessor (GetTodos/GetMode/GetModel),
+  `*entities.Chat` (Messages included) — unlike every other accessor (GetTodos/GetModel),
   which deliberately expose one derived value each, resuming needs the raw history too.
 - **Resuming.** `tui.resumeChatCmd` (stream.go) loads a chat's full state (`GetChat`/`GetTodos`/
-  `GetMode`/`GetModel`) and returns the same `chatStartedMsg` a fresh picker selection already
+  `GetModel`) and returns the same `chatStartedMsg` a fresh picker selection already
   produces, with a new `messages []*message.Message` field populated. `Model.Update`'s existing
   `chatStartedMsg` case reconstructs `transcript` from it (`reconstructTranscript`, chat.go) —
   only user/assistant messages with non-empty rendered text, deliberately not reconstructing
@@ -691,17 +947,50 @@ cause was in `Model.Update` itself, so it affected every filterable list equally
 of them the same way.
 
 Addendum (post-v0.1.0, provider retry/backoff): `impl/providers.maxProviderRetries`
-(`openaicompat.go`) makes retry-on-429 an explicit, uniform choice across all three provider
+(`openaicompat.go`) makes retry-on-429 an explicit, uniform choice across all four provider
 families rather than silently inheriting whatever each vendored SDK defaults to. Confirmed directly
 against each SDK's own source: `openai-go`/`anthropic-sdk-go` both default to only 2 retries
 (`internal/requestconfig/requestconfig.go`'s `MaxRetries: 2`, retrying 408/409/429/5xx with
 exponential backoff+jitter, honoring a `Retry-After` header when the server sends one) —
 `openaiRetryOption()`/`anthropicoption.WithMaxRetries(maxProviderRetries)` bump both to 5 (applied
 at every construction site: `newOpenAINative`, `newAnthropic`, `newOpenAICompatible`, `newOllama`).
-`google.golang.org/genai` (Gemini) already defaults to 5 attempts including 429 in its retryable
-status codes (`common.go`'s `defaultRetryAttempts`/`defaultRetryHTTPStatusCodes`) and is left on its
-own default rather than duplicated — 5 elsewhere just matches it, so a 429 gets the same retry
-budget regardless of provider family.
+
+**Bugfix (post-v0.1.0), same addendum:** this originally claimed `google.golang.org/genai`
+(Gemini) "already defaults to 5 retry attempts" and left it unconfigured on that basis. That was
+wrong — a misreading of the SDK source that went unnoticed until a real Gemini 429 ("quota
+exceeded") propagated as an immediate hard error with zero retries. genai's `retryHTTPRequest`
+(`common.go`) opens with `if opts == nil { return do(req) }`: a nil `*HTTPRetryOptions` means
+exactly one attempt, and `ClientConfig.HTTPOptions.RetryOptions` is nil unless a caller sets it —
+retries are opt-in, matching the Python/JS SDKs' documented behavior, not on by default.
+`defaultRetryAttempts = 5`/`defaultRetryHTTPStatusCodes` (which does include 429) are only the
+*values* substituted for an unset field once `HTTPRetryOptions` is non-nil, not a default-on
+retry policy. Fixed in `factory.go`'s `newGemini`: it now sets `HTTPOptions.RetryOptions` explicitly
+(`Attempts: maxProviderRetries`, everything else left at genai's own defaults), so all four
+provider families get the same retry budget for the same class of error, instead of Gemini
+silently getting zero retries while believing it already matched the others.
+
+**Caveat also worth documenting**, since it's easy to conflate the two: a "quota exceeded" 429 (a
+hard daily/monthly cap genuinely exhausted) is not the same failure as a transient rate-limit 429
+(too many requests this minute). Retrying helps the second case; for the first, every retry fails
+identically until the quota window itself resets, so the user still sees a 429 in the end — just
+after the retry budget's cumulative backoff instead of immediately. This fix closes the "we never
+even tried" gap; it cannot manufacture quota that genuinely isn't there.
+
+Addendum (post-v0.1.0, bugfix: transcript word-wrap). `chat.go`'s `renderEntry` used to concatenate
+a transcript entry's label and raw text straight into the viewport with no width constraint at
+all — `refreshViewport` fed the result directly to `bubbles/viewport.SetContent`, which does not
+wrap content on its own. Any line longer than the terminal's width (a long assistant reply, a
+pasted user message, a skill's full body shown via `ctrl+s`) ran off-screen unreadably instead of
+wrapping. `chat.go` already had a *different* line-width fix for `statusErr`
+(`renderStatusErrLine`, clamping the one-line status row to fit rather than letting it overflow) —
+this addendum closes the equivalent gap for the transcript body itself, which that earlier fix
+never covered. `renderEntry`'s body text is now wrapped through
+`lipgloss.NewStyle().Width(width).Render(text)`, the same wrap-not-clip idiom, but applied at the
+paragraph level instead of a single clamped line, so multi-line replies keep their real line
+breaks while any individual too-long line still wraps at word boundaries. `refreshViewport` passes
+`c.viewport.Width` (the exact content-column width `resize` already computes, reserving
+`sidebarWidth`) as that width, so wrapped text always fits the actual rendered column regardless of
+terminal size.
 
 ## 6. Data model
 
@@ -745,8 +1034,9 @@ dispatched subagent has no `Chat` of its own to read one from in the first place
 - Compaction tests: configured `Trigger`s fire at the right threshold; a `PipelineStrategy` run
   doesn't drop messages needed for task continuity.
 - Session-state round-trip test: `Chat.SessionState` serialize/deserialize, asserting a standing
-  approval `Rule`, in-progress todo items, and current mode all survive a simulated restart
-  together.
+  approval `Rule` and in-progress todo items survive a simulated restart together. (Post-v0.1.0:
+  also asserts an old chat's orphaned `agentModeState` key from before §3.8's addendum round-trips
+  harmlessly, not just that current state survives.)
 - **File-format loader tests (new emphasis in this revision)** — `agentsource`, `mcpsource`,
   `skillsource`, `projectcontext` are Canopy's own code, the most likely place for
   compatibility bugs against Claude Code's format: fixture-based tests using real example

@@ -3,8 +3,7 @@
 // that hands off into a chat view driving turns through
 // domain/services.AgentService's streaming entry points
 // (RunTextStream/RunMessagesStream), rendering incremental response
-// content, tool-approval prompts, a live todo panel, and a mode
-// indicator/switcher.
+// content, tool-approval prompts, and a live todo panel.
 package tui
 
 import (
@@ -38,16 +37,9 @@ type streamErrMsg struct {
 	err error
 }
 
-// modeChangedMsg reports a user-initiated mode switch (AgentService.SetMode)
-// completed.
-type modeChangedMsg struct {
-	mode string
-}
-
 // modelChangedMsg reports a user-initiated model switch (AgentService.
 // SetModel, the ctrl+o model-picker overlay — post-v0.1.0 addendum, Design
-// §4/FR1) completed, mirroring modeChangedMsg's shape/role for the mode
-// switch.
+// §4/FR1) completed.
 type modelChangedMsg struct {
 	model string
 }
@@ -64,7 +56,7 @@ type agentChangedMsg struct {
 
 // chatStartedMsg reports the outcome of picking an agent in the picker
 // screen, or (post-v0.1.0 addendum) resuming a chat via ctrl+h/--continue:
-// either a chat ready to display (id, agent name, its current Todos/Mode/
+// either a chat ready to display (id, agent name, its current Todos/
 // Model snapshot, and — resume only — messages, its full prior history) or
 // an error, which the top-level Model surfaces instead of transitioning to
 // the chat screen.
@@ -72,7 +64,6 @@ type chatStartedMsg struct {
 	chatID    string
 	agentName string
 	todos     []todo.Item
-	mode      string
 	model     string
 	err       error
 
@@ -94,7 +85,7 @@ type chatStartedMsg struct {
 // all three resume identically rather than three hand-rolled copies.
 //
 // Deliberate scope cut: unlike StartChat/SetAgent, resuming a chat does not
-// call AgentService.RecordLastAgent — GetChat/GetTodos/GetMode/GetModel are
+// call AgentService.RecordLastAgent — GetChat/GetTodos/GetModel are
 // pure reads with no natural "this agent is now active" hook the way
 // StartChat/SetAgent already have one. A restart's zero-flag auto-resume
 // (Design §5's earlier addendum) therefore still reflects the last agent a
@@ -111,10 +102,6 @@ func resumeChatCmd(svc *services.AgentService, ctx context.Context, chatID strin
 		if err != nil {
 			return chatStartedMsg{err: fmt.Errorf("loading todos: %w", err)}
 		}
-		mode, err := svc.GetMode(ctx, chatID)
-		if err != nil {
-			return chatStartedMsg{err: fmt.Errorf("loading mode: %w", err)}
-		}
 		model, err := svc.GetModel(ctx, chatID)
 		if err != nil {
 			return chatStartedMsg{err: fmt.Errorf("loading model: %w", err)}
@@ -123,7 +110,6 @@ func resumeChatCmd(svc *services.AgentService, ctx context.Context, chatID strin
 			chatID:    chatID,
 			agentName: chat.AgentName,
 			todos:     todos,
-			mode:      mode,
 			model:     model,
 			messages:  chat.Messages,
 		}

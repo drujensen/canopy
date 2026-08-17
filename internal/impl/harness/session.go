@@ -10,8 +10,8 @@ import (
 )
 
 // LoadSession deserializes chat.SessionState into a *agent.Session (Design
-// §3.9): standing tool-approval rules, todo items, and the current
-// plan/execute mode all ride in this one blob. An empty/nil SessionState
+// §3.9): standing tool-approval rules and todo items all ride in this one
+// blob. An empty/nil SessionState
 // (a brand-new chat) yields a fresh &agent.Session{} — its zero value is
 // documented by agent.Session as ready to use, so a first turn on a new chat
 // needs no special-casing.

@@ -58,8 +58,7 @@ type transcriptEntry struct {
 // chatModel is the chat screen (Design §5): a scrolling transcript fed by
 // AgentService's streaming entry points, a composer, a tool-approval prompt
 // that preempts the composer while a request is pending (Design §3.6), and
-// a sidebar showing the live todo panel (Design §3.7) and the current
-// plan/execute mode with a switch keybinding (Design §3.8).
+// a sidebar showing the live todo panel (Design §3.7).
 type chatModel struct {
 	chatID    string
 	agentName string
@@ -108,11 +107,10 @@ type chatModel struct {
 	viewport viewport.Model
 
 	todos []todo.Item
-	mode  string
 
 	// model is the currently active model name (post-v0.1.0 addendum,
-	// Design §4/FR1 — AgentService.GetModel), shown in the sidebar next to
-	// Mode. Seeded at construction and refreshed after every completed turn
+	// Design §4/FR1 — AgentService.GetModel), shown in the sidebar.
+	// Seeded at construction and refreshed after every completed turn
 	// (RunResult.Model, via handleStreamMsg's streamDoneMsg case) and
 	// immediately after a ctrl+o switch (modelChangedMsg, see model.go).
 	model string
@@ -139,9 +137,9 @@ type chatModel struct {
 }
 
 // newChatModel constructs a chatModel for a just-started or resumed chat,
-// seeded with its current Todos/Mode/Model snapshot (Design §3.7/§3.8,
+// seeded with its current Todos/Model snapshot (Design §3.7,
 // post-v0.1.0 Model addendum).
-func newChatModel(chatID, agentName string, todos []todo.Item, mode, model string, width, height int) *chatModel {
+func newChatModel(chatID, agentName string, todos []todo.Item, model string, width, height int) *chatModel {
 	composer := textinput.New()
 	composer.Placeholder = "Type a message and press enter..."
 	composer.Focus()
@@ -154,7 +152,6 @@ func newChatModel(chatID, agentName string, todos []todo.Item, mode, model strin
 		chatID:    chatID,
 		agentName: agentName,
 		todos:     todos,
-		mode:      mode,
 		model:     model,
 		spinner:   sp,
 		composer:  composer,
@@ -167,7 +164,7 @@ func newChatModel(chatID, agentName string, todos []todo.Item, mode, model strin
 const sidebarWidth = 28
 
 // resize adjusts the viewport/composer to fit width x height, reserving
-// sidebarWidth columns for the todo/mode sidebar and a couple of rows for
+// sidebarWidth columns for the todo sidebar and a couple of rows for
 // the composer/approval-prompt line.
 func (c *chatModel) resize(width, height int) {
 	c.width, c.height = width, height
@@ -187,7 +184,7 @@ func (c *chatModel) resize(width, height int) {
 
 // handleKey processes a key press for the chat screen: approval decisions
 // while pendingApproval is set, overlay-picker navigation while picker is
-// set, mode/agent/model-switch or message-submit otherwise, and composer
+// set, agent/model-switch or message-submit otherwise, and composer
 // text editing as the fallback.
 func (c *chatModel) handleKey(msg tea.KeyMsg, svc *services.AgentService, ctx context.Context) tea.Cmd {
 	if c.pendingApproval != nil {
@@ -209,8 +206,6 @@ func (c *chatModel) handleKey(msg tea.KeyMsg, svc *services.AgentService, ctx co
 		// active — esc has no other meaning on this screen.
 		c.cancelTurn()
 		return nil
-	case "ctrl+p":
-		return c.toggleModeCmd(svc, ctx)
 	case "ctrl+a":
 		// Same guard streaming-sensitive actions elsewhere in this file
 		// apply (see "enter" below): don't open the agent-switch overlay
@@ -282,7 +277,7 @@ func (c *chatModel) handleKey(msg tea.KeyMsg, svc *services.AgentService, ctx co
 // AgentService.ListAgents()/ListModelSummaries(). Both are pure, in-memory
 // reads (no I/O, unlike everything else this file calls through svc), so
 // this runs synchronously inside handleKey rather than round-tripping
-// through a tea.Cmd/tea.Msg the way starting a turn or toggling mode do.
+// through a tea.Cmd/tea.Msg the way starting a turn does.
 //
 // The model picker (post-v0.1.0 addendum) uses ListModelSummaries rather
 // than ListModels/newPickerList's plain-name pickerItem, so each entry can
@@ -448,27 +443,9 @@ func (c *chatModel) respondApproval(svc *services.AgentService, ctx context.Cont
 	return tea.Batch(c.startTurnCmd(svc, ctx, []*message.Message{approvalMsg}), c.spinner.Tick)
 }
 
-// toggleModeCmd flips between "plan" and "execute" (Design §3.8's user
-// keybinding path — a mode switch initiated by the user, not the model)
-// via AgentService.SetMode.
-func (c *chatModel) toggleModeCmd(svc *services.AgentService, ctx context.Context) tea.Cmd {
-	next := "plan"
-	if c.mode == "plan" {
-		next = "execute"
-	}
-	chatID := c.chatID
-	return func() tea.Msg {
-		if err := svc.SetMode(ctx, chatID, next); err != nil {
-			return streamErrMsg{err: fmt.Errorf("switching mode: %w", err)}
-		}
-		return modeChangedMsg{mode: next}
-	}
-}
-
 // setModelCmd calls AgentService.SetModel for chosen (a ModelConfig.Name
 // from the ctrl+o picker's list, post-v0.1.0 addendum) and returns a
-// modelChangedMsg Model.Update applies to refresh the sidebar — mirroring
-// toggleModeCmd's modeChangedMsg pattern.
+// modelChangedMsg Model.Update applies to refresh the sidebar.
 func (c *chatModel) setModelCmd(svc *services.AgentService, ctx context.Context, chosen string) tea.Cmd {
 	chatID := c.chatID
 	return func() tea.Msg {
@@ -510,30 +487,40 @@ func (c *chatModel) setAgentCmd(svc *services.AgentService, ctx context.Context,
 // already does exactly the reset ctrl+n needs — it discards the old
 // *chatModel entirely and constructs a brand-new one via newChatModel,
 // which zero-values transcript/streaming/pendingApproval and seeds
-// todos/mode/model fresh from the new (empty) chat's own state. Reusing
+// todos/model fresh from the new (empty) chat's own state. Reusing
 // that message means ctrl+n's "reset" is not a second, hand-rolled reset
 // code path that could drift from what starting a chat from the picker
 // screen already guarantees.
 func (c *chatModel) startNewChatCmd(svc *services.AgentService, ctx context.Context) tea.Cmd {
 	agentName := c.agentName
+	previousModel := c.model
 	return func() tea.Msg {
 		chatID := newChatID(agentName)
 		if _, err := svc.StartChat(ctx, chatID, agentName); err != nil {
 			return chatStartedMsg{err: fmt.Errorf("starting new chat: %w", err)}
 		}
+		// Carry over the old chat's active model the same way agentName is
+		// already carried over (post-v0.1.0 bugfix): without this, a fresh
+		// chat's ModelOverride starts empty and resolveModelName falls back
+		// to AgentServiceConfig.DefaultModel — the model last used as of
+		// process *startup*, not whatever the user had actually switched to
+		// via ctrl+o during this running session. SetModel here makes ctrl+n
+		// behave consistently with ctrl+n's own agent carry-over, and also
+		// records this as the new last-used model (AgentService.SetModel's
+		// existing RecordLastModel side effect), so a following restart
+		// picks up the same value too.
+		if err := svc.SetModel(ctx, chatID, previousModel); err != nil {
+			return chatStartedMsg{err: fmt.Errorf("carrying over model: %w", err)}
+		}
 		todos, err := svc.GetTodos(ctx, chatID)
 		if err != nil {
 			return chatStartedMsg{err: fmt.Errorf("loading todos: %w", err)}
-		}
-		mode, err := svc.GetMode(ctx, chatID)
-		if err != nil {
-			return chatStartedMsg{err: fmt.Errorf("loading mode: %w", err)}
 		}
 		model, err := svc.GetModel(ctx, chatID)
 		if err != nil {
 			return chatStartedMsg{err: fmt.Errorf("loading model: %w", err)}
 		}
-		return chatStartedMsg{chatID: chatID, agentName: agentName, todos: todos, mode: mode, model: model}
+		return chatStartedMsg{chatID: chatID, agentName: agentName, todos: todos, model: model}
 	}
 }
 
@@ -546,8 +533,8 @@ func (c *chatModel) startNewChatCmd(svc *services.AgentService, ctx context.Cont
 // starting a new turn is the one place both halves of that are guaranteed
 // to happen, since every new turn is either about to send a fresh message
 // or about to receive a fresh response. This is the only place statusErr is
-// ever cleared; a config action that can itself streamErrMsg (toggleModeCmd/
-// setModelCmd/setAgentCmd) does not start a turn and so does not clear a
+// ever cleared; a config action that can itself streamErrMsg (setModelCmd/
+// setAgentCmd) does not start a turn and so does not clear a
 // pending turn error.
 //
 // ctx is not passed to startTurn directly: a fresh context.WithCancel
@@ -603,7 +590,7 @@ func (c *chatModel) cancelTurn() {
 // handleStreamMsg applies one streaming event (see stream.go) to the chat's
 // state: accumulating text/detecting an approval request for
 // streamChunkMsg, folding the finished reply into the transcript and
-// updating Todos/Mode for streamDoneMsg, or surfacing an error for
+// updating Todos for streamDoneMsg, or surfacing an error for
 // streamErrMsg. It returns the next Cmd to run — re-arming
 // waitForStreamEvent for a non-terminal chunk, or nil once the turn is over.
 func (c *chatModel) handleStreamMsg(msg tea.Msg) tea.Cmd {
@@ -616,7 +603,6 @@ func (c *chatModel) handleStreamMsg(msg tea.Msg) tea.Cmd {
 		c.finishStreaming()
 		if msg.result != nil {
 			c.todos = msg.result.Todos
-			c.mode = msg.result.Mode
 			c.model = msg.result.Model
 		}
 		c.refreshViewport()
@@ -703,15 +689,21 @@ func toolCallName(tc message.ToolCallContent) string {
 
 // refreshViewport re-renders the transcript (plus any in-flight streaming
 // text) into the viewport and scrolls to the bottom, so new content is
-// always visible as it streams in.
+// always visible as it streams in. Each entry is word-wrapped to the
+// viewport's own width (renderEntry) rather than left to run off-screen —
+// without this, any line longer than the terminal's width (a long
+// assistant reply, a pasted user message, a skill body shown via ctrl+s)
+// either gets silently clipped by the terminal or scrolls off unreadably,
+// exactly the bug this addendum fixes.
 func (c *chatModel) refreshViewport() {
+	width := c.viewport.Width
 	var b strings.Builder
 	for _, e := range c.transcript {
-		b.WriteString(renderEntry(e))
+		b.WriteString(renderEntry(e, width))
 		b.WriteString("\n\n")
 	}
 	if c.streaming.Len() > 0 {
-		b.WriteString(renderEntry(transcriptEntry{role: message.RoleAssistant, text: c.streaming.String()}))
+		b.WriteString(renderEntry(transcriptEntry{role: message.RoleAssistant, text: c.streaming.String()}, width))
 	}
 	if b.Len() == 0 {
 		// A brand-new (or freshly ctrl+n'd) chat has nothing in transcript
@@ -769,18 +761,29 @@ func reconstructTranscript(messages []*message.Message) []transcriptEntry {
 	return entries
 }
 
-func renderEntry(e transcriptEntry) string {
+// renderEntry renders one transcript entry, word-wrapping its body text to
+// width (the viewport's content width) via lipgloss's Width-based Render —
+// the same wrap-not-clip idiom renderStatusErrLine already established for
+// the status line. width <= 0 (not expected in practice, since resize
+// always sets c.viewport.Width before the first refreshViewport call, but
+// defensive against a zero-value chatModel in a test) skips wrapping
+// entirely rather than passing a nonsensical width to lipgloss.
+func renderEntry(e transcriptEntry, width int) string {
+	text := e.text
+	if width > 0 {
+		text = lipgloss.NewStyle().Width(width).Render(text)
+	}
 	if e.system {
-		return systemLabelStyle.Render("system") + "\n" + e.text
+		return systemLabelStyle.Render("system") + "\n" + text
 	}
 	label := userLabelStyle.Render("you")
 	if e.role == message.RoleAssistant {
 		label = assistantLabelStyle.Render("assistant")
 	}
-	return label + "\n" + e.text
+	return label + "\n" + text
 }
 
-// View renders the chat screen: a sidebar (agent + mode + model + todos)
+// View renders the chat screen: a sidebar (agent + model + todos)
 // beside either an open overlay picker (ctrl+a/ctrl+o, post-v0.1.0 addendum)
 // or the transcript with either the composer or a pending approval prompt at
 // the bottom, plus a status line for the last stream error, if any.
@@ -813,14 +816,12 @@ func (c *chatModel) View(width, height int) string {
 	return lipgloss.JoinHorizontal(lipgloss.Top, sidebar, main)
 }
 
-// renderSidebar renders the agent/mode/model indicators (Design §3.8,
-// post-v0.1.0 §3.4/§4 addendum) and the live todo panel (Design §3.7).
+// renderSidebar renders the agent/model indicators (post-v0.1.0 §3.4/§4
+// addendum) and the live todo panel (Design §3.7).
 func (c *chatModel) renderSidebar() string {
 	var b strings.Builder
 	b.WriteString(modeStyle.Render("Agent: " + c.agentName))
 	b.WriteString("\n(ctrl+a to switch)\n")
-	b.WriteString(modeStyle.Render("Mode: " + c.mode))
-	b.WriteString("\n(ctrl+p to switch)\n")
 	b.WriteString(modeStyle.Render("Model: " + c.model))
 	b.WriteString("\n(ctrl+o to switch)\n")
 	b.WriteString("(ctrl+s to view skills)\n")
@@ -870,7 +871,7 @@ func (c *chatModel) renderApprovalPrompt() string {
 // or clip on its own, so the raw string is handed straight to the terminal,
 // which wraps a too-wide line or renders embedded newlines as genuinely
 // separate rows — pushing the total rendered height past what the terminal
-// can show in one screen and scrolling the sidebar/mode-indicator/transcript
+// can show in one screen and scrolling the sidebar/transcript
 // above it out of view, exactly the secondary layout bug this task flagged.
 // Collapsing embedded newlines to spaces and truncating to one line's worth
 // of the main column's width keeps the error's footprint to the single row

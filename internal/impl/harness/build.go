@@ -5,7 +5,6 @@ import (
 	"slices"
 
 	"github.com/microsoft/agent-framework-go/agent"
-	"github.com/microsoft/agent-framework-go/agent/harness/agentmode"
 	"github.com/microsoft/agent-framework-go/agent/harness/todo"
 	"github.com/microsoft/agent-framework-go/agent/harness/toolapproval"
 
@@ -42,16 +41,14 @@ type BuildParams struct {
 	// WireLoopQuality.
 	Config agent.Config
 
-	// TodoProvider and ModeProvider are the shared agent/harness/todo and
-	// agent/harness/agentmode instances to wire into Config.ContextProviders
-	// (Design §3.7/§3.8). The caller (domain/services.AgentService) owns
-	// these instances so the exact same ones back both the agent's own
-	// todos_*/mode_* tools and any read-only, no-live-agent-needed session
-	// inspection the caller does itself (see AgentService.GetTodos/GetMode).
-	// Nil skips wiring that provider in — mainly useful for tests that don't
-	// need the full four-feature surface.
+	// TodoProvider is the shared agent/harness/todo instance to wire into
+	// Config.ContextProviders (Design §3.7). The caller
+	// (domain/services.AgentService) owns this instance so the exact same one
+	// backs both the agent's own todos_* tools and any read-only,
+	// no-live-agent-needed session inspection the caller does itself (see
+	// AgentService.GetTodos). Nil skips wiring it in — mainly useful for
+	// tests that don't need the full loop-quality surface.
 	TodoProvider *todo.Provider
-	ModeProvider *agentmode.Provider
 }
 
 // Build constructs a *agent.Agent wired with a ChatHistoryProvider bound to
@@ -76,12 +73,11 @@ func Build(ctx context.Context, params BuildParams) (*agent.Agent, error) {
 //
 //   - Compaction (Design §3.5/FR10): agent/compaction.NewContextProvider,
 //     appended to Config.ContextProviders.
-//   - Todo (Design §3.7/FR11) and mode (Design §3.8/FR12): params.TodoProvider
-//     and params.ModeProvider, appended to Config.ContextProviders in that
-//     order (after compaction, so compaction acts on the raw conversation
-//     before todo/mode inject their own per-turn instructional messages —
-//     otherwise those freshly-injected messages could be immediately
-//     compacted away on the same turn they were added).
+//   - Todo (Design §3.7/FR11): params.TodoProvider, appended to
+//     Config.ContextProviders after compaction, so compaction acts on the
+//     raw conversation before todo injects its own per-turn instructional
+//     messages — otherwise those freshly-injected messages could be
+//     immediately compacted away on the same turn they were added.
 //   - Approvals (Design §3.6/FR5): agent/harness/toolapproval.New, prepended
 //     to Config.Middlewares. It must land in Config.Middlewares (which wraps
 //     an agent's entire invoke lifecycle, including history/context
@@ -109,9 +105,6 @@ func WireLoopQuality(params BuildParams) agent.Config {
 	cfg.ContextProviders = append(slices.Clone(cfg.ContextProviders), NewCompactionProvider(params.Model.ContextWindowTokens))
 	if params.TodoProvider != nil {
 		cfg.ContextProviders = append(cfg.ContextProviders, params.TodoProvider)
-	}
-	if params.ModeProvider != nil {
-		cfg.ContextProviders = append(cfg.ContextProviders, params.ModeProvider)
 	}
 
 	cfg.Middlewares = append([]agent.Middleware{toolapproval.New(toolapproval.Config{})}, slices.Clone(cfg.Middlewares)...)

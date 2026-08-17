@@ -118,6 +118,74 @@ func TestChatHistoryProvider_Invoked_SkipsFailedRun(t *testing.T) {
 	assert.Empty(t, chat.Messages)
 }
 
+// TestChatHistoryProvider_Invoked_DedupesRepeatedCallsWithinOneTurn is a
+// direct unit test for a real reported bug: a chat resumed via --continue
+// showed one typed message duplicated up to 8 times. Root cause:
+// agent/harness/toolapproval's internal auto-approval loop makes one
+// complete, independent invoke() round trip — including its own Invoked
+// call — per newly-issued tool call, all within a *single* outer turn, and
+// resends the exact same *message.Message objects (the turn's original new
+// messages) on every one of those internal rounds. Simulates exactly that:
+// the *same* ChatHistoryProvider instance (one outer turn's worth of
+// lifetime — see that type's own doc comment) receiving multiple Invoked
+// calls that each include the *same* new user message pointer, mixed with
+// genuinely different response content each round (mirroring a real
+// auto-approval chain: request approval, execute, ask the model again).
+// Asserts the repeated message is persisted exactly once, while each
+// round's distinct new content still lands.
+func TestChatHistoryProvider_Invoked_DedupesRepeatedCallsWithinOneTurn(t *testing.T) {
+	repo, err := jsonrepo.NewChatRepository(t.TempDir())
+	require.NoError(t, err)
+	chatID := newTestChat(t, repo)
+	provider := harness.NewChatHistoryProvider(chatID, repo)
+	ctx := context.Background()
+
+	// The turn's one new message — the exact same *message.Message object
+	// toolapproval's internal loop would resend on every round.
+	newTurnMsg := message.NewText("try again")
+
+	round1Response := message.NewText("round 1 reply")
+	round1Response.Role = message.RoleAssistant
+	require.NoError(t, provider.Invoked(ctx, agent.InvokedContext{
+		RequestMessages:  []*message.Message{newTurnMsg},
+		ResponseMessages: []*message.Message{round1Response},
+	}))
+
+	// A second internal round of the *same* outer turn: the framework
+	// resends newTurnMsg again (same pointer), with a genuinely new
+	// response.
+	round2Response := message.NewText("round 2 reply")
+	round2Response.Role = message.RoleAssistant
+	require.NoError(t, provider.Invoked(ctx, agent.InvokedContext{
+		RequestMessages:  []*message.Message{newTurnMsg},
+		ResponseMessages: []*message.Message{round2Response},
+	}))
+
+	// A third round, same story.
+	round3Response := message.NewText("round 3 reply")
+	round3Response.Role = message.RoleAssistant
+	require.NoError(t, provider.Invoked(ctx, agent.InvokedContext{
+		RequestMessages:  []*message.Message{newTurnMsg},
+		ResponseMessages: []*message.Message{round3Response},
+	}))
+
+	chat, err := repo.Get(ctx, chatID)
+	require.NoError(t, err)
+
+	var tryAgainCount int
+	var texts []string
+	for _, m := range chat.Messages {
+		texts = append(texts, m.String())
+		if m.String() == "try again" {
+			tryAgainCount++
+		}
+	}
+	assert.Equal(t, 1, tryAgainCount, "the repeated new-turn message must be persisted exactly once, not once per internal round: got %v", texts)
+	assert.Contains(t, texts, "round 1 reply")
+	assert.Contains(t, texts, "round 2 reply")
+	assert.Contains(t, texts, "round 3 reply")
+}
+
 // TestChatHistoryProvider_Invoking_EmptyHistory asserts a brand-new chat
 // with no stored messages just passes the new turn's messages through
 // unchanged.

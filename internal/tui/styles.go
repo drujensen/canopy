@@ -3,7 +3,7 @@ package tui
 import "github.com/charmbracelet/lipgloss"
 
 // Styling is deliberately minimal (Design §5 doesn't ask for a themed UI,
-// just a functional chat/approval/todo/mode surface): a handful of named
+// just a functional chat/approval/todo surface): a handful of named
 // lipgloss styles used consistently across the picker and chat views.
 var (
 	sidebarStyle = lipgloss.NewStyle().

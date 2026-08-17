@@ -31,9 +31,9 @@ type Chat struct {
 	Messages []*message.Message `json:"messages"`
 
 	// SessionState holds a serialized *agent.Session blob (Design §3.9,
-	// Requirements FR14): standing approval rules, todo items, and the
-	// current plan/execute mode, all persisted together as one opaque
-	// byte slice. Phase 1 only carries the field and stores it as raw
+	// Requirements FR14): standing approval rules and todo items, all
+	// persisted together as one opaque byte slice. Phase 1 only carries the
+	// field and stores it as raw
 	// bytes; actual (de)serialization against *agent.Session is Phase 5's
 	// job.
 	SessionState []byte `json:"session_state,omitempty"`

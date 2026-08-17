@@ -6,6 +6,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"testing"
 
 	"github.com/microsoft/agent-framework-go/tool"
@@ -236,7 +237,7 @@ func TestAgentService_BuildTools(t *testing.T) {
 			}
 			def := agentsource.AgentDefinition{Name: "test-agent", Tools: tt.allowlist}
 
-			got, err := svc.buildTools(def, "")
+			got, err := svc.buildTools(def)
 			if tt.wantErr != "" {
 				require.Error(t, err)
 				assert.Contains(t, err.Error(), tt.wantErr)
@@ -250,14 +251,11 @@ func TestAgentService_BuildTools(t *testing.T) {
 
 // TestAgentService_BuildTools_MCPTools covers the MCP-tool assembly policy
 // this phase adds to buildTools (Design §3.11, Requirements FR6/FR18): MCP
-// tools follow the exact same allowlist/plan-mode rules buildTools already
-// applies to core tools — an empty allowlist inherits every MCP tool
-// alongside every core tool, a non-empty allowlist requires an MCP tool to
-// be named explicitly by its plain (server-documented) name, and plan mode
-// withholds every MCP tool outright regardless of the allowlist, the same
-// "omit, not just approval-force" treatment Bash/FileWrite get (see
-// isPlanModeRestricted's doc comment). containsToolName is defined in
-// phase5_test.go.
+// tools follow the exact same allowlist rules buildTools already applies to
+// core tools — an empty allowlist inherits every MCP tool alongside every
+// core tool, a non-empty allowlist requires an MCP tool to be named
+// explicitly by its plain (server-documented) name. containsToolName is
+// defined in phase5_test.go.
 func TestAgentService_BuildTools_MCPTools(t *testing.T) {
 	newSvc := func(t *testing.T) *AgentService {
 		t.Helper()
@@ -269,7 +267,7 @@ func TestAgentService_BuildTools_MCPTools(t *testing.T) {
 
 	t.Run("no explicit allowlist inherits the MCP tool alongside core tools", func(t *testing.T) {
 		svc := newSvc(t)
-		got, err := svc.buildTools(agentsource.AgentDefinition{Name: "assistant"}, "")
+		got, err := svc.buildTools(agentsource.AgentDefinition{Name: "assistant"})
 		require.NoError(t, err)
 		// 6 core tools (no WebSearchBackend configured, so WebSearch is
 		// omitted, matching TestAgentService_BuildTools' own count for that
@@ -280,7 +278,7 @@ func TestAgentService_BuildTools_MCPTools(t *testing.T) {
 
 	t.Run("explicit allowlist not naming the MCP tool omits it", func(t *testing.T) {
 		svc := newSvc(t)
-		got, err := svc.buildTools(agentsource.AgentDefinition{Name: "assistant", Tools: []string{"FileRead"}}, "")
+		got, err := svc.buildTools(agentsource.AgentDefinition{Name: "assistant", Tools: []string{"FileRead"}})
 		require.NoError(t, err)
 		assert.Len(t, got, 1)
 		assert.False(t, containsToolName(got, "search_docs"))
@@ -288,24 +286,10 @@ func TestAgentService_BuildTools_MCPTools(t *testing.T) {
 
 	t.Run("explicit allowlist naming the MCP tool includes it", func(t *testing.T) {
 		svc := newSvc(t)
-		got, err := svc.buildTools(agentsource.AgentDefinition{Name: "assistant", Tools: []string{"FileRead", "search_docs"}}, "")
+		got, err := svc.buildTools(agentsource.AgentDefinition{Name: "assistant", Tools: []string{"FileRead", "search_docs"}})
 		require.NoError(t, err)
 		assert.Len(t, got, 2)
 		assert.True(t, containsToolName(got, "search_docs"))
-	})
-
-	t.Run("plan mode withholds the MCP tool from the default (no-allowlist) list", func(t *testing.T) {
-		svc := newSvc(t)
-		got, err := svc.buildTools(agentsource.AgentDefinition{Name: "assistant"}, "plan")
-		require.NoError(t, err)
-		assert.False(t, containsToolName(got, "search_docs"), "plan mode must withhold MCP tools the same way it withholds Bash/FileWrite")
-	})
-
-	t.Run("plan mode withholds the MCP tool even when explicitly allowlisted", func(t *testing.T) {
-		svc := newSvc(t)
-		got, err := svc.buildTools(agentsource.AgentDefinition{Name: "assistant", Tools: []string{"search_docs"}}, "plan")
-		require.NoError(t, err)
-		assert.Empty(t, got)
 	})
 }
 
@@ -320,7 +304,7 @@ func TestAgentService_BuildTools_MCPToolCollidesWithCoreToolName(t *testing.T) {
 		MCPTools: map[string]tool.Tool{"Bash": fakeMCPTool{name: "Bash"}},
 	})
 
-	got, err := svc.buildTools(agentsource.AgentDefinition{Name: "assistant"}, "")
+	got, err := svc.buildTools(agentsource.AgentDefinition{Name: "assistant"})
 	require.NoError(t, err)
 	// 6 core tools (no WebSearchBackend) and no extra entry for the
 	// colliding "Bash" MCP tool — it must not be double-counted or replace
@@ -414,7 +398,7 @@ func TestAgentService_BuildTopLevelAgent_WrapsOtherAgentsAsSubagentTools(t *test
 
 	ctx := context.Background()
 
-	toolList, err := svc.buildTopLevelTools(ctx, agentsource.AgentDefinition{Name: "parent", Description: "parent agent"}, "")
+	toolList, err := svc.buildTopLevelTools(ctx, agentsource.AgentDefinition{Name: "parent", Description: "parent agent"})
 	require.NoError(t, err)
 
 	// 6 core tools (no WebSearchBackend configured here, so WebSearch is
@@ -429,6 +413,108 @@ func TestAgentService_BuildTopLevelAgent_WrapsOtherAgentsAsSubagentTools(t *test
 	assert.Contains(t, wrappedNames, "helper")
 	assert.Contains(t, wrappedNames, "other")
 	assert.NotContains(t, wrappedNames, "parent")
+}
+
+// TestAgentService_BuildTopLevelTools_SkipsMisconfiguredOtherAgent is a
+// regression test for a real bug: buildTopLevelTools' "wrap every other
+// agent as a subagent-dispatch tool" loop used to propagate a failure
+// building *any* other agent as an outright error, meaning one agent
+// referencing an unavailable tool (e.g. "Skill" with zero skills loaded, or
+// "WebSearch" with no WebSearchBackend configured) broke starting *every*
+// agent, including ones with nothing wrong with them. Now that failure is
+// logged and the misconfigured agent is skipped as a subagent-dispatch
+// option — "parent" must still build successfully, wrapping only the agent
+// that's actually fine.
+func TestAgentService_BuildTopLevelTools_SkipsMisconfiguredOtherAgent(t *testing.T) {
+	provider, model := testProviderModel(t, "ok")
+	svc := NewAgentService(AgentServiceConfig{
+		Definitions: Definitions{
+			Agents: map[string]agentsource.AgentDefinition{
+				"parent": {Name: "parent", Description: "parent agent"},
+				"fine":   {Name: "fine", Description: "a normally-configured agent"},
+				"broken": {Name: "broken", Description: "references a tool that isn't available", Tools: []string{"Skill"}},
+			},
+		},
+		Providers:    []entities.ProviderConfig{provider},
+		Models:       []entities.ModelConfig{model},
+		DefaultModel: model.Name,
+		Tools:        ToolsConfig{WorkingRoot: t.TempDir()}, // no skills loaded, so "Skill" is unavailable
+	})
+	ctx := context.Background()
+
+	toolList, err := svc.buildTopLevelTools(ctx, agentsource.AgentDefinition{Name: "parent", Description: "parent agent"})
+	require.NoError(t, err, "one misconfigured other agent must not break building parent's own tool list")
+
+	var wrappedNames []string
+	for _, tl := range toolList {
+		wrappedNames = append(wrappedNames, tl.Name())
+	}
+	assert.Contains(t, wrappedNames, "fine", "the working other agent must still be wrapped as a subagent-dispatch tool")
+	assert.NotContains(t, wrappedNames, "broken", "the misconfigured other agent must be skipped, not included half-built")
+}
+
+// TestAgentService_BuildTopLevelTools_OwnMisconfiguredToolsStillErrors
+// proves the fix above didn't over-correct: a user directly selecting an
+// agent whose *own* tools: allowlist references something unavailable must
+// still get a clear, immediate error — only the eager "wrap other agents"
+// loop became non-fatal, not def's own tool-list resolution.
+func TestAgentService_BuildTopLevelTools_OwnMisconfiguredToolsStillErrors(t *testing.T) {
+	svc := NewAgentService(AgentServiceConfig{
+		Definitions: Definitions{
+			Agents: map[string]agentsource.AgentDefinition{
+				"broken": {Name: "broken", Description: "references a tool that isn't available", Tools: []string{"Skill"}},
+			},
+		},
+		Tools: ToolsConfig{WorkingRoot: t.TempDir()},
+	})
+	ctx := context.Background()
+
+	_, err := svc.buildTopLevelTools(ctx, agentsource.AgentDefinition{Name: "broken", Description: "references a tool that isn't available", Tools: []string{"Skill"}})
+	require.Error(t, err, "an agent directly selected with its own unavailable tool must still fail loudly")
+	assert.Contains(t, err.Error(), "Skill")
+}
+
+// TestAgentService_DefaultSDLCAgents_BuildOnZeroSkillsConfigured is an
+// end-to-end regression test for the exact bug reported in practice:
+// building "general" (or any other default agent) used to fail with
+// `agent service: building subagent "research" for "general": agent
+// service: agent "research" references unknown or unavailable tool
+// "Skill"` on any install with zero skills configured, because
+// research/design/plan's generated tools: allowlist named "Skill" (only
+// available once at least one skill is loaded) and buildTopLevelTools used
+// to propagate a failure building any *other* agent as a hard error. Uses
+// agentsource.WriteDefaults' real generated content — not a hand-rolled
+// AgentDefinition — so this exercises exactly what a fresh, zero-config
+// install actually ships. A WebSearchBackend is configured (stubBackend),
+// matching the reporter's real environment (TAVILY_API_KEY set) — the
+// three SDLC agents also name WebSearch in their allowlist, and correctly
+// still fail loudly if selected directly with no backend configured (see
+// TestAgentService_BuildTopLevelTools_OwnMisconfiguredToolsStillErrors);
+// that's intentional, by-design behavior this test isn't meant to cover.
+func TestAgentService_DefaultSDLCAgents_BuildOnZeroSkillsConfigured(t *testing.T) {
+	homeDir := t.TempDir()
+	require.NoError(t, agentsource.WriteDefaults(filepath.Join(homeDir, ".canopy", "agents")))
+	agents, err := agentsource.Load(t.TempDir(), homeDir)
+	require.NoError(t, err)
+	require.Len(t, agents, 5, "general, research, design, plan, execute")
+
+	provider, model := testProviderModel(t, "ok")
+	svc := NewAgentService(AgentServiceConfig{
+		Definitions:  Definitions{Agents: agents},
+		Providers:    []entities.ProviderConfig{provider},
+		Models:       []entities.ModelConfig{model},
+		DefaultModel: model.Name,
+		Tools: ToolsConfig{
+			WorkingRoot:      t.TempDir(),
+			WebSearchBackend: stubBackend{}, // matches the reporter's real environment
+		}, // no Skills configured — the exact reported scenario
+	})
+	ctx := context.Background()
+
+	for name, def := range agents {
+		_, err := svc.buildTopLevelTools(ctx, def)
+		assert.NoError(t, err, "agent %q must build successfully with zero skills configured", name)
+	}
 }
 
 // TestAgentService_BuildInstructions asserts project instructions and an

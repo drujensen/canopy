@@ -38,7 +38,7 @@ func drainStream(t *testing.T, stream agent.ResponseStream) []*agent.ResponseUpd
 // core streaming contract (Requirements FR8): ranging over the
 // agent.ResponseStream RunMessagesStream returns yields the same content a
 // non-streaming RunText call would collect, and finalize (once the stream is
-// fully drained) reports the same Todos/Mode a RunResult from RunText/
+// fully drained) reports the same Todos a RunResult from RunText/
 // RunMessages would.
 func TestAgentService_RunMessagesStream_DeliversUpdatesIncrementally(t *testing.T) {
 	provider, model := testProviderModel(t, "hello from the stream")
@@ -80,7 +80,6 @@ func TestAgentService_RunMessagesStream_DeliversUpdatesIncrementally(t *testing.
 	require.NoError(t, err)
 	require.NotNil(t, result)
 	assert.Contains(t, result.Response.String(), "hello from the stream")
-	assert.Equal(t, "execute", result.Mode)
 	assert.Empty(t, result.Todos)
 }
 

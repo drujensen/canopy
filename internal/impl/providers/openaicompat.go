@@ -35,13 +35,23 @@ func openaiTimeoutOptions(cfg entities.ProviderConfig) []option.RequestOption {
 // directly in each SDK's internal/requestconfig/requestconfig.go —
 // `MaxRetries: 2`, with a retry predicate covering 408/409/429/5xx and a
 // backoff that honors a `Retry-After` response header when the server sends
-// one). google.golang.org/genai (Gemini) already defaults to 5 attempts
-// including 429 in its retryable status codes (common.go's
-// defaultRetryAttempts/defaultRetryHTTPStatusCodes) and is deliberately left
-// on its own default rather than duplicating that configuration here — 5
-// here just matches it, so a 429 gets the same retry budget regardless of
-// which provider family is in play, instead of OpenAI/Anthropic silently
-// giving up sooner than Gemini would for the identical error.
+// one).
+//
+// Bugfix (post-v0.1.0): google.golang.org/genai (Gemini) does NOT retry by
+// default, despite an earlier version of this comment claiming otherwise —
+// that was a misreading of the SDK source. genai's retryHTTPRequest
+// (common.go) starts with `if opts == nil { return do(req) }`: retries are
+// opt-in via an explicit *genai.HTTPRetryOptions on ClientConfig.HTTPOptions
+// (or per-request types.HTTPOptions), matching the Python/JS SDKs'
+// documented "retries must be requested explicitly" behavior.
+// defaultRetryAttempts=5/defaultRetryHTTPStatusCodes (including 429) are
+// only the *values* genai substitutes for an unset field once
+// HTTPRetryOptions is non-nil — they were never a default-on behavior. A
+// real user hit exactly this gap: a Gemini 429 propagated as an immediate
+// hard error with zero retry attempts. Fixed in factory.go's newGemini by
+// setting HTTPOptions.RetryOptions explicitly. 5 here matches that fix, so
+// every provider family gets the same retry budget for the same class of
+// error.
 const maxProviderRetries = 5
 
 // openaiRetryOption is maxProviderRetries as an option.RequestOption, used

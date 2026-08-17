@@ -1,6 +1,8 @@
 package main
 
 import (
+	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -25,7 +27,7 @@ func TestComputeStartAgent_LastUsedStillExists(t *testing.T) {
 
 // TestComputeStartAgent_LastUsedRemoved_FallsBackToGeneral covers the
 // explicitly requested fallback: the last-used agent no longer exists, but
-// "general" (agentsource.WriteDefault's own default agent name) does.
+// "general" (agentsource.WriteDefaults' own default agent name) does.
 func TestComputeStartAgent_LastUsedRemoved_FallsBackToGeneral(t *testing.T) {
 	agents := map[string]agentsource.AgentDefinition{
 		"general": {Name: "general"},
@@ -35,7 +37,7 @@ func TestComputeStartAgent_LastUsedRemoved_FallsBackToGeneral(t *testing.T) {
 
 // TestComputeStartAgent_NoLastUsed_FallsBackToGeneral covers a brand-new
 // install with no last_agent.json yet (lastUsed == "") but a "general"
-// agent already configured (agentsource.WriteDefault's zero-config path).
+// agent already configured (agentsource.WriteDefaults' zero-config path).
 func TestComputeStartAgent_NoLastUsed_FallsBackToGeneral(t *testing.T) {
 	agents := map[string]agentsource.AgentDefinition{
 		"general": {Name: "general"},
@@ -62,6 +64,78 @@ func TestComputeStartAgent_NoMatchAndNoGeneral_FallsBackToPicker(t *testing.T) {
 func TestComputeStartAgent_EmptyAgentsMap(t *testing.T) {
 	assert.Equal(t, "", computeStartAgent(nil, "assistant"))
 	assert.Equal(t, "", computeStartAgent(map[string]agentsource.AgentDefinition{}, ""))
+}
+
+// TestComputeDefaultModel_LastUsedStillExists is a regression test for a
+// real reported bug: switching models via ctrl+o only ever set that one
+// chat's Chat.ModelOverride, so starting a fresh chat/session afterward
+// always fell back to providersFile.Models[0] regardless of what the user
+// had actually switched to. computeDefaultModel's common case: the
+// last-used model is still configured, so it's returned instead of
+// models[0].
+func TestComputeDefaultModel_LastUsedStillExists(t *testing.T) {
+	models := []entities.ModelConfig{
+		{Name: "drujensen/ornith"},
+		{Name: "openai/gpt-5"},
+		{Name: "anthropic/claude-sonnet-5"},
+	}
+	assert.Equal(t, "anthropic/claude-sonnet-5", computeDefaultModel(models, "anthropic/claude-sonnet-5"))
+}
+
+// TestComputeDefaultModel_LastUsedRemoved_FallsBackToFirst covers a
+// last-used model that's since disappeared from the configured list (e.g. a
+// provider removed, or --refresh-providers pruning a stale entry) — falls
+// back to models[0], not an error or a dangling reference to a model that
+// no longer resolves to any ProviderConfig.
+func TestComputeDefaultModel_LastUsedRemoved_FallsBackToFirst(t *testing.T) {
+	models := []entities.ModelConfig{
+		{Name: "drujensen/ornith"},
+		{Name: "openai/gpt-5"},
+	}
+	assert.Equal(t, "drujensen/ornith", computeDefaultModel(models, "removed-model"))
+}
+
+// TestComputeDefaultModel_NoLastUsed_FallsBackToFirst covers a brand-new
+// install with no last_model.json yet (lastUsed == "") — the exact
+// pre-addendum behavior, preserved as the fallback.
+func TestComputeDefaultModel_NoLastUsed_FallsBackToFirst(t *testing.T) {
+	models := []entities.ModelConfig{
+		{Name: "drujensen/ornith"},
+		{Name: "openai/gpt-5"},
+	}
+	assert.Equal(t, "drujensen/ornith", computeDefaultModel(models, ""))
+}
+
+// TestDirMissingOrEmpty_MissingDirectory is the zero-config first-run
+// case: the directory (e.g. ~/.canopy/agents or ~/.canopy/skills) doesn't
+// exist yet at all.
+func TestDirMissingOrEmpty_MissingDirectory(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "agents")
+	needs, err := dirMissingOrEmpty(dir)
+	require.NoError(t, err)
+	assert.True(t, needs)
+}
+
+// TestDirMissingOrEmpty_EmptyDirectory covers a directory that exists (e.g.
+// created but never populated) with no entries in it yet.
+func TestDirMissingOrEmpty_EmptyDirectory(t *testing.T) {
+	dir := t.TempDir()
+	needs, err := dirMissingOrEmpty(dir)
+	require.NoError(t, err)
+	assert.True(t, needs)
+}
+
+// TestDirMissingOrEmpty_HasAtLeastOneEntry is the "don't touch it" case
+// this whole check exists for: as long as the directory has at least one
+// entry — whether it's one of Canopy's own defaults, a user-authored file,
+// or even an unrelated one — defaults must not be (re)written.
+func TestDirMissingOrEmpty_HasAtLeastOneEntry(t *testing.T) {
+	dir := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "general.md"), []byte("---\nname: general\n---\n"), 0o644))
+
+	needs, err := dirMissingOrEmpty(dir)
+	require.NoError(t, err)
+	assert.False(t, needs)
 }
 
 // TestMergeNewProviders_AdditiveNeverClobbersExisting is the specific test

@@ -35,7 +35,6 @@ import (
 	"time"
 
 	"github.com/microsoft/agent-framework-go/agent"
-	"github.com/microsoft/agent-framework-go/agent/harness/agentmode"
 	"github.com/microsoft/agent-framework-go/agent/harness/todo"
 	"github.com/microsoft/agent-framework-go/message"
 	"github.com/microsoft/agent-framework-go/tool"
@@ -75,71 +74,6 @@ func isCoreToolName(name string) bool {
 		}
 	}
 	return false
-}
-
-// planMode is the agentmode name (Design §3.8, Requirements FR12) under
-// which mutating tools are withheld from every agent's tool list — see
-// planModeMutatingTools and isPlanModeRestricted below for the mechanism
-// this package uses to answer Design §3.8's flagged open point ("plan mode
-// should pair with §3.6 ... the exact mechanism is impl/harness's to
-// define").
-const planMode = "plan"
-
-// planModeMutatingTools are the core tool names (Design §3.2's two
-// approval-gated tools — Bash, FileWrite) omitted from every agent's
-// assembled tool list while the chat's current mode is planMode, regardless
-// of the agent definition's own "tools" allowlist.
-//
-// # Design decision: omit, not just approval-force
-//
-// Design §3.8 flagged the exact plan-mode mechanism as open ("mutating
-// tools stay approval-required or withheld while planning"). This package
-// chooses withheld: plan mode drops Bash/FileWrite from the tool list
-// entirely rather than leaving them present-but-approval-gated. Both tools
-// are already approval-gated in every mode (Requirements FR5), so
-// "approval-required" alone wouldn't actually change anything about plan
-// mode — it would just be the status quo with an extra label. Omitting the
-// tools instead gives plan mode a real, independent guarantee: even a
-// standing "always approve this tool" rule from a prior execute-mode turn
-// (Design §3.6) cannot let a mutating call slip through while planning,
-// because the model has no way to invoke a tool that was never offered to
-// it this turn. execute mode restores the tool's normal (approval-gated)
-// availability.
-//
-// # Known limitation
-//
-// This restriction is only applied to the top-level, chat-bound agent
-// (buildTopLevelAgent). A subagent dispatched via tool/agenttool
-// (buildSubagentAgent) is NOT restricted by the parent's mode, since
-// subagents run in a fresh, unpersisted session with no agentmode wiring of
-// their own (Design §3.4's context-isolation model doesn't thread the
-// parent's mode through). A plan-mode top-level agent could still cause a
-// mutation indirectly by dispatching a subagent that calls Bash/FileWrite.
-// Flagged here as a real follow-up, not silently accepted.
-var planModeMutatingTools = map[string]struct{}{
-	"Bash":      {},
-	"FileWrite": {},
-}
-
-// isPlanModeRestricted reports whether toolName should be omitted from the
-// assembled tool list because mode is planMode. isMCP additionally withholds
-// every MCP-provided tool outright while planning, regardless of its name:
-// mcpclient.Connect's own doc comment already commits to wrapping every
-// MCP-provided tool with tool.ApprovalRequiredFunc, but that alone doesn't
-// satisfy plan mode's stronger guarantee (see planModeMutatingTools' doc
-// comment on "omit, not just approval-force") — an MCP tool is already
-// approval-gated in every mode, so leaving it present-but-gated during
-// planning would be the status quo with no real restriction, exactly the
-// reasoning that already applies to Bash/FileWrite.
-func isPlanModeRestricted(mode, toolName string, isMCP bool) bool {
-	if mode != planMode {
-		return false
-	}
-	if isMCP {
-		return true
-	}
-	_, restricted := planModeMutatingTools[toolName]
-	return restricted
 }
 
 // Definitions bundles the file-format loader output (Design §3.11) an
@@ -239,6 +173,19 @@ type AgentServiceConfig struct {
 	// remembering the last-used agent is a convenience, not something that
 	// should ever fail an otherwise-successful StartChat/SetAgent call.
 	RecordLastAgent func(agentName string) error
+
+	// RecordLastModel, when set (post-v0.1.0 addendum), is called with a
+	// ModelConfig.Name every time SetModel successfully makes it a chat's
+	// model override — mirrors RecordLastAgent exactly, including its
+	// best-effort contract (nil callback is simply not invoked; an error it
+	// returns is logged, never propagated). The real implementation
+	// (impl/config.SaveLastModel) persists it so a brand-new chat's default
+	// model resolution (resolveModelName's defaultModel fallback) can pick
+	// up the last model the user actually chose instead of always falling
+	// back to providers.json's first-listed model — see cmd/canopy's
+	// computeDefaultModel, which reads it back via impl/config.LoadLastModel
+	// before constructing AgentServiceConfig.DefaultModel.
+	RecordLastModel func(modelName string) error
 }
 
 // AgentService ties agentsource-loaded agent definitions, provider/model
@@ -258,19 +205,21 @@ type AgentService struct {
 	// (see that field's doc comment).
 	recordLastAgent func(agentName string) error
 
-	// todoProvider and modeProvider are the single, shared agent/harness/todo
-	// and agent/harness/agentmode instances (Design §3.7/§3.8) used both to
-	// wire every chat-bound agent's todos_*/mode_* tools (via
-	// harness.BuildParams.TodoProvider/ModeProvider) and to answer
-	// GetTodos/GetMode/SetMode directly from a chat's deserialized session,
-	// without needing a live *agent.Agent mid-run — see those methods' doc
-	// comments. One shared instance per AgentService (not per-agent, per-run)
-	// because both providers are stateless configuration; the actual state
-	// they read/write always lives on the *agent.Session passed via
-	// agent.WithSession, keyed by a fixed package-internal state key, so any
-	// same-configuration instance reads/writes the same data.
+	// recordLastModel is AgentServiceConfig.RecordLastModel, possibly nil
+	// (see that field's doc comment).
+	recordLastModel func(modelName string) error
+
+	// todoProvider is the single, shared agent/harness/todo instance (Design
+	// §3.7) used both to wire every chat-bound agent's todos_* tools (via
+	// harness.BuildParams.TodoProvider) and to answer GetTodos directly from
+	// a chat's deserialized session, without needing a live *agent.Agent
+	// mid-run — see that method's doc comment. One shared instance per
+	// AgentService (not per-agent, per-run) because the provider is stateless
+	// configuration; the actual state it reads/writes always lives on the
+	// *agent.Session passed via agent.WithSession, keyed by a fixed
+	// package-internal state key, so any same-configuration instance
+	// reads/writes the same data.
 	todoProvider *todo.Provider
-	modeProvider *agentmode.Provider
 
 	// mcpTools and mcpToolNames are AgentServiceConfig.MCPTools, filtered at
 	// construction time to drop any name colliding with coreToolNames (see
@@ -324,18 +273,11 @@ func NewAgentService(cfg AgentServiceConfig) *AgentService {
 		toolsCfg:        cfg.Tools,
 		logger:          cfg.Logger,
 		recordLastAgent: cfg.RecordLastAgent,
+		recordLastModel: cfg.RecordLastModel,
 		middlewares:     cfg.Middlewares,
 		mcpTools:        mcpTools,
 		mcpToolNames:    mcpToolNames,
 		todoProvider:    todo.New(nil),
-		// DefaultMode is "execute", not agentmode's own package default of
-		// "plan" (defaultModes[0]): a brand-new chat should be immediately
-		// able to act, matching Claude Code's default posture — a user opts
-		// into plan mode (via the mode_set tool or, in Plan Phase 6's TUI, a
-		// keybinding calling SetMode) rather than every chat starting
-		// restricted until switched. This is a judgment call, not a
-		// framework requirement.
-		modeProvider: agentmode.New(agentmode.Config{DefaultMode: "execute"}),
 	}
 }
 
@@ -373,18 +315,29 @@ func (s *AgentService) tryRecordLastAgent(agentName string) {
 	}
 }
 
+// tryRecordLastModel calls recordLastModel (AgentServiceConfig.
+// RecordLastModel, post-v0.1.0 addendum), if set, logging rather than
+// propagating any error — mirrors tryRecordLastAgent exactly.
+func (s *AgentService) tryRecordLastModel(modelName string) {
+	if s.recordLastModel == nil {
+		return
+	}
+	if err := s.recordLastModel(modelName); err != nil && s.logger != nil {
+		s.logger.Warn("failed to record last-used model", "model", modelName, "error", err)
+	}
+}
+
 // RunResult is AgentService.RunText/RunMessages' return value: the model's
 // response plus a post-turn snapshot of the session-scoped state Design
-// §3.7/§3.8 track (todos, mode) and the chat-scoped model routing state
+// §3.7 tracks (todos) and the chat-scoped model routing state
 // (post-v0.1.0 addendum, Design §4/FR1 — Chat.ModelOverride), so a caller
 // (Plan Phase 6's TUI) doesn't need a second round-trip just to render the
-// current todo list, mode, or active model name after every turn.
-// Todos/Mode/Model reflect state as of immediately after this turn completed
+// current todo list or active model name after every turn.
+// Todos/Model reflect state as of immediately after this turn completed
 // (i.e. after session persistence — see persistSession).
 type RunResult struct {
 	Response *agent.Response
 	Todos    []todo.Item
-	Mode     string
 
 	// Model is the ModelConfig.Name this turn was actually routed through —
 	// chat.ModelOverride if set, otherwise the agent definition's own
@@ -447,7 +400,7 @@ func (s *AgentService) RunText(ctx context.Context, chatID, msg string) (*RunRes
 // returns to this function, the entire outer middleware chain (including
 // toolapproval's post-next() saveState) has finished, so the *agent.Session
 // object now reflects every mutation any part of the turn made to it —
-// compaction's incremental index state, todo/mode's tool-driven state
+// compaction's incremental index state, todo's tool-driven state
 // (both of which mutate *during* the provider call, well before
 // HistoryProvider.Invoked runs, so those would actually have been fine
 // either way), and toolapproval's Rule. persistSession reloads the chat
@@ -468,16 +421,27 @@ func (s *AgentService) RunMessages(ctx context.Context, chatID string, msgs []*m
 		return nil, fmt.Errorf("agent service: loading session state for chat %q: %w", chatID, err)
 	}
 
-	a, err := s.buildTopLevelAgent(ctx, chat, session)
+	a, err := s.buildTopLevelAgent(ctx, chat)
 	if err != nil {
 		return nil, err
 	}
 
 	var chatPatched bool
 	msgs, chatPatched = withReconstructedApprovalFunctionCalls(chat, msgs)
+	// Proactive repair (see removeOrphanedApprovalRequests' doc comment): a
+	// chat already carrying an orphaned ToolApprovalRequestContent from a
+	// *previous* turn's chained-auto-approval bug would otherwise fail
+	// inside a.Run below on every single future turn — toolautocall's own
+	// request/response validation runs before this function gets a chance
+	// to repair anything after the fact. Repairing here too, before the
+	// call, means an already-stuck chat self-heals on its very next turn
+	// instead of staying permanently broken.
+	if harness.RemoveOrphanedApprovalRequests(chat) {
+		chatPatched = true
+	}
 	if chatPatched {
 		if err := s.repository.Update(ctx, chat); err != nil {
-			return nil, fmt.Errorf("agent service: persisting reconciled approval call IDs for chat %q: %w", chatID, err)
+			return nil, fmt.Errorf("agent service: persisting reconciled approval state for chat %q: %w", chatID, err)
 		}
 	}
 	resp, err := a.Run(ctx, msgs, agent.WithSession(session)).Collect()
@@ -489,6 +453,10 @@ func (s *AgentService) RunMessages(ctx context.Context, chatID string, msgs []*m
 		return nil, err
 	}
 
+	if err := s.repairOrphanedApprovalRequests(ctx, chatID); err != nil {
+		return nil, err
+	}
+
 	modelName, err := s.activeModelName(chat)
 	if err != nil {
 		return nil, err
@@ -497,7 +465,6 @@ func (s *AgentService) RunMessages(ctx context.Context, chatID string, msgs []*m
 	return &RunResult{
 		Response: resp,
 		Todos:    s.todoProvider.GetAllItems(agent.WithSession(session)),
-		Mode:     s.modeProvider.GetMode(agent.WithSession(session)),
 		Model:    modelName,
 	}, nil
 }
@@ -517,7 +484,7 @@ func (s *AgentService) RunTextStream(ctx context.Context, chatID, msg string) (a
 // the same post-run session persistence RunMessages does (persistSession,
 // unchanged and shared, not reimplemented — see RunMessages' own doc comment
 // for why that persistence has to be a deliberate second write) and still
-// making the same final Todos/Mode/Response available once the turn is over.
+// making the same final Todos/Response available once the turn is over.
 //
 // # Why this returns a (stream, finalize) pair instead of just a stream
 //
@@ -565,7 +532,7 @@ func (s *AgentService) RunTextStream(ctx context.Context, chatID, msg string) (a
 // The one new edge case streaming introduces is a caller-initiated early
 // break for a reason *other* than an error (e.g. a cancelled turn): that
 // silently skips persistence too, so a caller that wants a partial turn's
-// tool-approval/todo/mode state persisted must still drain the stream fully
+// tool-approval/todo state persisted must still drain the stream fully
 // rather than abandoning it partway through.
 func (s *AgentService) RunMessagesStream(ctx context.Context, chatID string, msgs []*message.Message) (agent.ResponseStream, func() (*RunResult, error), error) {
 	chat, err := s.repository.Get(ctx, chatID)
@@ -578,15 +545,22 @@ func (s *AgentService) RunMessagesStream(ctx context.Context, chatID string, msg
 		return nil, nil, fmt.Errorf("agent service: loading session state for chat %q: %w", chatID, err)
 	}
 
-	a, err := s.buildTopLevelAgent(ctx, chat, session)
+	a, err := s.buildTopLevelAgent(ctx, chat)
 	if err != nil {
 		return nil, nil, err
 	}
 
 	msgs, chatPatched := withReconstructedApprovalFunctionCalls(chat, msgs)
+	// Proactive repair — see the identical block in RunMessages for why
+	// this has to run before a.Run, not only after, to let an already-stuck
+	// chat self-heal on its next turn (removeOrphanedApprovalRequests' doc
+	// comment has the full empirical finding).
+	if harness.RemoveOrphanedApprovalRequests(chat) {
+		chatPatched = true
+	}
 	if chatPatched {
 		if err := s.repository.Update(ctx, chat); err != nil {
-			return nil, nil, fmt.Errorf("agent service: persisting reconciled approval call IDs for chat %q: %w", chatID, err)
+			return nil, nil, fmt.Errorf("agent service: persisting reconciled approval state for chat %q: %w", chatID, err)
 		}
 	}
 	inner := a.Run(ctx, msgs, agent.WithSession(session))
@@ -617,6 +591,12 @@ func (s *AgentService) RunMessagesStream(ctx context.Context, chatID string, msg
 			return
 		}
 
+		if repairErr := s.repairOrphanedApprovalRequests(ctx, chatID); repairErr != nil {
+			state.err = repairErr
+			state.done = true
+			return
+		}
+
 		modelName, modelErr := s.activeModelName(chat)
 		if modelErr != nil {
 			state.err = modelErr
@@ -627,7 +607,6 @@ func (s *AgentService) RunMessagesStream(ctx context.Context, chatID string, msg
 		state.result = &RunResult{
 			Response: &resp,
 			Todos:    s.todoProvider.GetAllItems(agent.WithSession(session)),
-			Mode:     s.modeProvider.GetMode(agent.WithSession(session)),
 			Model:    modelName,
 		}
 		state.done = true
@@ -839,6 +818,31 @@ func withReconstructedApprovalFunctionCalls(chat *entities.Chat, msgs []*message
 	return append([]*message.Message{synthetic}, msgs...), chatPatched
 }
 
+// repairOrphanedApprovalRequests reloads chatID fresh from the repository
+// (the caller's own in-memory *entities.Chat is stale by this point — see
+// harness.RemoveOrphanedApprovalRequests' doc comment for the full
+// empirical finding behind this repair, including why
+// impl/harness.ChatHistoryProvider.Invoked *also* runs the same repair on
+// every individual persist, not only here) and persists the repair if
+// harness.RemoveOrphanedApprovalRequests actually finds and drops
+// anything. A no-op, not an error, when there's nothing to repair — this
+// runs after every single turn, so the common case (no orphaned request at
+// all) must stay
+// cheap and silent.
+func (s *AgentService) repairOrphanedApprovalRequests(ctx context.Context, chatID string) error {
+	chat, err := s.repository.Get(ctx, chatID)
+	if err != nil {
+		return fmt.Errorf("agent service: loading chat %q: %w", chatID, err)
+	}
+	if !harness.RemoveOrphanedApprovalRequests(chat) {
+		return nil
+	}
+	if err := s.repository.Update(ctx, chat); err != nil {
+		return fmt.Errorf("agent service: persisting orphaned-approval-request repair for chat %q: %w", chatID, err)
+	}
+	return nil
+}
+
 // streamRunState carries RunMessagesStream's post-run outcome from its
 // wrapping stream closure to the paired finalize func it returns alongside
 // that stream — see RunMessagesStream's doc comment. Not safe for concurrent
@@ -886,31 +890,6 @@ func (s *AgentService) GetTodos(ctx context.Context, chatID string) ([]todo.Item
 		return nil, err
 	}
 	return s.todoProvider.GetAllItems(agent.WithSession(session)), nil
-}
-
-// GetMode returns chat's current plan/execute mode (Design §3.8, Requirements
-// FR12), read the same standalone way GetTodos reads todos.
-func (s *AgentService) GetMode(ctx context.Context, chatID string) (string, error) {
-	session, err := s.loadChatSession(ctx, chatID)
-	if err != nil {
-		return "", err
-	}
-	return s.modeProvider.GetMode(agent.WithSession(session)), nil
-}
-
-// SetMode updates chat's current mode and persists it immediately (Design
-// §3.8: "the TUI also calls SetMode directly on a user keybinding") — a
-// user-initiated mode switch doesn't need to wait for a run to take effect
-// or to be saved.
-func (s *AgentService) SetMode(ctx context.Context, chatID, mode string) error {
-	session, err := s.loadChatSession(ctx, chatID)
-	if err != nil {
-		return err
-	}
-	if err := s.modeProvider.SetMode(mode, agent.WithSession(session)); err != nil {
-		return fmt.Errorf("agent service: setting mode for chat %q: %w", chatID, err)
-	}
-	return s.persistSession(ctx, chatID, session)
 }
 
 // ListModels returns every configured ModelConfig.Name, sorted (post-v0.1.0
@@ -973,13 +952,11 @@ func (s *AgentService) GetModel(ctx context.Context, chatID string) (string, err
 }
 
 // SetModel sets chat's per-chat model override (Chat.ModelOverride,
-// post-v0.1.0 addendum, Design §4/FR1) and persists it immediately —
-// mirroring SetMode's "a user-initiated switch doesn't need to wait for a
-// run to take effect or to be saved" reasoning (Design §3.8). modelName must
-// name an already-configured ModelConfig; this is a real, defensive check
-// even though the TUI's model picker (ListModels) only ever offers valid
-// choices — the same defensive posture SetMode applies against
-// s.modeProvider's known modes.
+// post-v0.1.0 addendum, Design §4/FR1) and persists it immediately — a
+// user-initiated switch doesn't need to wait for a run to take effect or to
+// be saved. modelName must name an already-configured ModelConfig; this is
+// a real, defensive check even though the TUI's model picker (ListModels)
+// only ever offers valid choices.
 func (s *AgentService) SetModel(ctx context.Context, chatID, modelName string) error {
 	if _, ok := s.models[modelName]; !ok {
 		return fmt.Errorf("agent service: unknown model %q", modelName)
@@ -993,6 +970,7 @@ func (s *AgentService) SetModel(ctx context.Context, chatID, modelName string) e
 	if err := s.repository.Update(ctx, chat); err != nil {
 		return fmt.Errorf("agent service: setting model override for chat %q: %w", chatID, err)
 	}
+	s.tryRecordLastModel(modelName)
 	return nil
 }
 
@@ -1014,19 +992,21 @@ func (s *AgentService) activeModelName(chat *entities.Chat) (string, error) {
 	return name, nil
 }
 
-// ListAgents returns every loaded agent definition's Name, sorted
-// (post-v0.1.0 addendum, Design §3.4/§5) — mirrors ListModels for the same
-// "a TUI picker needs a deterministic list of valid choices" reason, here
-// for the ctrl+a in-chat agent-switch overlay rather than the top-level
-// picker screen (which sources its list directly from the agentsource-
-// loaded map it's constructed with, not through AgentService — see
-// NewModel/Model.agentNames).
+// ListAgents returns every loaded agent definition's Name, sorted via
+// agentsource.SortNames (post-v0.1.0 addendum, Design §3.4/§5: Canopy's own
+// default agents first, in SDLC pipeline order, then everything else
+// alphabetically) — mirrors ListModels for the same "a TUI picker needs a
+// deterministic list of valid choices" reason, here for the ctrl+a in-chat
+// agent-switch overlay rather than the top-level picker screen (which
+// sources its list directly from the agentsource-loaded map it's
+// constructed with, not through AgentService — see NewModel/
+// Model.agentNames, which calls the same agentsource.SortNames).
 func (s *AgentService) ListAgents() []string {
 	names := make([]string, 0, len(s.defs.Agents))
 	for name := range s.defs.Agents {
 		names = append(names, name)
 	}
-	sort.Strings(names)
+	agentsource.SortNames(names)
 	return names
 }
 
@@ -1096,7 +1076,7 @@ func (s *AgentService) ListChatSummaries(ctx context.Context) ([]ChatSummary, er
 }
 
 // GetChat returns the full persisted entities.Chat for chatID (post-v0.1.0
-// addendum). Unlike every other AgentService accessor (GetTodos/GetMode/
+// addendum). Unlike every other AgentService accessor (GetTodos/
 // GetModel), which deliberately expose one derived piece of state each,
 // this is the one place the TUI needs the raw Messages too: resuming a chat
 // (ctrl+h/--continue, tui.resumeChatCmd) has to reconstruct a transcript
@@ -1129,7 +1109,7 @@ const titleGenerationTextLimit = 2000
 //
 // Deliberately not built via buildTopLevelAgent/harness.Build: a title-
 // generation call needs no tools, no ChatHistoryProvider, no compaction/
-// todo/mode wiring — providers.New directly (the same minimal-construction
+// todo wiring — providers.New directly (the same minimal-construction
 // path buildSubagentAgent already uses) is enough, and skips all of that
 // overhead for a single throwaway completion.
 //
@@ -1276,7 +1256,7 @@ func sanitizeTitle(s string) string {
 }
 
 // loadChatSession loads chatID's persisted chat and deserializes its
-// SessionState, the common first step GetTodos/GetMode/SetMode all need.
+// SessionState, the common first step GetTodos needs.
 func (s *AgentService) loadChatSession(ctx context.Context, chatID string) (*agent.Session, error) {
 	chat, err := s.repository.Get(ctx, chatID)
 	if err != nil {
@@ -1298,13 +1278,7 @@ func (s *AgentService) loadChatSession(ctx context.Context, chatID string) (*age
 // Code's own Task-tool behavior (a dispatched subagent doesn't itself
 // dispatch further subagents) and avoids unbounded construction-time
 // recursion when two agent definitions could each wrap the other.
-//
-// session is chat's already-deserialized session (see LoadSession) — used
-// here only to read the chat's current mode (Design §3.8) before the tool
-// list is assembled, so planMode's tool restriction (see
-// planModeMutatingTools) applies to *this* turn's tool list rather than
-// lagging a turn behind.
-func (s *AgentService) buildTopLevelAgent(ctx context.Context, chat *entities.Chat, session *agent.Session) (*agent.Agent, error) {
+func (s *AgentService) buildTopLevelAgent(ctx context.Context, chat *entities.Chat) (*agent.Agent, error) {
 	def, ok := s.defs.Agents[chat.AgentName]
 	if !ok {
 		return nil, fmt.Errorf("agent service: chat %q references unknown agent %q", chat.ID, chat.AgentName)
@@ -1315,9 +1289,7 @@ func (s *AgentService) buildTopLevelAgent(ctx context.Context, chat *entities.Ch
 		return nil, err
 	}
 
-	mode := s.modeProvider.GetMode(agent.WithSession(session))
-
-	toolList, err := s.buildTopLevelTools(ctx, def, mode)
+	toolList, err := s.buildTopLevelTools(ctx, def)
 	if err != nil {
 		return nil, err
 	}
@@ -1338,19 +1310,34 @@ func (s *AgentService) buildTopLevelAgent(ctx context.Context, chat *entities.Ch
 		Model:        model,
 		Config:       cfg,
 		TodoProvider: s.todoProvider,
-		ModeProvider: s.modeProvider,
 	})
 }
 
-// buildTopLevelTools assembles def's own core tool list (restricted by mode,
-// see buildTools) plus, for every *other* loaded agent definition, a
+// buildTopLevelTools assembles def's own core tool list (see buildTools)
+// plus, for every *other* loaded agent definition, a
 // tool/agenttool-wrapped subagent tool (FR9, Design §3.4) — split out from
 // buildTopLevelAgent so the assembly logic itself (which agents get
 // wrapped, and that def is never wrapped as its own subagent) is directly
 // testable without needing to inspect a constructed *agent.Agent's
 // internals, which the framework doesn't expose an accessor for.
-func (s *AgentService) buildTopLevelTools(ctx context.Context, def agentsource.AgentDefinition, mode string) ([]tool.Tool, error) {
-	toolList, err := s.buildTools(def, mode)
+//
+// def's own tool list still fails loudly (the buildTools call above): a
+// user directly selecting an agent whose own tools: allowlist references
+// something unavailable deserves an immediate, clear error. But a failure
+// building one of the *other* agents as a subagent-dispatch tool is
+// deliberately non-fatal here — logged as a warning and skipped, not
+// propagated — for the same reason a broken MCP server doesn't stop Canopy
+// from starting (Requirements §7): one misconfigured or under-configured
+// agent definition (e.g. one whose tools: names WebSearch/Skill without
+// the corresponding backend/skills actually available — see coreTools'
+// conditional construction) must not make every *other* agent unusable
+// just because this loop eagerly tries to wrap it. Before this fix, it
+// did: any agent's construction — including "general"'s — would fail
+// outright the moment any other loaded agent had an unavailable tool in
+// its allowlist, which is a much larger blast radius than the one broken
+// agent actually deserves.
+func (s *AgentService) buildTopLevelTools(ctx context.Context, def agentsource.AgentDefinition) ([]tool.Tool, error) {
+	toolList, err := s.buildTools(def)
 	if err != nil {
 		return nil, err
 	}
@@ -1361,7 +1348,11 @@ func (s *AgentService) buildTopLevelTools(ctx context.Context, def agentsource.A
 		}
 		subAgent, err := s.buildSubagentAgent(ctx, subDef)
 		if err != nil {
-			return nil, fmt.Errorf("agent service: building subagent %q for %q: %w", name, def.Name, err)
+			if s.logger != nil {
+				s.logger.Warn("skipping subagent-dispatch tool for a misconfigured agent",
+					"agent", name, "parent", def.Name, "error", err)
+			}
+			continue
 		}
 		toolList = append(toolList, agenttool.New(subAgent, agenttool.Config{}))
 	}
@@ -1376,13 +1367,10 @@ func (s *AgentService) buildTopLevelTools(ctx context.Context, def agentsource.A
 // automatic" claim). This is what makes subagent dispatch genuinely
 // isolated from the parent's conversation rather than sharing its Chat.
 //
-// Subagents are NOT restricted by the parent's plan/execute mode (mode="" —
-// see buildTools/isPlanModeRestricted) and get none of Design §3.5-§3.8's
-// other wiring either (no compaction/todo/agentmode/approvals) — see
-// planModeMutatingTools' doc comment for the known limitation this implies,
-// and this package's doc comment on why AgentService pragmatically keeps
-// subagent construction on the direct impl/providers.New path rather than
-// impl/harness.Build.
+// Subagents get none of Design §3.5-§3.7's other harness wiring either (no
+// compaction/todo/approvals) — see this package's doc comment on why
+// AgentService pragmatically keeps subagent construction on the direct
+// impl/providers.New path rather than impl/harness.Build.
 //
 // Subagents also do NOT honor the parent chat's Chat.ModelOverride
 // (post-v0.1.0 addendum, Design §4/FR1): resolveProviderModel is called here
@@ -1398,7 +1386,7 @@ func (s *AgentService) buildSubagentAgent(ctx context.Context, def agentsource.A
 	if err != nil {
 		return nil, err
 	}
-	toolList, err := s.buildTools(def, "")
+	toolList, err := s.buildTools(def)
 	if err != nil {
 		return nil, err
 	}
@@ -1569,13 +1557,7 @@ func (s *AgentService) GetSkillBody(name string) (string, error) {
 // exactly the named subset otherwise — an MCP tool's plain name (as its
 // server documents it, not namespaced; see mcpclient.ConnectAll's doc
 // comment) is a valid allowlist entry exactly like a core tool's name.
-//
-// Plan mode (isPlanModeRestricted) withholds every MCP tool outright, the
-// same "omit, not just approval-force" treatment Bash/FileWrite get — see
-// isPlanModeRestricted's doc comment for why approval-gating alone (which
-// every MCP tool already has, per mcpclient.Connect) doesn't satisfy plan
-// mode's stronger guarantee.
-func (s *AgentService) buildTools(def agentsource.AgentDefinition, mode string) ([]tool.Tool, error) {
+func (s *AgentService) buildTools(def agentsource.AgentDefinition) ([]tool.Tool, error) {
 	available, err := s.coreTools()
 	if err != nil {
 		return nil, err
@@ -1587,17 +1569,11 @@ func (s *AgentService) buildTools(def agentsource.AgentDefinition, mode string) 
 	if len(def.Tools) == 0 {
 		result := make([]tool.Tool, 0, len(coreToolNames)+len(s.mcpToolNames))
 		for _, name := range coreToolNames {
-			if isPlanModeRestricted(mode, name, false) {
-				continue
-			}
 			if t, ok := available[name]; ok {
 				result = append(result, t)
 			}
 		}
 		for _, name := range s.mcpToolNames {
-			if isPlanModeRestricted(mode, name, true) {
-				continue
-			}
 			if t, ok := available[name]; ok {
 				result = append(result, t)
 			}
@@ -1607,10 +1583,6 @@ func (s *AgentService) buildTools(def agentsource.AgentDefinition, mode string) 
 
 	result := make([]tool.Tool, 0, len(def.Tools))
 	for _, name := range def.Tools {
-		_, isMCP := s.mcpTools[name]
-		if isPlanModeRestricted(mode, name, isMCP) {
-			continue
-		}
 		t, ok := available[name]
 		if !ok {
 			return nil, fmt.Errorf("agent service: agent %q references unknown or unavailable tool %q", def.Name, name)

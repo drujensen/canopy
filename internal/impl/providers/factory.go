@@ -117,14 +117,29 @@ func newAnthropic(cfg entities.ProviderConfig, model entities.ModelConfig, agent
 
 // newGemini builds a Google Gemini-backed agent via geminiprovider.NewAgent.
 //
-// Retry-on-429/5xx is not configured explicitly here the way
-// openaiRetryOption/anthropicoption.WithMaxRetries are for the other two
-// provider families: google.golang.org/genai already defaults to 5 retry
-// attempts with exponential backoff+jitter, including 429 in its default
-// retryable status codes (common.go's defaultRetryAttempts/
-// defaultRetryHTTPStatusCodes) — the same budget openaiRetryOption's doc
-// comment explains OpenAI/Anthropic are bumped up to match, so nothing to
-// override here.
+// Bugfix (post-v0.1.0): retry-on-429/5xx used to not be configured here at
+// all, on the mistaken assumption that google.golang.org/genai retries by
+// default the way openai-go/anthropic-sdk-go do. It doesn't:
+// genai.ClientConfig.HTTPOptions.RetryOptions is nil unless a caller sets
+// it, and genai's own retryHTTPRequest treats a nil *HTTPRetryOptions as
+// "exactly one attempt, no retry" — retries are opt-in, not a default (see
+// maxProviderRetries' doc comment, openaicompat.go, for the full source
+// citation). A real Gemini 429 ("quota exceeded") confirmed this: it
+// propagated as an immediate hard error with no retry at all. Fixed by
+// setting RetryOptions explicitly below — Attempts matches
+// maxProviderRetries, the same budget every other provider family gets for
+// this class of error; every other field (delay/backoff/jitter/retryable
+// status codes, which already includes 429) is left as genai's own
+// defaults by passing nil, not duplicated here.
+//
+// Caveat worth calling out, since it's easy to miss: a "quota exceeded"
+// 429 (a hard cap — daily/monthly free-tier usage genuinely exhausted) is
+// not the same failure as a transient rate-limit 429 (too many requests
+// this minute). Retrying helps the second case; for the first, every retry
+// will fail with the identical error until the quota window itself resets,
+// so the user still sees a 429 in the end — just after ~a minute of
+// backoff instead of immediately. This fix closes the "we never even
+// tried" gap; it can't manufacture quota that genuinely isn't there.
 //
 // The client is given an HTTPClient wrapping
 // newGeminiFunctionCallIDPatchingTransport (gemini_transport.go): real
@@ -136,12 +151,16 @@ func newAnthropic(cfg entities.ProviderConfig, model entities.ModelConfig, agent
 // downstream consumer (toolautocall's same-turn auto-call loop included,
 // not just Canopy's own cross-turn approval-response reconstruction).
 func newGemini(ctx context.Context, cfg entities.ProviderConfig, model entities.ModelConfig, agentCfg agent.Config) (*agent.Agent, error) {
-	clientCfg := &genai.ClientConfig{
-		APIKey:     cfg.APIKey,
-		HTTPClient: &http.Client{Transport: newGeminiFunctionCallIDPatchingTransport(http.DefaultTransport)},
+	httpOptions := genai.HTTPOptions{
+		RetryOptions: &genai.HTTPRetryOptions{Attempts: genai.Ptr(int32(maxProviderRetries))},
 	}
 	if cfg.BaseURL != "" {
-		clientCfg.HTTPOptions = genai.HTTPOptions{BaseURL: cfg.BaseURL}
+		httpOptions.BaseURL = cfg.BaseURL
+	}
+	clientCfg := &genai.ClientConfig{
+		APIKey:      cfg.APIKey,
+		HTTPClient:  &http.Client{Transport: newGeminiFunctionCallIDPatchingTransport(http.DefaultTransport)},
+		HTTPOptions: httpOptions,
 	}
 	client, err := genai.NewClient(ctx, clientCfg)
 	if err != nil {

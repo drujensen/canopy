@@ -3,6 +3,7 @@ package services
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -159,7 +160,7 @@ func TestAgentService_Approvals_AlwaysApprove_PersistsAcrossRestart(t *testing.T
 	require.NoError(t, statErr, "bash should have executed once approval was granted")
 
 	// Simulate a process restart: a brand-new AgentService (fresh in-memory
-	// maps, fresh todo/agentmode Provider instances) that shares nothing
+	// maps, fresh todo Provider instance) that shares nothing
 	// with svc except the on-disk ChatRepository.
 	require.NoError(t, os.Remove(marker))
 	restarted := newSvc()
@@ -172,6 +173,244 @@ func TestAgentService_Approvals_AlwaysApprove_PersistsAcrossRestart(t *testing.T
 	}
 	_, statErr = os.Stat(marker)
 	assert.NoError(t, statErr, "the standing approval rule must have let the tool execute again automatically after the restart")
+}
+
+// TestAgentService_ChainedAutoApprove_ThenLaterTurn_DoesNotError is an
+// end-to-end regression test for a real reported bug: a user answered one
+// approval-gated Bash call with "always allow this tool", the agent then
+// went on to make several more Bash calls in that same turn (all
+// auto-approved by the standing rule, exactly what "always allow" is for),
+// and the *next* unrelated message the user sent afterward failed with
+// "ToolApprovalRequestContent found with ToolCall.CallID(s) '...' that have
+// no matching ToolApprovalResponseContent" — a confirmed agent-framework-go
+// bug where only the *first* auto-approved call in a turn gets a correctly
+// matched request+response pair persisted; every one after that in the same
+// turn persists only the request (see harness.RemoveOrphanedApprovalRequests'
+// doc comment for the full empirical finding). No restart involved — this
+// reproduces entirely within one running AgentService, the same as the real
+// report. Uses enough chained calls (6) to actually trigger the bug: 1
+// (explicitly approved) + 2 (first auto-approved, historically fine) would
+// not have caught this on its own.
+func TestAgentService_ChainedAutoApprove_ThenLaterTurn_DoesNotError(t *testing.T) {
+	workDir := t.TempDir()
+	marker := filepath.Join(workDir, "marker.txt")
+
+	const numToolCalls = 6
+	var callCount int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		n := atomic.AddInt32(&callCount, 1)
+		w.Header().Set("Content-Type", "application/json")
+		if n <= numToolCalls {
+			args, err := json.Marshal(map[string]string{"command": fmt.Sprintf("echo run-%d >> %s", n, marker)})
+			require.NoError(t, err)
+			_ = json.NewEncoder(w).Encode(toolCallChatCompletionResponse(fmt.Sprintf("call-%d", n), "run_shell", string(args)))
+			return
+		}
+		_ = json.NewEncoder(w).Encode(chatCompletionResponse(fmt.Sprintf("reply-%d", n)))
+	}))
+	t.Cleanup(server.Close)
+
+	provider := entities.ProviderConfig{Name: "p", Type: entities.ProviderTypeOpenAI, APIKey: "sk-test", BaseURL: server.URL + "/v1"}
+	model := entities.ModelConfig{Name: "m", Provider: provider.Name, ModelName: "gpt-test"}
+
+	repo, err := jsonrepo.NewChatRepository(t.TempDir())
+	require.NoError(t, err)
+
+	svc := NewAgentService(AgentServiceConfig{
+		Definitions: Definitions{
+			Agents: map[string]agentsource.AgentDefinition{"assistant": {Name: "assistant"}},
+		},
+		Providers:    []entities.ProviderConfig{provider},
+		Models:       []entities.ModelConfig{model},
+		DefaultModel: model.Name,
+		Repository:   repo,
+		Tools:        ToolsConfig{WorkingRoot: workDir},
+	})
+
+	ctx := context.Background()
+	_, err = svc.StartChat(ctx, "chat-1", "assistant")
+	require.NoError(t, err)
+
+	// Turn 1: the first call requires approval.
+	result1, err := svc.RunText(ctx, "chat-1", "please run the marker command")
+	require.NoError(t, err)
+	var approvalReq *message.ToolApprovalRequestContent
+	for _, m := range result1.Response.Messages {
+		if req := findApprovalRequest(t, m); req != nil {
+			approvalReq = req
+		}
+	}
+	require.NotNil(t, approvalReq, "turn 1 must surface an approval request")
+
+	// Turn 2: "always allow this tool" — this chains through the remaining
+	// numToolCalls-1 calls, all auto-approved by the standing rule, within
+	// this single turn. This is where the bug used to leave orphaned,
+	// unanswered requests in persisted history.
+	approvalMsg := &message.Message{
+		Role:     message.RoleUser,
+		Contents: []message.Content{approvalReq.AlwaysApproveToolResponse()},
+	}
+	_, err = svc.RunMessages(ctx, "chat-1", []*message.Message{approvalMsg})
+	require.NoError(t, err, "turn 2 (always-approve, chaining into several more auto-approved calls) must not error")
+
+	// Turn 3: a later, entirely unrelated message — this is exactly where
+	// the real bug surfaced.
+	_, err = svc.RunText(ctx, "chat-1", "continue doing some work")
+	require.NoError(t, err, "a later unrelated turn must not fail with 'no matching ToolApprovalResponseContent'")
+}
+
+// TestAgentService_AlreadyStuckChat_SelfHealsOnNextTurn covers the case
+// TestAgentService_ChainedAutoApprove_ThenLaterTurn_DoesNotError doesn't:
+// a chat that was already left in the broken state by a *pre-fix* binary
+// (an orphaned ToolApprovalRequestContent already sitting in persisted
+// history, e.g. exactly the shape a user hitting this bug before today
+// would have on disk right now) must self-heal automatically on its very
+// next turn, not require any manual repair. This specifically proves the
+// *proactive* repair (harness.RemoveOrphanedApprovalRequests called before
+// a.Run, not only after) — without it, a.Run itself fails immediately on
+// every future turn, before the after-the-fact repair ever gets a chance
+// to run.
+func TestAgentService_AlreadyStuckChat_SelfHealsOnNextTurn(t *testing.T) {
+	repo, err := jsonrepo.NewChatRepository(t.TempDir())
+	require.NoError(t, err)
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(chatCompletionResponse("all good now"))
+	}))
+	t.Cleanup(server.Close)
+
+	provider := entities.ProviderConfig{Name: "p", Type: entities.ProviderTypeOpenAI, APIKey: "sk-test", BaseURL: server.URL + "/v1"}
+	model := entities.ModelConfig{Name: "m", Provider: provider.Name, ModelName: "gpt-test"}
+
+	svc := NewAgentService(AgentServiceConfig{
+		Definitions: Definitions{
+			Agents: map[string]agentsource.AgentDefinition{"assistant": {Name: "assistant"}},
+		},
+		Providers:    []entities.ProviderConfig{provider},
+		Models:       []entities.ModelConfig{model},
+		DefaultModel: model.Name,
+		Repository:   repo,
+	})
+
+	ctx := context.Background()
+	chat, err := svc.StartChat(ctx, "chat-1", "assistant")
+	require.NoError(t, err)
+
+	// Directly construct the exact broken shape a pre-fix binary would have
+	// left behind: an orphaned request with no matching response anywhere.
+	orphanedReq := &message.ToolApprovalRequestContent{
+		RequestID: "req-orphaned",
+		ToolCall:  &message.FunctionCallContent{CallID: "call-stale", Name: "run_shell", Arguments: `{}`},
+	}
+	chat.Messages = append(chat.Messages,
+		&message.Message{Role: message.RoleUser, Contents: []message.Content{&message.TextContent{Text: "please run something"}}},
+		&message.Message{Role: message.RoleAssistant, Contents: []message.Content{orphanedReq}},
+	)
+	require.NoError(t, repo.Update(ctx, chat))
+
+	// Sanity: confirm this chat really is stuck the way the bug leaves it —
+	// the framework's own validation must reject it as-is.
+	_, err = svc.RunText(ctx, "chat-1", "continue doing some work")
+	require.NoError(t, err, "the proactive repair must fix the already-stuck chat before a.Run ever sees the orphaned request, so this must succeed on the very first attempt after the fix, with no manual intervention")
+}
+
+// TestAgentService_PlainFollowUp_ChainedAutoApprove_NoDuplicateMessage is an
+// end-to-end regression test for a second real reported bug (found in the
+// same investigation as the orphaned-request bugs above, but distinct): a
+// chat resumed via --continue showed one typed message duplicated up to 8
+// times in the rendered transcript. Root cause: agent/harness/toolapproval's
+// internal auto-approval loop makes one independent invoke() round trip —
+// each with its own impl/harness.ChatHistoryProvider.Invoked persist call —
+// per newly-issued tool call within a single outer turn, resending the same
+// *message.Message objects (the turn's actual new messages) on every round;
+// without deduplication, each round re-persists them as if they were new.
+// Fixed by impl/harness.ChatHistoryProvider tracking pointer identity across
+// Invoked calls for the lifetime of one turn (see
+// TestChatHistoryProvider_Invoked_DedupesRepeatedCallsWithinOneTurn in
+// impl/harness for the direct unit-level test of that mechanism) — this
+// test proves it end-to-end through a real chained-auto-approval sequence,
+// the same shape the user actually hit.
+func TestAgentService_PlainFollowUp_ChainedAutoApprove_NoDuplicateMessage(t *testing.T) {
+	workDir := t.TempDir()
+	marker := filepath.Join(workDir, "marker.txt")
+
+	var callCount int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		n := atomic.AddInt32(&callCount, 1)
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case n == 1:
+			args, err := json.Marshal(map[string]string{"command": "echo one >> " + marker})
+			require.NoError(t, err)
+			_ = json.NewEncoder(w).Encode(toolCallChatCompletionResponse("call-1", "run_shell", string(args)))
+		case n == 2:
+			_ = json.NewEncoder(w).Encode(chatCompletionResponse("done with call-1"))
+		case n >= 3 && n <= 7:
+			// The "try again" follow-up chains through several more
+			// auto-approved calls under the now-standing rule.
+			args, err := json.Marshal(map[string]string{"command": fmt.Sprintf("echo run-%d >> %s", n, marker)})
+			require.NoError(t, err)
+			_ = json.NewEncoder(w).Encode(toolCallChatCompletionResponse(fmt.Sprintf("call-%d", n), "run_shell", string(args)))
+		default:
+			_ = json.NewEncoder(w).Encode(chatCompletionResponse(fmt.Sprintf("reply-%d", n)))
+		}
+	}))
+	t.Cleanup(server.Close)
+
+	provider := entities.ProviderConfig{Name: "p", Type: entities.ProviderTypeOpenAI, APIKey: "sk-test", BaseURL: server.URL + "/v1"}
+	model := entities.ModelConfig{Name: "m", Provider: provider.Name, ModelName: "gpt-test"}
+
+	repo, err := jsonrepo.NewChatRepository(t.TempDir())
+	require.NoError(t, err)
+
+	svc := NewAgentService(AgentServiceConfig{
+		Definitions: Definitions{
+			Agents: map[string]agentsource.AgentDefinition{"assistant": {Name: "assistant"}},
+		},
+		Providers:    []entities.ProviderConfig{provider},
+		Models:       []entities.ModelConfig{model},
+		DefaultModel: model.Name,
+		Repository:   repo,
+		Tools:        ToolsConfig{WorkingRoot: workDir},
+	})
+
+	ctx := context.Background()
+	_, err = svc.StartChat(ctx, "chat-1", "assistant")
+	require.NoError(t, err)
+
+	result1, err := svc.RunText(ctx, "chat-1", "please run the marker command")
+	require.NoError(t, err)
+	var approvalReq *message.ToolApprovalRequestContent
+	for _, m := range result1.Response.Messages {
+		if req := findApprovalRequest(t, m); req != nil {
+			approvalReq = req
+		}
+	}
+	require.NotNil(t, approvalReq)
+
+	approvalMsg := &message.Message{
+		Role:     message.RoleUser,
+		Contents: []message.Content{approvalReq.AlwaysApproveToolResponse()},
+	}
+	_, err = svc.RunMessages(ctx, "chat-1", []*message.Message{approvalMsg})
+	require.NoError(t, err)
+
+	_, err = svc.RunText(ctx, "chat-1", "try again")
+	require.NoError(t, err)
+
+	chat, err := repo.Get(ctx, "chat-1")
+	require.NoError(t, err)
+
+	var tryAgainCount int
+	for _, m := range chat.Messages {
+		for _, c := range m.Contents {
+			if txt, ok := c.(*message.TextContent); ok && txt.Text == "try again" {
+				tryAgainCount++
+			}
+		}
+	}
+	assert.Equal(t, 1, tryAgainCount, "the user's plain follow-up message must be persisted exactly once, not once per internal auto-approval round it happens to trigger")
 }
 
 // TestAgentService_Todos_PersistAcrossRestart is Requirements FR11's
@@ -231,88 +470,6 @@ func TestAgentService_Todos_PersistAcrossRestart(t *testing.T) {
 	assert.Equal(t, "Write the report", todos[0].Title)
 }
 
-// TestAgentService_Mode_ReadSetPersistAcrossRestart is Requirements FR12's
-// persistence claim, plus the readable/settable half PLAN.md Phase 5 asks
-// for: a new chat starts in AgentService's configured default mode
-// ("execute", not agentmode's own package default of "plan" — see
-// NewAgentService's doc comment), SetMode changes it immediately, and the
-// new mode is readable from a brand-new AgentService sharing only the
-// persisted ChatRepository.
-func TestAgentService_Mode_ReadSetPersistAcrossRestart(t *testing.T) {
-	repo, err := jsonrepo.NewChatRepository(t.TempDir())
-	require.NoError(t, err)
-
-	newSvc := func() *AgentService {
-		return NewAgentService(AgentServiceConfig{
-			Definitions: Definitions{
-				Agents: map[string]agentsource.AgentDefinition{
-					"assistant": {Name: "assistant", Description: "test agent"},
-				},
-			},
-			Repository: repo,
-		})
-	}
-
-	ctx := context.Background()
-	svc := newSvc()
-	_, err = svc.StartChat(ctx, "chat-1", "assistant")
-	require.NoError(t, err)
-
-	mode, err := svc.GetMode(ctx, "chat-1")
-	require.NoError(t, err)
-	assert.Equal(t, "execute", mode)
-
-	require.NoError(t, svc.SetMode(ctx, "chat-1", "plan"))
-
-	mode, err = svc.GetMode(ctx, "chat-1")
-	require.NoError(t, err)
-	assert.Equal(t, "plan", mode)
-
-	restarted := newSvc()
-	mode, err = restarted.GetMode(ctx, "chat-1")
-	require.NoError(t, err)
-	assert.Equal(t, "plan", mode, "the mode switch must survive a restart")
-}
-
-// TestAgentService_PlanMode_RestrictsMutatingTools is Design §3.8's flagged
-// open point, made concrete: building an agent's tool list under plan mode
-// omits the two approval-gated, mutating core tools (Bash/run_shell,
-// FileWrite/file_write) regardless of the agent definition's own allowlist,
-// while leaving non-mutating tools (file_read) available; execute mode (and
-// the zero-value "no mode" used elsewhere in this package's tests) is
-// unrestricted.
-func TestAgentService_PlanMode_RestrictsMutatingTools(t *testing.T) {
-	svc := NewAgentService(AgentServiceConfig{
-		Definitions: Definitions{
-			Agents: map[string]agentsource.AgentDefinition{
-				"assistant": {Name: "assistant"},
-			},
-		},
-		Tools: ToolsConfig{WorkingRoot: t.TempDir()},
-	})
-	ctx := context.Background()
-
-	execTools, err := svc.buildTopLevelTools(ctx, agentsource.AgentDefinition{Name: "assistant"}, "execute")
-	require.NoError(t, err)
-	planTools, err := svc.buildTopLevelTools(ctx, agentsource.AgentDefinition{Name: "assistant"}, "plan")
-	require.NoError(t, err)
-
-	assert.True(t, containsToolName(execTools, "run_shell"), "execute mode must offer the bash tool")
-	assert.True(t, containsToolName(execTools, "file_write"), "execute mode must offer the file-write tool")
-
-	assert.False(t, containsToolName(planTools, "run_shell"), "plan mode must withhold the bash tool")
-	assert.False(t, containsToolName(planTools, "file_write"), "plan mode must withhold the file-write tool")
-	assert.True(t, containsToolName(planTools, "file_read"), "plan mode must still offer non-mutating tools")
-
-	// Plan mode overrides even an explicit agent allowlist that names a
-	// mutating tool — see planModeMutatingTools' doc comment for why this
-	// is a deliberate "withheld, not just approval-gated" design.
-	explicit, err := svc.buildTools(agentsource.AgentDefinition{Name: "assistant", Tools: []string{"Bash", "FileRead"}}, "plan")
-	require.NoError(t, err)
-	assert.False(t, containsToolName(explicit, "run_shell"))
-	assert.True(t, containsToolName(explicit, "file_read"))
-}
-
 func containsToolName(tools []tool.Tool, name string) bool {
 	for _, tl := range tools {
 		if tl.Name() == name {
@@ -370,13 +527,102 @@ func TestAgentService_Model_ReadSetPersistAcrossRestart(t *testing.T) {
 	restarted := newSvc()
 	model, err = restarted.GetModel(ctx, "chat-1")
 	require.NoError(t, err)
-	assert.Equal(t, "m2", model, "the model override must survive a restart, the same way SetMode's mode switch does")
+	assert.Equal(t, "m2", model, "the model override must survive a restart")
+}
+
+// TestAgentService_SetModel_RecordsLastModel asserts SetModel calls
+// AgentServiceConfig.RecordLastModel (post-v0.1.0 addendum, fixing a real
+// bug where a fresh chat always fell back to providers.json's first-listed
+// model, silently discarding the model the user had actually switched to)
+// with the newly-set model name, on success — mirrors
+// TestAgentService_StartChat_RecordsLastAgent exactly.
+func TestAgentService_SetModel_RecordsLastModel(t *testing.T) {
+	repo, err := jsonrepo.NewChatRepository(t.TempDir())
+	require.NoError(t, err)
+
+	p1 := entities.ProviderConfig{Name: "p1", Type: entities.ProviderTypeOpenAI}
+	m1 := entities.ModelConfig{Name: "m1", Provider: "p1"}
+	m2 := entities.ModelConfig{Name: "m2", Provider: "p1"}
+
+	var recorded []string
+	svc := NewAgentService(AgentServiceConfig{
+		Definitions: Definitions{
+			Agents: map[string]agentsource.AgentDefinition{"assistant": {Name: "assistant"}},
+		},
+		Providers:    []entities.ProviderConfig{p1},
+		Models:       []entities.ModelConfig{m1, m2},
+		DefaultModel: "m1",
+		Repository:   repo,
+		RecordLastModel: func(name string) error {
+			recorded = append(recorded, name)
+			return nil
+		},
+	})
+
+	ctx := context.Background()
+	_, err = svc.StartChat(ctx, "chat-1", "assistant")
+	require.NoError(t, err)
+	assert.Empty(t, recorded, "starting a chat must not itself record a last-used model — only an explicit SetModel does")
+
+	require.NoError(t, svc.SetModel(ctx, "chat-1", "m2"))
+	assert.Equal(t, []string{"m2"}, recorded)
+}
+
+// TestAgentService_SetModel_NilRecordLastModel_NoPanic asserts the default
+// (no RecordLastModel set) is a safe no-op, not a nil-func-call panic.
+func TestAgentService_SetModel_NilRecordLastModel_NoPanic(t *testing.T) {
+	repo, err := jsonrepo.NewChatRepository(t.TempDir())
+	require.NoError(t, err)
+
+	p1 := entities.ProviderConfig{Name: "p1", Type: entities.ProviderTypeOpenAI}
+	m1 := entities.ModelConfig{Name: "m1", Provider: "p1"}
+	svc := NewAgentService(AgentServiceConfig{
+		Definitions: Definitions{
+			Agents: map[string]agentsource.AgentDefinition{"assistant": {Name: "assistant"}},
+		},
+		Providers:    []entities.ProviderConfig{p1},
+		Models:       []entities.ModelConfig{m1},
+		DefaultModel: "m1",
+		Repository:   repo,
+	})
+
+	ctx := context.Background()
+	_, err = svc.StartChat(ctx, "chat-1", "assistant")
+	require.NoError(t, err)
+	require.NoError(t, svc.SetModel(ctx, "chat-1", "m1"))
+}
+
+// TestAgentService_SetModel_RecordLastModelError_DoesNotFailSetModel
+// asserts remembering the last-used model is genuinely best-effort: a
+// failure writing that state must never fail an otherwise-successful
+// SetModel call.
+func TestAgentService_SetModel_RecordLastModelError_DoesNotFailSetModel(t *testing.T) {
+	repo, err := jsonrepo.NewChatRepository(t.TempDir())
+	require.NoError(t, err)
+
+	p1 := entities.ProviderConfig{Name: "p1", Type: entities.ProviderTypeOpenAI}
+	m1 := entities.ModelConfig{Name: "m1", Provider: "p1"}
+	svc := NewAgentService(AgentServiceConfig{
+		Definitions: Definitions{
+			Agents: map[string]agentsource.AgentDefinition{"assistant": {Name: "assistant"}},
+		},
+		Providers:       []entities.ProviderConfig{p1},
+		Models:          []entities.ModelConfig{m1},
+		DefaultModel:    "m1",
+		Repository:      repo,
+		RecordLastModel: func(name string) error { return errors.New("disk full") },
+	})
+
+	ctx := context.Background()
+	_, err = svc.StartChat(ctx, "chat-1", "assistant")
+	require.NoError(t, err)
+	err = svc.SetModel(ctx, "chat-1", "m1")
+	require.NoError(t, err, "a RecordLastModel failure must not fail SetModel")
 }
 
 // TestAgentService_SetModel_RejectsUnknownModel is SetModel's defensive
 // validation claim: an unconfigured model name is a clear error and must not
-// mutate the chat's persisted override, mirroring SetMode's own validation
-// against s.modeProvider's known modes.
+// mutate the chat's persisted override.
 func TestAgentService_SetModel_RejectsUnknownModel(t *testing.T) {
 	repo, err := jsonrepo.NewChatRepository(t.TempDir())
 	require.NoError(t, err)
