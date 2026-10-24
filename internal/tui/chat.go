@@ -1,7 +1,9 @@
 package tui
 
 import (
+	"cmp"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -18,6 +20,7 @@ import (
 	"github.com/microsoft/agent-framework-go/message"
 
 	"github.com/drujensen/canopy/internal/domain/services"
+	"github.com/drujensen/canopy/internal/impl/tools"
 )
 
 // pickerKind identifies which in-chat overlay picker (see chatModel.picker)
@@ -114,6 +117,15 @@ type chatModel struct {
 	// transcript/composer simply take the full width while hidden; see
 	// mainWidth.
 	sidebarHidden bool
+
+	// pendingToolCalls maps a tool call's CallID to its tool Name, recorded
+	// by applyUpdate's *message.FunctionCallContent case and consumed by
+	// its *message.FunctionResultContent case (post-v0.1.0 addendum: richer
+	// tool-call/result rendering) — the two arrive as separate streamed
+	// updates, call first, so the result (which only carries a CallID, not
+	// a Name) needs this to know which tool it's reporting on. Cleared per
+	// entry as each result arrives; never grows unbounded across a turn.
+	pendingToolCalls map[string]string
 
 	todos []todo.Item
 
@@ -686,8 +698,13 @@ func (c *chatModel) handleStreamMsg(msg tea.Msg, svc *services.AgentService, ctx
 
 // applyUpdate folds one *agent.ResponseUpdate's contents into the chat's
 // in-flight state: text is appended to the streaming buffer so it renders
-// incrementally (Requirements FR8), and a tool call surfaces a
-// "[calling toolname...]" marker.
+// incrementally (Requirements FR8); a tool call surfaces an
+// argument-aware "[toolname(headline)]" marker (toolCallHeadline) instead
+// of a bare "[calling toolname...]" repeated with no way to tell one shell
+// command or file write from another; and a tool result (post-v0.1.0
+// addendum) follows up with a short summary — an error if the call failed,
+// a line-diff stat for file_write, or a truncated output preview for
+// run_shell — once it actually completes.
 func (c *chatModel) applyUpdate(update *agent.ResponseUpdate) {
 	if update == nil {
 		return
@@ -698,10 +715,121 @@ func (c *chatModel) applyUpdate(update *agent.ResponseUpdate) {
 			c.streaming.WriteString(t.Text)
 		case *message.FunctionCallContent:
 			if t.Name != "" {
-				c.streaming.WriteString(fmt.Sprintf("\n[calling %s...]\n", t.Name))
+				if c.pendingToolCalls == nil {
+					c.pendingToolCalls = make(map[string]string)
+				}
+				c.pendingToolCalls[t.CallID] = t.Name
+				c.streaming.WriteString(fmt.Sprintf("\n[%s]\n", toolCallHeadline(t.Name, t.Arguments)))
 			}
+		case *message.FunctionResultContent:
+			c.streaming.WriteString(c.renderToolResult(t))
 		}
 	}
+}
+
+// toolCallHeadline returns a short, human-readable summary of a tool
+// call's arguments for applyUpdate's "[...]" marker — Claude Code's own
+// "Bash(npm test)"/"Write(path/to/file)" style, not just the bare tool
+// name, so a run of several calls to the same tool (a single repeated
+// word, with no way to tell one shell command or file path from another)
+// becomes legible. Falls back to the tool name alone if arguments can't be
+// parsed, and to the raw (truncated) arguments JSON for a tool name this
+// function doesn't special-case — any MCP-provided tool, chiefly — rather
+// than showing nothing extra at all.
+func toolCallHeadline(name, argumentsJSON string) string {
+	var args map[string]any
+	_ = json.Unmarshal([]byte(argumentsJSON), &args)
+	str := func(key string) string {
+		s, _ := args[key].(string)
+		return s
+	}
+	switch name {
+	case "run_shell":
+		if cmd := str("command"); cmd != "" {
+			return fmt.Sprintf("%s(%s)", name, oneLinePreview(cmd, 100))
+		}
+	case "file_write", "file_read":
+		if path := str("path"); path != "" {
+			return fmt.Sprintf("%s(%s)", name, path)
+		}
+	case "file_search":
+		if pattern := str("pattern"); pattern != "" {
+			if path := str("path"); path != "" {
+				return fmt.Sprintf("%s(%q in %s)", name, pattern, path)
+			}
+			return fmt.Sprintf("%s(%q)", name, pattern)
+		}
+	case "directory_list":
+		return fmt.Sprintf("%s(%s)", name, cmp.Or(str("path"), "."))
+	case "web_fetch":
+		if url := str("url"); url != "" {
+			return fmt.Sprintf("%s(%s)", name, url)
+		}
+	case "web_search":
+		if q := str("query"); q != "" {
+			return fmt.Sprintf("%s(%q)", name, q)
+		}
+	case "Skill":
+		if n := str("name"); n != "" {
+			return fmt.Sprintf("%s(%s)", name, n)
+		}
+	}
+	if preview := oneLinePreview(argumentsJSON, 80); preview != "" && preview != "{}" {
+		return fmt.Sprintf("%s(%s)", name, preview)
+	}
+	return name
+}
+
+// renderToolResult renders a short follow-up summary for frc once its tool
+// call actually completes, consuming (and removing) the matching entry
+// pendingToolCalls' doc comment describes. Returns "" for a tool this
+// function doesn't special-case and that didn't error — most tools
+// (file_read, web_search, MCP-provided ones, ...) stay as quiet as they
+// were before this addendum; only a genuine failure is always worth a line,
+// regardless of which tool it was.
+func (c *chatModel) renderToolResult(frc *message.FunctionResultContent) string {
+	name := c.pendingToolCalls[frc.CallID]
+	delete(c.pendingToolCalls, frc.CallID)
+
+	if frc.Error != nil {
+		return fmt.Sprintf("  ✗ %s\n", oneLinePreview(frc.Error.Error(), 200))
+	}
+
+	switch name {
+	case "run_shell":
+		if out, ok := frc.Result.(string); ok {
+			if preview := truncatePreview(out, 400); preview != "" {
+				return "  " + preview + "\n"
+			}
+		}
+	case "file_write":
+		if out, ok := frc.Result.(tools.FileWriteOutput); ok {
+			return fmt.Sprintf("  wrote %s (+%d -%d lines, %d bytes)\n", out.Path, out.LinesAdded, out.LinesRemoved, out.BytesWritten)
+		}
+	}
+	return ""
+}
+
+// oneLinePreview collapses embedded newlines in s to spaces (the same
+// idiom renderStatusErrLine already uses) and truncates to maxRunes,
+// keeping a multi-line shell command or error message to one legible
+// transcript line rather than however many rows its raw text would take.
+func oneLinePreview(s string, maxRunes int) string {
+	s = strings.TrimSpace(strings.ReplaceAll(strings.ReplaceAll(s, "\r\n", " "), "\n", " "))
+	return truncatePreview(s, maxRunes)
+}
+
+// truncatePreview trims s to maxRunes, appending "…" when it had to cut
+// anything, without collapsing internal newlines — used where multi-line
+// output (a shell command's real stdout) is still meant to render as
+// multiple lines, just capped in overall length.
+func truncatePreview(s string, maxRunes int) string {
+	s = strings.TrimSpace(s)
+	runes := []rune(s)
+	if len(runes) <= maxRunes {
+		return s
+	}
+	return string(runes[:maxRunes]) + "…"
 }
 
 // finishStreaming folds the accumulated streaming buffer into transcript as

@@ -76,6 +76,33 @@ func TestNewFileWriteTool_OverwritesExisting(t *testing.T) {
 	assert.Equal(t, "new", string(data))
 }
 
+// TestNewFileWriteTool_ReportsLineDiffStat is this package's coverage for
+// the post-v0.1.0 addendum giving the TUI something to show beyond "wrote
+// a file": a real line-level diff against whatever was there before (not a
+// naive line-count delta), git-diff-stat style.
+func TestNewFileWriteTool_ReportsLineDiffStat(t *testing.T) {
+	dir := t.TempDir()
+	wt := NewFileWriteTool(FileWriteConfig{Root: dir})
+
+	brandNewArgs, err := json.Marshal(map[string]string{"path": "new.txt", "content": "a\nb\nc\n"})
+	require.NoError(t, err)
+	out, err := wt.Call(context.Background(), string(brandNewArgs))
+	require.NoError(t, err)
+	result := out.(FileWriteOutput)
+	assert.Equal(t, 3, result.LinesAdded, "a brand-new file has nothing to diff against — every line counts as added")
+	assert.Equal(t, 0, result.LinesRemoved)
+
+	path := filepath.Join(dir, "existing.txt")
+	require.NoError(t, os.WriteFile(path, []byte("a\nb\nc\n"), 0o644))
+	editArgs, err := json.Marshal(map[string]string{"path": "existing.txt", "content": "a\nx\nc\nd\n"})
+	require.NoError(t, err)
+	out, err = wt.Call(context.Background(), string(editArgs))
+	require.NoError(t, err)
+	result = out.(FileWriteOutput)
+	assert.Equal(t, 2, result.LinesAdded, "replacing 'b' with 'x' and appending 'd' is 2 added lines")
+	assert.Equal(t, 1, result.LinesRemoved, "replacing 'b' with 'x' is 1 removed line")
+}
+
 func TestNewFileWriteTool_PathTraversalRejected(t *testing.T) {
 	root := t.TempDir()
 	outside := t.TempDir()

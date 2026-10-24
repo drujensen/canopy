@@ -25,6 +25,7 @@ import (
 	"github.com/drujensen/canopy/internal/impl/agentsource"
 	jsonrepo "github.com/drujensen/canopy/internal/impl/repositories/json"
 	"github.com/drujensen/canopy/internal/impl/skillsource"
+	"github.com/drujensen/canopy/internal/impl/tools"
 )
 
 // --- synthetic-message tests: no real AgentService/network involved ---
@@ -1311,4 +1312,102 @@ func TestChatModel_View_FillsFullTerminalHeight(t *testing.T) {
 	c.refreshViewport()
 	lines = strings.Split(c.View(80, 24), "\n")
 	assert.Len(t, lines, 24, "the view with a status error line showing must still use exactly the requested terminal height")
+}
+
+// TestToolCallHeadline_KnownTools_ShowArguments is this package's coverage
+// for the post-v0.1.0 addendum replacing the bare "[calling toolname...]"
+// marker with an argument-aware headline — Claude Code's own
+// "Bash(npm test)"/"Write(path/to/file)" style — so a run of several calls
+// to the same tool is actually distinguishable.
+func TestToolCallHeadline_KnownTools_ShowArguments(t *testing.T) {
+	cases := []struct {
+		name, argsJSON, want string
+	}{
+		{"run_shell", `{"command":"npm test"}`, "run_shell(npm test)"},
+		{"file_write", `{"path":"README.md","content":"ignored here"}`, "file_write(README.md)"},
+		{"file_read", `{"path":"go.mod"}`, "file_read(go.mod)"},
+		{"directory_list", `{"path":"internal/tui"}`, "directory_list(internal/tui)"},
+		{"directory_list", `{}`, "directory_list(.)"},
+		{"web_fetch", `{"url":"https://example.com"}`, "web_fetch(https://example.com)"},
+		{"web_search", `{"query":"golang diff libraries"}`, `web_search("golang diff libraries")`},
+		{"Skill", `{"name":"mcp-server-setup"}`, "Skill(mcp-server-setup)"},
+	}
+	for _, c := range cases {
+		assert.Equal(t, c.want, toolCallHeadline(c.name, c.argsJSON), "name=%s args=%s", c.name, c.argsJSON)
+	}
+}
+
+// TestToolCallHeadline_UnknownTool_FallsBackToArgsPreview covers an
+// MCP-provided tool (or any name this package doesn't special-case): it
+// still shows the raw arguments rather than nothing beyond the bare name.
+func TestToolCallHeadline_UnknownTool_FallsBackToArgsPreview(t *testing.T) {
+	got := toolCallHeadline("echo", `{"message":"hi"}`)
+	assert.Equal(t, `echo({"message":"hi"})`, got)
+
+	assert.Equal(t, "echo", toolCallHeadline("echo", `{}`), "empty arguments must not render as a pointless 'echo({})'")
+	assert.Equal(t, "echo", toolCallHeadline("echo", ""), "unparseable/empty arguments must fall back to the bare name, not panic")
+}
+
+// TestChatModel_ApplyUpdate_RunShellCallAndResult_BothRender is this
+// package's coverage for the full call-then-result flow through
+// applyUpdate: the call surfaces the actual command (not just "run_shell"
+// repeated with no way to tell commands apart), and the result — arriving
+// as a separate, later update, correlated by CallID via pendingToolCalls
+// — follows up with the tool's real output.
+func TestChatModel_ApplyUpdate_RunShellCallAndResult_BothRender(t *testing.T) {
+	c := newChatModel("chat-1", "assistant", nil, "m1", 80, 24)
+
+	c.applyUpdate(&agent.ResponseUpdate{Contents: message.Contents{
+		&message.FunctionCallContent{CallID: "call-1", Name: "run_shell", Arguments: `{"command":"echo hi"}`},
+	}})
+	assert.Contains(t, c.streaming.String(), "run_shell(echo hi)")
+	assert.Len(t, c.pendingToolCalls, 1, "the call must be recorded, awaiting its result")
+
+	c.applyUpdate(&agent.ResponseUpdate{Contents: message.Contents{
+		&message.FunctionResultContent{CallID: "call-1", Result: "hi\nexit_code: 0"},
+	}})
+	assert.Contains(t, c.streaming.String(), "hi")
+	assert.Contains(t, c.streaming.String(), "exit_code: 0")
+	assert.Empty(t, c.pendingToolCalls, "the result must consume its pending entry")
+}
+
+// TestChatModel_ApplyUpdate_FileWriteResult_ShowsLineDiffStat is this
+// package's coverage for the part of this addendum the user actually
+// asked for: a file_write result renders a git-diff-style "+N -M lines"
+// stat (tools.FileWriteOutput.LinesAdded/LinesRemoved), not just a bare
+// "wrote a file" confirmation.
+func TestChatModel_ApplyUpdate_FileWriteResult_ShowsLineDiffStat(t *testing.T) {
+	c := newChatModel("chat-1", "assistant", nil, "m1", 80, 24)
+
+	c.applyUpdate(&agent.ResponseUpdate{Contents: message.Contents{
+		&message.FunctionCallContent{CallID: "call-1", Name: "file_write", Arguments: `{"path":"README.md","content":"..."}`},
+	}})
+	c.applyUpdate(&agent.ResponseUpdate{Contents: message.Contents{
+		&message.FunctionResultContent{CallID: "call-1", Result: tools.FileWriteOutput{
+			Path: "README.md", BytesWritten: 42, LinesAdded: 8, LinesRemoved: 3,
+		}},
+	}})
+
+	out := c.streaming.String()
+	assert.Contains(t, out, "README.md")
+	assert.Contains(t, out, "+8")
+	assert.Contains(t, out, "-3")
+}
+
+// TestChatModel_ApplyUpdate_ToolError_AlwaysRendersRegardlessOfTool is this
+// package's coverage that a failed call is never silently swallowed, even
+// for a tool with no other special-cased result rendering.
+func TestChatModel_ApplyUpdate_ToolError_AlwaysRendersRegardlessOfTool(t *testing.T) {
+	c := newChatModel("chat-1", "assistant", nil, "m1", 80, 24)
+
+	c.applyUpdate(&agent.ResponseUpdate{Contents: message.Contents{
+		&message.FunctionCallContent{CallID: "call-1", Name: "file_read", Arguments: `{"path":"missing.txt"}`},
+	}})
+	c.applyUpdate(&agent.ResponseUpdate{Contents: message.Contents{
+		&message.FunctionResultContent{CallID: "call-1", Error: fmt.Errorf("no such file or directory")},
+	}})
+
+	out := c.streaming.String()
+	assert.Contains(t, out, "✗")
+	assert.Contains(t, out, "no such file or directory")
 }
