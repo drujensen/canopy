@@ -12,7 +12,7 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func TestNewFileWriteTool_ContractAndApproval(t *testing.T) {
+func TestNewFileWriteTool_ContractAndNotApprovalGated(t *testing.T) {
 	wt := NewFileWriteTool(FileWriteConfig{})
 
 	var _ tool.FuncTool = wt
@@ -20,9 +20,9 @@ func TestNewFileWriteTool_ContractAndApproval(t *testing.T) {
 	assert.NotEmpty(t, wt.Description())
 	assert.NotNil(t, wt.Schema())
 
-	approval, ok := wt.(tool.ApprovalRequiredTool)
-	require.True(t, ok, "file write tool must implement tool.ApprovalRequiredTool")
-	assert.True(t, approval.ApprovalRequired(), "file write must require approval per FR5")
+	if approval, ok := wt.(tool.ApprovalRequiredTool); ok {
+		assert.False(t, approval.ApprovalRequired(), "file write must not require approval — approval-gating was removed")
+	}
 }
 
 func TestNewFileWriteTool_WritesActualFile(t *testing.T) {

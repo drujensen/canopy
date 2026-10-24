@@ -359,14 +359,8 @@ func (s *AgentService) RunText(ctx context.Context, chatID, msg string) (*RunRes
 // other loaded agent definition, per FR9/Design §3.4), and runs one turn
 // with msgs as the new messages, collecting the full response.
 //
-// Unlike RunText, callers can supply arbitrary message content here — in
-// particular, a message.ToolApprovalResponseContent or
-// message.AlwaysApproveToolApprovalResponseContent (Design §3.6, Requirements
-// FR5), which is the only way to answer a pending approval request
-// surfaced in a prior turn's RunResult.Response. Plan Phase 6's TUI is the
-// intended caller for that path (an "approve"/"always allow" prompt);
-// RunText alone can't express it since a plain string can't carry
-// structured approval content.
+// Unlike RunText, callers can supply arbitrary message content here, not
+// just plain text — Plan Phase 6's TUI is the intended caller for that path.
 //
 // # Session-state persistence (Design §3.9, Requirements FR14)
 //
@@ -378,38 +372,24 @@ func (s *AgentService) RunText(ctx context.Context, chatID, msg string) (*RunRes
 // way message history is persisted.
 //
 // That "piggyback on Invoked" design was the originally recommended
-// approach (one write covers messages + session state together) and was
-// tried first, but reading agent/harness/toolapproval/toolapproval.go's
-// run() function shows it doesn't actually work for toolapproval
-// specifically: toolapproval's middleware sits in agent.Config.Middlewares,
-// which wraps the *entire* agent invoke lifecycle including
-// HistoryProvider.Invoked (see WireLoopQuality's doc comment for why it has
-// to sit there). Every code path in toolapproval's run() that persists a
-// newly-added standing Rule into the session (session.Set, inside its
-// saveState helper) does so *after* it calls next(...) and that call
-// returns — and next(...), for a middleware in Config.Middlewares, is (or
-// wraps) the agent's whole invoke, which is where HistoryProvider.Invoked
-// already fired. So a Rule added by this turn's "always approve" response
-// is only written onto the *agent.Session object after
-// ChatHistoryProvider.Invoked already read and persisted it — relying
-// solely on Invoked would silently persist a chat.SessionState missing the
-// very Rule this turn was supposed to record. This was empirically confirmed
-// by tracing that call sequence, not assumed.
+// approach (one write covers messages + session state together), but
+// HistoryProvider.Invoked only ever persists chat.Messages — it never
+// touches chat.SessionState — so an explicit second write is required
+// regardless of what else is in the middleware chain: compaction's
+// incremental index state and todo's tool-driven state both mutate the
+// *agent.Session during the provider call, and nothing else in the request
+// path ever flushes that mutated Session back to the persisted Chat.
 //
 // The fix is this explicit second write: by the time a.RunText(...).Collect()
-// returns to this function, the entire outer middleware chain (including
-// toolapproval's post-next() saveState) has finished, so the *agent.Session
-// object now reflects every mutation any part of the turn made to it —
-// compaction's incremental index state, todo's tool-driven state
-// (both of which mutate *during* the provider call, well before
-// HistoryProvider.Invoked runs, so those would actually have been fine
-// either way), and toolapproval's Rule. persistSession reloads the chat
-// (rather than reusing the chat variable from the top of this function) so
-// it applies the SessionState write on top of whatever Messages
-// ChatHistoryProvider.Invoked already persisted, instead of clobbering them
-// with a stale in-memory copy. This is a real, deliberate double-write per
-// turn (chat.Messages via Invoked, then chat.SessionState via
-// persistSession) — noted here explicitly rather than left implicit.
+// returns to this function, the *agent.Session object reflects every
+// mutation the turn made to it, so persistSession writes it out.
+// persistSession reloads the chat (rather than reusing the chat variable
+// from the top of this function) so it applies the SessionState write on
+// top of whatever Messages ChatHistoryProvider.Invoked already persisted,
+// instead of clobbering them with a stale in-memory copy. This is a real,
+// deliberate double-write per turn (chat.Messages via Invoked, then
+// chat.SessionState via persistSession) — noted here explicitly rather than
+// left implicit.
 func (s *AgentService) RunMessages(ctx context.Context, chatID string, msgs []*message.Message) (*RunResult, error) {
 	chat, err := s.repository.Get(ctx, chatID)
 	if err != nil {
@@ -426,34 +406,12 @@ func (s *AgentService) RunMessages(ctx context.Context, chatID string, msgs []*m
 		return nil, err
 	}
 
-	var chatPatched bool
-	msgs, chatPatched = withReconstructedApprovalFunctionCalls(chat, msgs)
-	// Proactive repair (see removeOrphanedApprovalRequests' doc comment): a
-	// chat already carrying an orphaned ToolApprovalRequestContent from a
-	// *previous* turn's chained-auto-approval bug would otherwise fail
-	// inside a.Run below on every single future turn — toolautocall's own
-	// request/response validation runs before this function gets a chance
-	// to repair anything after the fact. Repairing here too, before the
-	// call, means an already-stuck chat self-heals on its very next turn
-	// instead of staying permanently broken.
-	if harness.RemoveOrphanedApprovalRequests(chat) {
-		chatPatched = true
-	}
-	if chatPatched {
-		if err := s.repository.Update(ctx, chat); err != nil {
-			return nil, fmt.Errorf("agent service: persisting reconciled approval state for chat %q: %w", chatID, err)
-		}
-	}
 	resp, err := a.Run(ctx, msgs, agent.WithSession(session)).Collect()
 	if err != nil {
 		return nil, fmt.Errorf("agent service: running chat %q: %w", chatID, err)
 	}
 
 	if err := s.persistSession(ctx, chatID, session); err != nil {
-		return nil, err
-	}
-
-	if err := s.repairOrphanedApprovalRequests(ctx, chatID); err != nil {
 		return nil, err
 	}
 
@@ -550,19 +508,6 @@ func (s *AgentService) RunMessagesStream(ctx context.Context, chatID string, msg
 		return nil, nil, err
 	}
 
-	msgs, chatPatched := withReconstructedApprovalFunctionCalls(chat, msgs)
-	// Proactive repair — see the identical block in RunMessages for why
-	// this has to run before a.Run, not only after, to let an already-stuck
-	// chat self-heal on its next turn (removeOrphanedApprovalRequests' doc
-	// comment has the full empirical finding).
-	if harness.RemoveOrphanedApprovalRequests(chat) {
-		chatPatched = true
-	}
-	if chatPatched {
-		if err := s.repository.Update(ctx, chat); err != nil {
-			return nil, nil, fmt.Errorf("agent service: persisting reconciled approval state for chat %q: %w", chatID, err)
-		}
-	}
 	inner := a.Run(ctx, msgs, agent.WithSession(session))
 	state := &streamRunState{}
 
@@ -587,12 +532,6 @@ func (s *AgentService) RunMessagesStream(ctx context.Context, chatID string, msg
 
 		if persistErr := s.persistSession(ctx, chatID, session); persistErr != nil {
 			state.err = persistErr
-			state.done = true
-			return
-		}
-
-		if repairErr := s.repairOrphanedApprovalRequests(ctx, chatID); repairErr != nil {
-			state.err = repairErr
 			state.done = true
 			return
 		}
@@ -623,224 +562,6 @@ func (s *AgentService) RunMessagesStream(ctx context.Context, chatID string, msg
 	}
 
 	return stream, finalize, nil
-}
-
-// withReconstructedApprovalFunctionCalls works around a confirmed bug in
-// agent-framework-go's agent/harness/toolautocall package: when a turn's new
-// msgs carry a *message.ToolApprovalResponseContent or
-// *message.AlwaysApproveToolApprovalResponseContent (i.e. this is a
-// follow-up turn answering an approval request surfaced by a *previous*
-// RunMessages/RunMessagesStream call — Design §3.6), toolautocall.Run
-// reconstructs a *message.FunctionResultContent for the approved/rejected
-// call and appends it to the messages sent to the underlying provider, but
-// never re-adds a matching *message.FunctionCallContent alongside it — see
-// toolautocall.go's processToolApprovalResponses/invokeApprovedToolApprovalResponses:
-// the reconstructed assistant message (built by convertToToolCallContentMessages)
-// is only used for preDownstreamCallHistory (yielded to the caller for
-// display) and is never merged back into the messages slice actually passed
-// to next() (the provider). This was confirmed empirically by dumping the
-// raw HTTP request body a real approval-then-continue turn produces: for
-// both the OpenAI and Gemini providers, the second turn's request contains a
-// "tool" role message with the function's result but no preceding
-// "assistant" message naming the function call it answers — a malformed
-// request by both APIs' own contract (a tool-result message must follow a
-// matching assistant tool-call message).
-//
-// OpenAI's/Anthropic's own client libraries are lenient enough (or Canopy's
-// test doubles didn't validate strictly enough) that this went unnoticed;
-// google.golang.org/genai's provider does its own client-side validation
-// before ever making a network call (provider/geminiprovider/agent.go's
-// buildRequestParts scans history for a *message.FunctionCallContent whose
-// CallID matches each *message.FunctionResultContent, since Gemini's
-// FunctionResponse wire format requires the function *name*, which
-// FunctionResultContent alone doesn't carry) — so with Gemini specifically,
-// every approval-gated tool call (every MCP tool, unconditionally, since
-// mcpclient.Connect wraps all of them with tool.ApprovalRequiredFunc; Bash
-// and FileWrite too) fails immediately with "geminiprovider: missing
-// function name for result with call ID ..." the moment a pending approval
-// is answered, whether by an explicit user decision or by a standing
-// "always approve" rule auto-replaying it on a later turn.
-//
-// The fix: before handing msgs to a.Run, scan them for any approval-response
-// content and, for each one whose snapshotted ToolCall is a
-// *message.FunctionCallContent, synthesize a plain assistant message
-// carrying that FunctionCallContent (marked InformationalOnly since it's
-// replayed context, not a new call to invoke) and prepend it. This new
-// message is not itself a ToolApprovalRequestContent/ResponseContent, so
-// toolautocall's own extraction leaves it untouched (its default case just
-// keeps unrecognized content types as-is) — it simply becomes ordinary
-// history a downstream provider's own callID/name reconciliation (Gemini's
-// callIDToName scan, in particular) can find, restoring the assistant
-// tool-call message every provider's wire protocol expects to precede a
-// tool-result message.
-//
-// A *message.ToolApprovalResponseContent already snapshots its originating
-// *message.FunctionCallContent onto its own ToolCall field at creation time
-// (see ToolApprovalRequestContent.CreateResponse in agent-framework-go's
-// message/content.go), so this reconstruction needs no separate lookup
-// against chat history — the data is already on the response content itself.
-//
-// # A second, real-Gemini-specific wrinkle: empty CallIDs
-//
-// google.golang.org/genai's FunctionCall.ID is documented Optional, and the
-// real Gemini API routinely omits it entirely — unlike OpenAI's
-// tool_call_id, which is always present, and unlike every fake-Gemini-server
-// fixture in this package's tests (before this fix), which always hand-set a
-// fake "id" real traffic never actually sends. agent-framework-go's
-// geminiprovider parses that missing field as
-// *message.FunctionCallContent.CallID == "", and its own buildRequestParts
-// unconditionally errors on a *message.FunctionResultContent whose CallID is
-// "" — captured live: a real canopy binary, talking to the real Gemini API,
-// through a real stdio MCP server, the moment a pending MCP tool approval
-// was answered ("geminiprovider: missing function name for result with call
-// ID \"\""; see TestGeminiEmptyCallID_ApproveThenContinue for the fast,
-// deterministic repro this evidence produced). Not MCP-specific — any
-// approval-gated tool (Bash/FileWrite too) hits the same error the moment a
-// real Gemini response omits the call ID.
-//
-// Naively minting a synthetic CallID only for the *response* side here (an
-// earlier version of this fix did exactly that) doesn't work: toolautocall's
-// own request/response reconciliation
-// (extractAndRemoveToolApprovalRequestsAndResponses in agent-framework-go)
-// separately compares the *ToolApprovalRequestContent* from turn N-1
-// (already persisted to chat history with CallID == "" by the time turn N
-// runs — chat storage round-trips through JSON, so there is no shared Go
-// object to mutate in place across turns) against turn N's response, and
-// fails loudly ("ToolApprovalRequestContent found with ToolCall.CallID(s)
-// ” that have no matching ToolApprovalResponseContent") the instant the two
-// sides disagree — empirically confirmed against
-// TestGeminiEmptyCallID_ApproveThenContinue. So the empty CallID has to be
-// repaired on *both* sides, in lockstep: this turn's response AND the
-// matching historical request sitting in chat.Messages. chat's
-// ToolApprovalRequestContent entries are matched to this turn's responses by
-// RequestID (a plain string, stable across the JSON round-trip, unlike
-// CallID-based identity) rather than object identity, and are mutated
-// in-place on the *entities.Chat the caller already loaded — the caller
-// (RunMessages/RunMessagesStream) must persist chat via
-// interfaces.ChatRepository.Update *before* calling a.Run when this function
-// reports chatPatched, so ChatHistoryProvider.Invoking's own independent
-// reload of the chat sees the repaired CallID rather than a stale
-// still-empty one.
-func withReconstructedApprovalFunctionCalls(chat *entities.Chat, msgs []*message.Message) (out []*message.Message, chatPatched bool) {
-	historicalRequestsByID := make(map[string]*message.FunctionCallContent)
-	if chat != nil {
-		for _, m := range chat.Messages {
-			if m == nil {
-				continue
-			}
-			for _, c := range m.Contents {
-				req, ok := c.(*message.ToolApprovalRequestContent)
-				if !ok || req == nil {
-					continue
-				}
-				if fcc, ok := req.ToolCall.(*message.FunctionCallContent); ok && fcc != nil {
-					historicalRequestsByID[req.RequestID] = fcc
-				}
-			}
-		}
-	}
-
-	var calls []message.Content
-	seen := make(map[*message.FunctionCallContent]bool)
-	var syntheticCallIDCounter int
-	addCall := func(toolCall message.ToolCallContent, requestID string) {
-		fcc, ok := toolCall.(*message.FunctionCallContent)
-		if !ok || fcc == nil || seen[fcc] {
-			return
-		}
-		seen[fcc] = true
-		if fcc.CallID == "" {
-			// Post gemini_transport.go (internal/impl/providers): this
-			// branch is no longer reachable for any *newly received* Gemini
-			// function call — the transport now patches a synthetic,
-			// non-empty id into the raw HTTP response before genai's
-			// decoder (and therefore this code) ever sees it, so a
-			// ToolApprovalRequestContent built from a fresh response always
-			// already has fcc.CallID != "" by the time it would reach here.
-			// It remains reachable, and is still needed, for exactly one
-			// real case: a chat persisted to disk *before* the transport
-			// fix existed can already contain a ToolApprovalRequestContent
-			// snapshot with CallID == "" (chat storage round-trips through
-			// JSON, so there's no way to retroactively repair
-			// already-persisted history just by shipping a new binary) — if
-			// a user resumes that chat and answers the still-pending
-			// approval today, CreateResponse clones that same empty CallID
-			// onto the new response, and this branch is what repairs it.
-			// See TestWithReconstructedApprovalFunctionCalls_EmptyCallID_PreFixPersistedChat
-			// (reconstructed_approval_calls_test.go) for a fast,
-			// transport-independent repro of that exact scenario, and
-			// TestWithReconstructedApprovalFunctionCalls_NonEmptyCallID_BranchNotTriggered
-			// confirming this branch stays inert once a CallID is already
-			// present (the post-fix steady state). Kept intentionally, not
-			// dead code: mint one synthetic ID and apply it to both this
-			// response's own snapshot and the matching historical request's
-			// snapshot in chat.Messages (if found), so toolautocall's
-			// request/response reconciliation still agrees — see this
-			// function's doc comment for why both sides need it.
-			if hist, found := historicalRequestsByID[requestID]; found && hist.CallID != "" {
-				fcc.CallID = hist.CallID
-			} else {
-				syntheticCallIDCounter++
-				fcc.CallID = fmt.Sprintf("canopy-synth-%d", syntheticCallIDCounter)
-				if found {
-					hist.CallID = fcc.CallID
-					chatPatched = true
-				}
-			}
-		}
-		clone := *fcc
-		clone.InformationalOnly = true
-		calls = append(calls, &clone)
-	}
-
-	for _, m := range msgs {
-		if m == nil {
-			continue
-		}
-		for _, c := range m.Contents {
-			switch resp := c.(type) {
-			case *message.ToolApprovalResponseContent:
-				if resp != nil {
-					addCall(resp.ToolCall, resp.RequestID)
-				}
-			case *message.AlwaysApproveToolApprovalResponseContent:
-				if resp != nil && resp.InnerResponse != nil {
-					addCall(resp.InnerResponse.ToolCall, resp.InnerResponse.RequestID)
-				}
-			}
-		}
-	}
-
-	if len(calls) == 0 {
-		return msgs, chatPatched
-	}
-	synthetic := &message.Message{Role: message.RoleAssistant, Contents: calls}
-	return append([]*message.Message{synthetic}, msgs...), chatPatched
-}
-
-// repairOrphanedApprovalRequests reloads chatID fresh from the repository
-// (the caller's own in-memory *entities.Chat is stale by this point — see
-// harness.RemoveOrphanedApprovalRequests' doc comment for the full
-// empirical finding behind this repair, including why
-// impl/harness.ChatHistoryProvider.Invoked *also* runs the same repair on
-// every individual persist, not only here) and persists the repair if
-// harness.RemoveOrphanedApprovalRequests actually finds and drops
-// anything. A no-op, not an error, when there's nothing to repair — this
-// runs after every single turn, so the common case (no orphaned request at
-// all) must stay
-// cheap and silent.
-func (s *AgentService) repairOrphanedApprovalRequests(ctx context.Context, chatID string) error {
-	chat, err := s.repository.Get(ctx, chatID)
-	if err != nil {
-		return fmt.Errorf("agent service: loading chat %q: %w", chatID, err)
-	}
-	if !harness.RemoveOrphanedApprovalRequests(chat) {
-		return nil
-	}
-	if err := s.repository.Update(ctx, chat); err != nil {
-		return fmt.Errorf("agent service: persisting orphaned-approval-request repair for chat %q: %w", chatID, err)
-	}
-	return nil
 }
 
 // streamRunState carries RunMessagesStream's post-run outcome from its

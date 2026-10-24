@@ -11,7 +11,7 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func TestNewBashTool_ContractAndApproval(t *testing.T) {
+func TestNewBashTool_ContractAndNotApprovalGated(t *testing.T) {
 	bt, err := NewBashTool(BashConfig{})
 	require.NoError(t, err)
 
@@ -20,9 +20,9 @@ func TestNewBashTool_ContractAndApproval(t *testing.T) {
 	assert.NotEmpty(t, bt.Description())
 	assert.NotNil(t, bt.Schema())
 
-	approval, ok := bt.(tool.ApprovalRequiredTool)
-	require.True(t, ok, "bash tool must implement tool.ApprovalRequiredTool")
-	assert.True(t, approval.ApprovalRequired(), "bash tool must require approval per FR5")
+	if approval, ok := bt.(tool.ApprovalRequiredTool); ok {
+		assert.False(t, approval.ApprovalRequired(), "bash tool must not require approval — approval-gating was removed")
+	}
 }
 
 func TestNewBashTool_RunsEcho(t *testing.T) {

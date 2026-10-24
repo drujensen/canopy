@@ -33,8 +33,9 @@ that use them. Canopy imports none of them, and imports none of `workflow`, `wor
 agentworkflow`, or `workflow/checkpoint` either (no graph engine — REQUIREMENTS.md §5).
 
 Packages Canopy imports from MAF-Go: `agent`, `tool`, `message`, `agent/compaction`,
-`agent/harness/{loop,toolautocall,toolapproval,todo}` (post-v0.1.0: `agentmode` was imported here
-too, before §3.8's addendum superseded it),
+`agent/harness/{loop,toolautocall,todo}` (post-v0.1.0: `agentmode` was imported here too, before
+§3.8's addendum superseded it; `toolapproval` was imported here too, before §3.6's addendum
+removed it),
 `provider/{openaiprovider,anthropicprovider,geminiprovider}`,
 `tool/{mcptool,shelltool,functool,agenttool}`, `provider/otelprovider` (Plan Phase 7, §3.10 —
 optional OTel tracing middleware; only reached when a caller explicitly enables tracing, see
@@ -56,9 +57,10 @@ internal/
   impl/
     providers/        # builds agent.ProviderConfig per configured provider (§4)
     tools/             # narrow core set: shell, file read/write/search, directory, web search/fetch
-    harness/           # wires agent/harness/{loop,toolautocall,toolapproval,todo}
+    harness/           # wires agent/harness/{loop,toolautocall,todo}
                         # and agent/compaction into each *agent.Agent at construction time
-                        # (post-v0.1.0: agentmode was wired here too — see §3.8's addendum)
+                        # (post-v0.1.0: agentmode was wired here too — see §3.8's addendum;
+                        # toolapproval was wired here too — see §3.6's addendum)
     agentsource/       # NEW — loads .claude/agents/*.md (§3.11)
     skillsource/       # NEW — loads .claude/skills/*/SKILL.md (§3.11)
     mcpsource/         # NEW — loads .mcp.json, constructs tool/mcptool clients (§3.11)
@@ -66,7 +68,7 @@ internal/
     repositories/
       json/            # ChatRepository only, in v1
     config/            # .env / flags; small flat-JSON provider/model config (§4, §6)
-  tui/                 # bubbletea: chat view + approval prompts, todo panel
+  tui/                 # bubbletea: chat view, todo panel
 ```
 
 No `ui/` (web) package in v1 — deferred per REQUIREMENTS.md §5, and no `mongo` package under
@@ -121,22 +123,21 @@ provider type. `Config.ContextProviders` and `Config.Middlewares` are where §3.
 type Tool interface { Name() string; Description() string }
 type SchemaTool interface { Tool; Schema() any; ReturnSchema() any }
 type FuncTool interface { SchemaTool; Call(ctx, args string) (any, error) }
-type ApprovalRequiredTool interface { Tool; ApprovalRequired() bool }
-func ApprovalRequiredFunc(t FuncTool) FuncTool
 ```
 
 Canopy's built-in `tool.FuncTool` set, deliberately sized to match Claude Code's own core tools
-rather than aiagent's full breadth (Requirements §5):
+rather than aiagent's full breadth (Requirements §5). None of these are approval-gated — see §3.6
+for why:
 
-| Canopy tool | Backing | Approval-gated? |
-|---|---|---|
-| Bash/shell | `tool/shelltool` (framework-provided local shell) | Yes |
-| File read | `impl/tools`, ported from aiagent's `file_read.go` | No |
-| File write | `impl/tools`, ported from aiagent's `file_write.go` | Yes |
-| File search / grep | `impl/tools`, ported from aiagent's `file_search.go` | No |
-| Directory listing | `impl/tools`, ported from aiagent's `directory.go` | No |
-| Web search | `impl/tools`, ported from aiagent's `web_search.go` | No |
-| Web fetch | `impl/tools`, ported from aiagent's `fetch.go` | No |
+| Canopy tool | Backing |
+|---|---|
+| Bash/shell | `tool/shelltool` (framework-provided local shell) |
+| File read | `impl/tools`, ported from aiagent's `file_read.go` |
+| File write | `impl/tools`, ported from aiagent's `file_write.go` |
+| File search / grep | `impl/tools`, ported from aiagent's `file_search.go` |
+| Directory listing | `impl/tools`, ported from aiagent's `directory.go` |
+| Web search | `impl/tools`, ported from aiagent's `web_search.go` |
+| Web fetch | `impl/tools`, ported from aiagent's `fetch.go` |
 
 Everything else aiagent has today — browser automation (go-rod), image generation, vision, git PR
 creation, swagger, memory — is **not** ported as a built-in in v1. A user who wants that
@@ -156,9 +157,8 @@ referenced `Definitions.Skills` at all). `coreToolNames` grew from seven entries
 appended); like `WebSearch` (only constructed when a backend is configured), `Skill` is only
 constructed into `AgentService.coreTools()`'s available map — and therefore only offered to any
 agent — when at least one skill is loaded (`len(s.defs.Skills) > 0`), so a project with no skills
-gets no tool offering nothing to look up. Not approval-gated, the same tier as `FileRead`. See
-§3.11's own addendum below for the full three-level design as implemented, including level 3's
-path-confinement decision.
+gets no tool offering nothing to look up. See §3.11's own addendum below for the full three-level
+design as implemented, including level 3's path-confinement decision.
 
 Addendum (post-v0.1.0): `ToolsConfig.WebSearchBackend` — the `WebSearchBackend` interface this
 section always described — went from always `nil` (no default search backend ever wired in
@@ -242,95 +242,46 @@ func NewContextProvider(cfg ContextProviderConfig) agent.ContextProvider
 from the agent's configured model context window) driving a sliding-window-then-summarization
 `PipelineStrategy`, attached via `Config.ContextProviders`. Runs automatically before each turn.
 
-### 3.6 Approvals and permissions (FR5)
+### 3.6 Tool execution — no approval gating (FR5 removed, post-v0.1.0)
 
-`agent/harness/toolapproval`:
+**Current policy: no tool call is ever blocked on a human decision. Every built-in and
+MCP-provided tool executes immediately when the model requests it — this is deliberate, not a gap
+to fill in later.** Nothing in `impl/tools`, `impl/mcpclient`, or `impl/harness` wraps a tool with
+`tool.ApprovalRequiredFunc` or sets a framework-level "requires acknowledgement" flag (e.g.
+`shelltool.LocalConfig.AcknowledgeUnsafe` is explicitly set `true` for the Bash tool specifically
+to opt out of the framework's own default approval requirement). `agent/harness/toolapproval` is
+not imported anywhere in this codebase. Do not reintroduce approval-gating, a confirmation prompt,
+or anything else that pauses a tool call on a human decision — if a future change needs to restrict
+what a tool can do, do it by withholding the tool from an agent's `tools:` allowlist (§3.11) or by
+tightening the tool's own input validation, not by adding a blocking step back into the loop.
 
-```go
-type Rule struct { /* ToolName + optional Arguments; nil Arguments matches all invocations */ }
-func New(cfg Config) agent.Middleware
-```
+**Why this was removed.** Canopy originally shipped FR5's two-tier "approve once" / "always allow"
+permission model via `agent/harness/toolapproval`, exactly as Claude Code's own permission system
+works. In practice it caused two problems, not one:
 
-Pauses the loop on an `ApprovalRequiredTool` call, emits a `ToolApprovalRequestContent`; the
-caller responds with approval/denial or "always approve"
-(`AlwaysApproveToolApprovalResponseContent`), which becomes a `Rule` checked automatically on
-future calls. State lives on `*agent.Session` (§3.9) under its own key.
+1. **It added no real safety value.** The prompt itself was removed early (every request was
+   already being auto-answered with `AlwaysApproveToolResponse()` the instant it surfaced — see the
+   git history around `tui/chat.go`'s former `pendingApprovals`/`sendAutoApprovals`), so by the time
+   the second problem below was diagnosed, approval-gating had already degraded into pure overhead:
+   an extra provider round trip per gated call, with no human ever actually asked to decide anything.
+2. **The approve-then-continue round trip corrupted chat history.** `toolautocall`'s own
+   reconstruction of the assistant message that must precede a tool result, combined with a
+   second, Canopy-side workaround (`withReconstructedApprovalFunctionCalls`) written against an
+   earlier misdiagnosis of the same symptom, could leave a duplicate, unresolved
+   `*message.FunctionCallContent` sitting in persisted history with no matching result. Some
+   providers (confirmed with DeepSeek) reject that history outright on the next turn —
+   `"ToolApprovalRequestContent"`/`"tool_calls"` validation errors that permanently broke the
+   affected chat, forcing the user to abandon it. A prior pass had already shipped a *second*
+   workaround (`harness.RemoveOrphanedApprovalRequests`, since deleted) to repair that corruption
+   after the fact — repairing the symptom rather than removing the mechanism that caused it.
 
-TUI renders a pending approval request as a prompt with "approve once" / "always allow this
-tool" — Claude Code's two-tier permission model.
-
-**Addendum (post-v0.1.0): the prompt was removed — every tool approval is now auto-answered.**
-The two-tier prompt above was found annoying enough in practice that `tui/chat.go` no longer
-blocks the composer on a `ToolApprovalRequestContent` at all: `chatModel.applyUpdate` queues each
-one onto `pendingApprovals` (a slice, not a single field — a turn can request several tools at
-once and every one needs its own answer) instead of setting a pending-decision field, and once the
-turn is fully over, `handleStreamMsg`'s `streamDoneMsg` case calls `sendAutoApprovals`, which
-answers every queued request with `AlwaysApproveToolResponse()` in one combined follow-up message
-and starts the next turn automatically — no keypress, no visible prompt. `ApprovalRequired()` on
-`Bash`/`FileWrite`/MCP tools, `agent/harness/toolapproval`'s own `Rule`-based reconciliation, and
-every fix in the two bugfix addenda directly below are all still exercised exactly as before; only
-the TUI-level human-in-the-loop decision was removed, which also incidentally fixes a real bug the
-single-field `pendingApproval` had: a multi-tool-call turn where more than one call needed approval
-only ever let the *last* one's request be answered, permanently losing the earlier ones (some
-OpenAI-compatible providers, e.g. DeepSeek, reject the resulting malformed request outright:
-"insufficient tool messages following tool_calls message").
-
-**Bugfix addenda (post-v0.1.0): two confirmed agent-framework-go bugs in this exact area, both
-fixed at Canopy's own boundary with the framework (`domain/services.AgentService` and
-`impl/harness.ChatHistoryProvider`) rather than patching the vendored framework itself.**
-Both follow the same shape: `toolautocall`'s own request/response reconciliation
-(`extractAndRemoveToolApprovalRequestsAndResponses`) requires every non-`InformationalOnly`
-`ToolApprovalRequestContent` anywhere in a turn's message history to have a matching
-`ToolApprovalResponseContent`, and errors loudly (`"ToolApprovalRequestContent found with
-ToolCall.CallID(s) '...' that have no matching ToolApprovalResponseContent"`) the instant it finds
-one that doesn't — by design, this validation is meant to catch a genuinely malformed request, not
-framework bookkeeping gaps of the framework's own making.
-
-1. **`withReconstructedApprovalFunctionCalls`** (`agent_service.go`) works around `toolautocall`
-   never re-adding a matching `*message.FunctionCallContent` alongside the
-   `*message.FunctionResultContent` it reconstructs for an approved/rejected call — confirmed by
-   dumping the raw HTTP request body a real approval-then-continue turn produces (a `"tool"` role
-   message with no preceding matching `"assistant"` tool-call message, malformed by both the
-   OpenAI and Gemini API's own contract). Fixed by synthesizing and prepending an
-   `InformationalOnly` assistant message carrying that `FunctionCallContent` before every `a.Run`
-   call whose new `msgs` answer a pending approval. Also repairs a related empty-`CallID` wrinkle
-   specific to pre-`gemini_transport.go`-fix persisted chats. See the function's own doc comment
-   for the full empirical trail (this is the most heavily-annotated function in the codebase for a
-   reason — the framework interaction here is genuinely subtle).
-2. **`harness.RemoveOrphanedApprovalRequests`** (`impl/harness/approval_repair.go`) fixes a second,
-   distinct bug, found from two real user reports of the same symptom: under a standing "always
-   approve" rule, the *first* auto-approved tool call in a turn persists a correctly matched
-   request+response pair, but every auto-approved call *after* that first one in the *same* turn
-   persists only the request — its response, though the call demonstrably executed (confirmed via a
-   real HTTP-call-count assertion in the regression test), never lands in `Chat.Messages` at all.
-   That orphaned request then breaks *every* subsequent turn on the chat, forever, the moment
-   `toolautocall`'s validation sees it again.
-   
-   The first fix attempt lived entirely in `domain/services.AgentService` (repairing before/after
-   each outer `RunMessages`/`RunMessagesStream` call) and turned out to be *insufficient*: a second
-   real report reproduced with the failing call's ID absent from the persisted chat file entirely —
-   proof the failure happened *inside* a still-running `a.Run` call, never returning control to
-   `AgentService` at all. Root cause: `toolapproval`'s internal auto-approval loop doesn't make one
-   combined invoke() round trip for a whole turn — it makes one *complete, independent* invoke()
-   round trip (its own `HistoryProvider.Invoking` reload and `Invoked` persist) *per newly-issued
-   tool call*. A long enough chain of auto-approved calls within a single turn means a *later*
-   internal round reloads history that a *slightly earlier* internal round (of the very same turn)
-   already left orphaned, and fails right there — a point `AgentService`'s own before/after repair
-   can never reach.
-   
-   Fixed by moving the repair into `impl/harness.ChatHistoryProvider.Invoked` itself (still exported
-   as `harness.RemoveOrphanedApprovalRequests` so `AgentService` can also call it) — the one place
-   that genuinely runs on *every* individual persist, including the ones nested inside
-   `toolapproval`'s internal loop, mid-turn. Repairing right before each persist stops an orphan
-   from ever surviving long enough for a later internal round of the *same* turn to trip over it.
-   `AgentService.RunMessages`/`RunMessagesStream` still additionally call the same function
-   before/after the outer turn — that's what self-heals a chat *already* left broken by an
-   older binary, a case the per-persist repair alone can't reach (it only ever sees what a *live*
-   run passes through it). Repairing by removal rather than fabricating a matching response is the
-   safer choice in both places: the request is stale bookkeeping noise by the time it's found (the
-   underlying call already ran to completion, which is how its request ever became visible in
-   history in the first place — there is no real approval decision left outstanding for a human or
-   a standing rule to make).
+Given (1), removing the entire mechanism was strictly better than patching it again: no safety
+behavior was lost (there was none left to lose), and the whole class of history-corruption bug
+(orphaned `FunctionCallContent`/`ToolApprovalRequestContent` with no matching result) became
+impossible, because the content types that caused it are never generated in the first place.
+`withReconstructedApprovalFunctionCalls`, `harness.RemoveOrphanedApprovalRequests`, the
+`toolapproval` middleware wiring, and every test that existed only to cover that machinery were
+deleted outright, not deprecated.
 
 ### 3.7 Todo / progress tracking (FR11)
 
@@ -395,41 +346,38 @@ equivalent); the TUI also calls `SetMode` directly on a user keybinding. Plan mo
 with §3.6 (mutating tools stay approval-required or withheld while planning) — the exact
 mechanism is `impl/harness`'s to define, flagged for Plan Phase 5.
 
-### 3.9 History and sessions — one mechanism persists §3.6/§3.7's state
+### 3.9 History and sessions — one mechanism persists §3.7's state
 
 `agent.HistoryProvider` backed by `ChatRepository` (JSON, v1) handles chat history (FR13).
 Separately, `agent.Session` is a key/value bag scoped to one conversation, explicitly built to be
 persisted — its doc comment: *"a Session can be serialized and deserialized directly with
-`encoding/json`, so that it can be saved in a persistent store."* `toolapproval` and `todo` both
-store their state via `session.Get`/`session.Set`, each under its own key in that one `Session` —
-neither exposes a separate store hook of its own. So the integration point is a single one: after
-each `Agent.Run`, `impl/harness` serializes the `*agent.Session` (`json.Marshal`) onto the Chat
-record's `SessionState []byte` field (§6); before the next run, it deserializes and passes it via
-`agent.WithSession(session)`. One write/read path covers approvals and todos together (FR14).
-(Post-v0.1.0: this blob was also where `agentmode`'s mode state lived, under its own
-`"agentModeState"` key — see §3.8's addendum on why that's superseded and why an old chat's
-now-orphaned key is harmless.)
+`encoding/json`, so that it can be saved in a persistent store."* `todo` stores its state via
+`session.Get`/`session.Set` under its own key in that one `Session` — it doesn't expose a separate
+store hook of its own. So the integration point is a single one: after each `Agent.Run`,
+`impl/harness` serializes the `*agent.Session` (`json.Marshal`) onto the Chat record's
+`SessionState []byte` field (§6); before the next run, it deserializes and passes it via
+`agent.WithSession(session)` (FR14). (Post-v0.1.0: this blob was also where `agentmode`'s mode
+state lived, under its own `"agentModeState"` key — see §3.8's addendum on why that's superseded
+and why an old chat's now-orphaned key is harmless; it was also where `toolapproval`'s standing
+"always allow" rules lived, before §3.6's addendum removed approval-gating entirely — an old
+chat's now-orphaned rule state is equally harmless, nothing reads that key anymore either.)
 
-**Bugfix addendum (post-v0.1.0), found in the same investigation as §3.6's two approval bugs but
-distinct from both:** a real user report — a chat resumed via `--continue` showed one typed message
-duplicated up to 8 times in the rendered transcript. Root cause is the same underlying framework
-behavior §3.6's `harness.RemoveOrphanedApprovalRequests` addendum documents: `toolapproval`'s
-internal auto-approval loop makes one complete, independent `invoke()` round trip — including its
-own `ChatHistoryProvider.Invoked` persist call — per newly-issued tool call within a *single* outer
-turn, and resends the exact same `*message.Message` objects (the turn's actual new messages, e.g.
-the user's own typed text) unchanged on every one of those internal rounds. `Invoked`'s existing
-`SourceTypeHistoryProvider` filter only recognizes content loaded by *that same round's own*
-`Invoking` call as "already history" — it has no way to know a message was already persisted by an
-*earlier* round of the *same* turn, so it re-appends and re-persists it every time.
+**Bugfix addendum (post-v0.1.0), now largely historical:** a real user report — a chat resumed via
+`--continue` showed one typed message duplicated up to 8 times in the rendered transcript. Root
+cause was `toolapproval`'s internal auto-approval loop (removed entirely per §3.6's addendum, so
+this specific trigger can no longer occur): it made one complete, independent `invoke()` round
+trip — including its own `ChatHistoryProvider.Invoked` persist call — per newly-issued tool call
+within a *single* outer turn, resending the exact same `*message.Message` objects (the turn's
+actual new messages, e.g. the user's own typed text) unchanged on every one of those internal
+rounds. `Invoked`'s `SourceTypeHistoryProvider` filter only recognizes content loaded by *that same
+round's own* `Invoking` call as "already history," so it re-appended and re-persisted the same
+message every time.
 
-Fixed by giving `ChatHistoryProvider` per-instance state: a `persistedThisTurn
-map[*message.Message]bool`, keyed by pointer identity (not content — the user typing the same words
-twice in two genuinely separate turns must never be deduplicated against each other; pointer
-identity can only match when the framework hands back the literal same Go object). This is safe to
-scope to the instance itself specifically because one `ChatHistoryProvider` is constructed fresh per
-outer turn (`impl/harness.Build`, called once per `AgentService.RunMessages`/`RunMessagesStream`
-call) and reused for that turn's entire `a.Run` duration, including every internal `toolapproval`
-round — exactly the lifetime the dedup needs, no more and no less.
+The fix — `ChatHistoryProvider` tracking a `persistedThisTurn map[*message.Message]bool`, keyed by
+pointer identity, scoped to one instance's lifetime (one outer turn) — is kept as a general-purpose
+safeguard even though its original trigger is gone: nothing else currently re-invokes `a.invoke`
+more than once per outer `a.Run` call, but the dedup is cheap and correct regardless of what
+(if anything) does so in the future.
 
 ### 3.10 Structured output, observability
 
@@ -758,7 +706,6 @@ shares:
 The only frontend in v1 (Requirements §5). Existing aiagent TUI concepts (chat view, streaming
 response rendering) port over consuming `agent.ResponseStream`. New/changed:
 
-- Approval-prompt component: one-off vs. always-allow (§3.6).
 - Live todo panel (§3.7).
 - Agent picker sourced from `agentsource` (§3.11) instead of a database-backed agent list.
 - No web UI, no `ui/` package, no WebSocket streaming — deferred (Requirements §5). When it comes
@@ -774,9 +721,7 @@ screen — neither ends the chat or clears its history; only `Chat.AgentName`/`C
 change, and `buildTopLevelAgent` already re-resolves both fresh on every turn, so the very next
 message is driven by the switched agent/model with the full prior transcript intact. Both
 keybindings are no-ops while a turn is actively streaming, the same guard `enter` (sending a
-message) already applies — §3.6's addendum removed the separate "tool-approval prompt pending"
-no-op case entirely, since approval is now auto-answered before the user ever gets a chance to
-press anything. The sidebar gained `Agent: ...` and
+message) already applies. The sidebar gained `Agent: ...` and
 `Model: ...` lines, each with its own `(ctrl+x to switch)` hint. (Post-v0.1.0: a third `Mode: ...`
 line with a `ctrl+p` hint lived here too, before §3.8's addendum superseded it — the sidebar now
 shows only Agent/Model plus the live todo panel.)
@@ -788,10 +733,10 @@ there is only one ID-generation scheme) bound to the *current* chat's agent (`ch
 `ctrl+a` already handles picking a different agent for the new chat in-place, so `ctrl+n` doesn't
 force the top-level picker screen). It reuses the existing `chatStartedMsg`/`Model.Update` path a
 fresh pick from the picker screen already produces — `Model.Update` discards the old `*chatModel`
-entirely and constructs a brand-new one via `newChatModel`, so transcript/streaming/pending-approval
-reset to zero values and todos/model are seeded fresh from the new, empty chat, with no second,
-hand-rolled "reset in place" code path to keep in sync with that one. Guarded the same way
-`ctrl+a`/`ctrl+o` are: a no-op while a turn is actively streaming or a tool approval is pending.
+entirely and constructs a brand-new one via `newChatModel`, so transcript/streaming reset to zero
+values and todos/model are seeded fresh from the new, empty chat, with no second, hand-rolled
+"reset in place" code path to keep in sync with that one. Guarded the same way `ctrl+a`/`ctrl+o`
+are: a no-op while a turn is actively streaming.
 
 Also addendum (post-v0.1.0): `ctrl+s` opens a read-only skills-browser overlay — see §3.11's own
 addendum for the full three-level skill design this exposes.
@@ -841,8 +786,8 @@ turn's lifecycle.
 - **A spinner shows while a turn is in flight.** `chatModel.spinner` (`bubbles/spinner`, already a
   sub-package of the already-required `bubbles` module — no new `go.mod` entry) replaces the
   composer in `View` while `streamActive`, alongside an "esc to cancel" hint. Ticking it required
-  `tea.Batch(startTurnCmd(...), spinner.Tick)` at the two real interactive entry points
-  (`handleKey`'s `"enter"` case, `respondApproval`) — deliberately *not* inside `startTurnCmd`
+  `tea.Batch(startTurnCmd(...), spinner.Tick)` at the real interactive entry point
+  (`handleKey`'s `"enter"` case) — deliberately *not* inside `startTurnCmd`
   itself, since `stream_leak_test.go`/`mcp_stream_test.go` call `startTurnCmd` directly and feed its
   result into `drainCmd`, a hand-rolled synchronous test harness that didn't originally understand
   `tea.BatchMsg`; `drainCmd` was taught to unwrap one level of batch (run every sub-`Cmd`, keep
@@ -895,9 +840,8 @@ its full prior transcript, not just started fresh.
   produces, with a new `messages []*message.Message` field populated. `Model.Update`'s existing
   `chatStartedMsg` case reconstructs `transcript` from it (`reconstructTranscript`, chat.go) —
   only user/assistant messages with non-empty rendered text, deliberately not reconstructing
-  historical tool-call/approval-prompt formatting (a resumed chat mid-tool-call isn't a supported
-  scenario; the pending approval itself doesn't survive a restart either, per §3.9's session-state
-  contract). One function, three callers: `Model.Init` (`--continue`), the top-level `screenHistory`
+  historical tool-call formatting (a resumed chat mid-tool-call isn't a supported scenario). One
+  function, three callers: `Model.Init` (`--continue`), the top-level `screenHistory`
   screen, and `chatModel`'s in-chat `pickerHistory` overlay — resuming is identical regardless of
   entry point. Deliberate scope cut: resuming does *not* call `RecordLastAgent` (no natural
   "this agent is now active" hook the way `StartChat`/`SetAgent` already have one) — a restart's
@@ -1047,14 +991,15 @@ dispatched subagent has no `Chat` of its own to read one from in the first place
 ## 7. Testing strategy
 
 - Unit tests per service with `testify`.
-- Tool contract tests: every built-in tool satisfies `tool.FuncTool`; approval-gated ones report
-  `ApprovalRequired() == true`.
+- Tool contract tests: every built-in tool satisfies `tool.FuncTool`; none implement
+  `tool.ApprovalRequiredTool` (or, if one does by framework default, reports
+  `ApprovalRequired() == false`) — approval-gating must stay off, not just absent by omission (§3.6).
 - Compaction tests: configured `Trigger`s fire at the right threshold; a `PipelineStrategy` run
   doesn't drop messages needed for task continuity.
-- Session-state round-trip test: `Chat.SessionState` serialize/deserialize, asserting a standing
-  approval `Rule` and in-progress todo items survive a simulated restart together. (Post-v0.1.0:
-  also asserts an old chat's orphaned `agentModeState` key from before §3.8's addendum round-trips
-  harmlessly, not just that current state survives.)
+- Session-state round-trip test: `Chat.SessionState` serialize/deserialize, asserting in-progress
+  todo items survive a simulated restart. (Post-v0.1.0: also asserts an old chat's orphaned
+  `agentModeState` key from before §3.8's addendum round-trips harmlessly, not just that current
+  state survives.)
 - **File-format loader tests (new emphasis in this revision)** — `agentsource`, `mcpsource`,
   `skillsource`, `projectcontext` are Canopy's own code, the most likely place for
   compatibility bugs against Claude Code's format: fixture-based tests using real example

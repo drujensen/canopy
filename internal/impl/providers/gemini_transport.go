@@ -12,18 +12,11 @@ package providers
 // "" with "geminiprovider: missing function name for result with call ID
 // \"\"".
 //
-// domain/services.withReconstructedApprovalFunctionCalls already works
-// around this for the *cross-turn* case (a user answering a pending
-// *message.ToolApprovalRequestContent* from a prior RunMessages/
-// RunMessagesStream call), by patching the []*message.Message list Canopy's
-// own application code hands to a.Run. That approach has no reach into
-// agent/harness/toolautocall's *same-turn*, non-approval-gated auto-call
-// loop: for every core tool that isn't Bash/FileWrite/MCP-provided (FileRead,
-// FileSearch, DirectoryList, WebFetch, WebSearch, Skill), toolautocall
-// invokes the tool and feeds the result back to the provider entirely inside
-// one call to a.Run — Canopy's RunMessages/RunMessagesStream never sees the
-// intermediate messages that loop constructs, so there is no []*message.Message
-// hook to patch before the fact.
+// agent/harness/toolautocall's auto-call loop invokes the tool and feeds the
+// result back to the provider entirely inside one call to a.Run, so
+// Canopy's RunMessages/RunMessagesStream never sees the intermediate
+// messages that loop constructs — there is no []*message.Message hook in
+// application code to patch a missing CallID after the fact.
 //
 // The fix here operates one layer lower: a custom http.RoundTripper, wired
 // into newGemini's *genai.ClientConfig via HTTPClient, inspects every
@@ -32,10 +25,9 @@ package providers
 // genai's own decoder (api_client.go's deserializeUnaryResponse/
 // deserializeStreamResponse) ever parses it. Because this runs underneath
 // genai's decoding entirely, every *message.FunctionCallContent Canopy's own
-// code (including toolautocall's same-turn loop, which this transport can't
-// otherwise reach) ever sees already has a non-empty CallID by construction —
-// see newGemini's doc comment for what this means for
-// withReconstructedApprovalFunctionCalls' own empty-CallID branch.
+// code (including toolautocall's same-turn loop, which nothing in
+// application code can otherwise reach) ever sees already has a non-empty
+// CallID by construction.
 
 import (
 	"bufio"
@@ -50,10 +42,8 @@ import (
 )
 
 // geminiFunctionCallIDPrefix names every synthetic ID this transport mints,
-// distinct from withReconstructedApprovalFunctionCalls' own
-// "canopy-synth-%d" prefix (domain/services/agent_service.go) so a synthetic
-// ID's origin is unambiguous if it ever shows up in a log or a captured
-// request body during debugging.
+// so a synthetic ID's origin is unambiguous if it ever shows up in a log or
+// a captured request body during debugging.
 const geminiFunctionCallIDPrefix = "canopy-transport-fc-"
 
 // newGeminiFunctionCallIDPatchingTransport wraps base (following

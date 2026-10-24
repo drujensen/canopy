@@ -1,8 +1,7 @@
 // Package tools implements Canopy's narrow, Claude-Code-comparable built-in
 // tool set (docs/DESIGN.md §3.2): bash/shell, file read/write/search,
 // directory listing, web search, and web fetch. Each tool is a
-// tool.FuncTool; mutating tools (bash, file write) are approval-gated via
-// tool.ApprovalRequiredFunc per docs/REQUIREMENTS.md FR5.
+// tool.FuncTool; none are approval-gated.
 package tools
 
 import (

@@ -113,17 +113,13 @@ func drainCmdWithTimeout(t *testing.T, c *chatModel, svc *services.AgentService,
 	}
 }
 
-// TestChatModel_MCPTool_AutoApprovedExecutesToolAndCompletes drives the real
+// TestChatModel_MCPTool_ExecutesToolAndCompletes drives the real
 // chatModel.startTurnCmd -> startTurn -> AgentService.RunMessagesStream path
 // (exactly what a live keypress in the TUI does) with a real, connected MCP
-// tool the fake provider requests, asserting the resulting
-// ToolApprovalRequestContent actually reaches chatModel's state and gets
-// auto-answered (post-v0.1.0 addendum: no prompt ever blocks here anymore —
-// see chat.go's pendingApprovals/sendAutoApprovals) — the real MCP tool Call
-// (a real network round trip to the httptest-backed MCP server) executes,
-// and the turn completes with the follow-up model response folded into the
-// transcript, with no approval decision left pending.
-func TestChatModel_MCPTool_AutoApprovedExecutesToolAndCompletes(t *testing.T) {
+// tool the fake provider requests: the tool executes directly (no
+// approval round trip), and the turn completes with the follow-up model
+// response folded into the transcript.
+func TestChatModel_MCPTool_ExecutesToolAndCompletes(t *testing.T) {
 	svc := newMCPTestService(t)
 	ctx := context.Background()
 	_, err := svc.StartChat(ctx, "chat-1", "assistant")
@@ -133,8 +129,6 @@ func TestChatModel_MCPTool_AutoApprovedExecutesToolAndCompletes(t *testing.T) {
 
 	drainCmdWithTimeout(t, c, svc, ctx, c.startTurnCmd(svc, ctx, []*message.Message{message.NewText("please use the echo tool to say hi")}), 10*time.Second)
 
-	require.Empty(t, c.pendingApprovals, "the MCP tool's approval request must have been auto-answered, through the full chatModel/stream.go path")
-	require.NotContains(t, c.View(80, 24), "Tool approval requested", "no blocking prompt should ever render")
 	require.Len(t, c.transcript, 1)
 	require.Contains(t, c.transcript[0].text, "done")
 }
@@ -244,9 +238,8 @@ func TestRealProgram_MCPTool_AsyncRuntime(t *testing.T) {
 	p.Send(tea.KeyMsg{Type: tea.KeyEnter})
 
 	// Give the real async runtime time to run both fake HTTP round trips
-	// (the initial request, then the auto-approval follow-up turn
-	// sendAutoApprovals starts automatically — post-v0.1.0 addendum, no
-	// prompt or keypress needed) and process the resulting
+	// (the tool-call request, then toolautocall's own follow-up call once
+	// the tool has executed) and process the resulting
 	// streamChunkMsg/streamDoneMsg events. There's no direct read access to
 	// the live model without racing the Update goroutine, so this just
 	// waits a fixed window — generous relative to the fake provider's
@@ -263,8 +256,7 @@ func TestRealProgram_MCPTool_AsyncRuntime(t *testing.T) {
 		finalModel, ok := res.model.(Model)
 		require.True(t, ok)
 		require.NotNil(t, finalModel.chat, "chat must still be set on the final model")
-		require.Empty(t, finalModel.chat.pendingApprovals, "the real async tea.Program runtime must have auto-answered the MCP tool's approval request, matching the synchronous drainCmd tests above")
-		require.NotEmpty(t, finalModel.chat.transcript, "the auto-approved follow-up turn must have completed and folded a reply into the transcript")
+		require.NotEmpty(t, finalModel.chat.transcript, "the tool call must have completed and folded a reply into the transcript")
 	case <-time.After(15 * time.Second):
 		t.Fatal("tea.Program.Run() never returned after Quit — reproduces the live hang under the real async runtime")
 	}

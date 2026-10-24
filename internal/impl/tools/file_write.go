@@ -30,10 +30,11 @@ type FileWriteOutput struct {
 }
 
 // NewFileWriteTool builds Canopy's file-write tool (docs/DESIGN.md §3.2 row
-// 3). Approval-gated via tool.ApprovalRequiredFunc per docs/REQUIREMENTS.md
-// FR5 — writing mutates the filesystem. Creates missing parent directories
-// so the model doesn't need a separate "make directory" tool call, mirroring
-// Claude Code's Write tool behavior.
+// 3). Creates missing parent directories so the model doesn't need a
+// separate "make directory" tool call, mirroring Claude Code's Write tool
+// behavior. Not approval-gated — approval-gating was removed (it only ever
+// auto-approved silently, adding an extra round trip and the risk of
+// malformed-history bugs with no actual safety benefit).
 func NewFileWriteTool(cfg FileWriteConfig) tool.FuncTool {
 	base := functool.MustNew(functool.Config{
 		Name:        "file_write",
@@ -54,5 +55,5 @@ func NewFileWriteTool(cfg FileWriteConfig) tool.FuncTool {
 
 		return FileWriteOutput{BytesWritten: len(in.Content), Path: in.Path}, nil
 	})
-	return tool.ApprovalRequiredFunc(base)
+	return base
 }

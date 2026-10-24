@@ -3,16 +3,12 @@ package services
 import (
 	"context"
 	"encoding/json"
-	"fmt"
 	"net/http"
 	"net/http/httptest"
-	"os"
-	"path/filepath"
 	"sync/atomic"
 	"testing"
 
 	"github.com/microsoft/agent-framework-go/agent"
-	"github.com/microsoft/agent-framework-go/message"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -120,32 +116,24 @@ func TestAgentService_RunMessagesStream_FinalizeBeforeDrainErrors(t *testing.T) 
 // TestAgentService_RunMessagesStream_PersistsSessionIdenticallyToRunMessages
 // is this phase's key claim about the streaming gap resolution: the
 // streaming entry point must not diverge from RunMessages' persistence
-// behavior (Design §3.9, Requirements FR14). It reuses the exact
-// approval-gated-tool scenario TestAgentService_Approvals_AlwaysApprove_
-// PersistsAcrossRestart (phase5_test.go) proves for the non-streaming path,
-// but drives turns 1 and 2 through the *streaming* entry points
-// (RunTextStream/RunMessagesStream) instead, then confirms the standing
-// "always approve" rule they persisted is visible to a brand-new
-// AgentService (simulating a process restart) driven through the
-// *non-streaming* RunText — cross-checking that both entry points read and
-// write the identical persisted session-state shape.
+// behavior (Design §3.9, Requirements FR14). Drives a turn that adds a todo
+// item through the *streaming* entry point (RunTextStream), then confirms
+// that todo is visible to a brand-new AgentService (simulating a process
+// restart) via GetTodos, which reads directly from persisted
+// SessionState — cross-checking that both entry points read and write the
+// identical persisted session-state shape, mirroring
+// TestAgentService_Todos_PersistAcrossRestart's non-streaming claim
+// (phase5_test.go) for the streaming path instead.
 func TestAgentService_RunMessagesStream_PersistsSessionIdenticallyToRunMessages(t *testing.T) {
-	workDir := t.TempDir()
-	marker := filepath.Join(workDir, "marker.txt")
-
 	var callCount int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		n := atomic.AddInt32(&callCount, 1)
 		w.Header().Set("Content-Type", "application/json")
-		if n%2 == 1 {
-			args, err := json.Marshal(map[string]string{
-				"command": fmt.Sprintf("echo run-%d >> %s", n, marker),
-			})
-			require.NoError(t, err)
-			_ = json.NewEncoder(w).Encode(toolCallChatCompletionResponse(fmt.Sprintf("call-%d", n), "run_shell", string(args)))
+		if n == 1 {
+			_ = json.NewEncoder(w).Encode(toolCallChatCompletionResponse("call-1", "todos_add", `{"Arg0":[{"title":"Write the report"}]}`))
 			return
 		}
-		_ = json.NewEncoder(w).Encode(chatCompletionResponse("ok"))
+		_ = json.NewEncoder(w).Encode(chatCompletionResponse("added it"))
 	}))
 	t.Cleanup(server.Close)
 
@@ -166,7 +154,7 @@ func TestAgentService_RunMessagesStream_PersistsSessionIdenticallyToRunMessages(
 			Models:       []entities.ModelConfig{model},
 			DefaultModel: model.Name,
 			Repository:   repo,
-			Tools:        ToolsConfig{WorkingRoot: workDir},
+			Tools:        ToolsConfig{WorkingRoot: t.TempDir()},
 		})
 	}
 
@@ -175,57 +163,23 @@ func TestAgentService_RunMessagesStream_PersistsSessionIdenticallyToRunMessages(
 	_, err = svc.StartChat(ctx, "chat-1", "assistant")
 	require.NoError(t, err)
 
-	// Turn 1, via the streaming entry point: the model asks to run the
-	// marker command. Drain the stream, then finalize.
-	stream1, finalize1, err := svc.RunTextStream(ctx, "chat-1", "please run the marker command")
+	// Via the streaming entry point: the model adds a todo item. Drain the
+	// stream, then finalize.
+	stream, finalize, err := svc.RunTextStream(ctx, "chat-1", "please track this task for me")
 	require.NoError(t, err)
-	updates1 := drainStream(t, stream1)
-	result1, err := finalize1()
+	drainStream(t, stream)
+	result, err := finalize()
 	require.NoError(t, err)
+	require.Len(t, result.Todos, 1)
+	assert.Equal(t, "Write the report", result.Todos[0].Title)
 
-	_, statErr := os.Stat(marker)
-	assert.True(t, os.IsNotExist(statErr), "bash must not execute before approval is granted")
-
-	var approvalReq *message.ToolApprovalRequestContent
-	for _, u := range updates1 {
-		for _, c := range u.Contents {
-			if req, ok := c.(*message.ToolApprovalRequestContent); ok {
-				approvalReq = req
-			}
-		}
-	}
-	require.NotNil(t, approvalReq, "an approval request must have been surfaced in the streamed updates")
-	// The finalized Response must carry the same approval request the
-	// streamed updates did, matching RunMessages' non-streaming contract.
-	require.NotNil(t, findApprovalRequest(t, result1.Response.Messages[len(result1.Response.Messages)-1]))
-
-	// Turn 2, also via the streaming entry point: respond with "always
-	// approve this tool".
-	approvalMsg := &message.Message{
-		Role:     message.RoleUser,
-		Contents: []message.Content{approvalReq.AlwaysApproveToolResponse()},
-	}
-	stream2, finalize2, err := svc.RunMessagesStream(ctx, "chat-1", []*message.Message{approvalMsg})
-	require.NoError(t, err)
-	drainStream(t, stream2)
-	_, err = finalize2()
-	require.NoError(t, err)
-
-	_, statErr = os.Stat(marker)
-	require.NoError(t, statErr, "bash should have executed once approval was granted via the streaming entry point")
-
-	// Simulate a process restart, then drive the follow-up turn through the
-	// *non-streaming* RunText, cross-checking that the streaming path's
-	// persisted session state is read identically by the non-streaming path.
-	require.NoError(t, os.Remove(marker))
+	// Simulate a process restart, then read the todo back through a
+	// brand-new AgentService that only shares the persisted ChatRepository
+	// — cross-checking that the streaming path's persisted session state is
+	// read identically to the non-streaming path's own persistence.
 	restarted := newSvc()
-
-	result3, err := restarted.RunText(ctx, "chat-1", "please run the marker command again")
+	todos, err := restarted.GetTodos(ctx, "chat-1")
 	require.NoError(t, err)
-
-	for _, m := range result3.Response.Messages {
-		assert.Nil(t, findApprovalRequest(t, m), "a standing 'always approve' rule persisted via the streaming entry point must auto-approve without re-prompting after a restart, even when read back through the non-streaming entry point")
-	}
-	_, statErr = os.Stat(marker)
-	assert.NoError(t, statErr, "the standing approval rule persisted via streaming must have let the tool execute again automatically after the restart")
+	require.Len(t, todos, 1)
+	assert.Equal(t, "Write the report", todos[0].Title, "a todo added via the streaming entry point must persist identically to the non-streaming path")
 }

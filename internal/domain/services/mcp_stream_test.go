@@ -119,7 +119,8 @@ func runWithTimeout(t *testing.T, d time.Duration, fn func()) {
 // tool, driven through AgentService.RunMessagesStream — the exact code path
 // internal/tui/stream.go's startTurn uses — must actually complete (drain
 // the stream, then finalize) within a short deadline instead of hanging or
-// silently swallowing an error.
+// silently swallowing an error. The MCP tool is not approval-gated, so the
+// call executes directly within this one turn.
 func TestRunMessagesStream_MCPTool_ToolCalled(t *testing.T) {
 	var callCount int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -161,23 +162,8 @@ func TestRunMessagesStream_MCPTool_ToolCalled(t *testing.T) {
 		require.NoError(t, err)
 		require.NotNil(t, result)
 		t.Logf("final response: %q", result.Response.String())
-		for _, m := range result.Response.Messages {
-			for _, c := range m.Contents {
-				t.Logf("content: %T %+v", c, c)
-			}
-		}
-		// The MCP-provided echo tool is always approval-required
-		// (mcpclient.Connect wraps every MCP tool with
-		// tool.ApprovalRequiredFunc), so a single turn requesting it must
-		// surface a ToolApprovalRequestContent, not silently execute it.
-		require.NotNil(t, findApprovalRequest(t, lastMessage(t, result.Response)), "an approval request must have been surfaced for the MCP tool call")
+		assert.Contains(t, result.Response.String(), "done", "the turn must complete after the tool executes directly, with no approval round trip")
 	})
-}
-
-func lastMessage(t *testing.T, resp *agent.Response) *message.Message {
-	t.Helper()
-	require.NotEmpty(t, resp.Messages)
-	return resp.Messages[len(resp.Messages)-1]
 }
 
 // TestRunMessagesStream_MCPTool_NotCalled isolates whether merely *having* an
@@ -308,41 +294,19 @@ func TestRunMessagesStream_MCPTool_Gemini_ToolCalled(t *testing.T) {
 				t.Logf("content: %T %+v", c, c)
 			}
 		}
-		require.NotNil(t, findApprovalRequest(t, lastMessage(t, result.Response)), "an approval request must have been surfaced for the MCP tool call")
+		assert.Contains(t, result.Response.String(), "done", "the turn must complete after the tool executes directly, with no approval round trip")
 	})
 }
 
-// TestRunMessagesStream_MCPTool_Gemini_ApproveThenContinue_ActuallyCallsTheTool
-// is the regression test for this task's actual root cause: a confirmed bug
-// in agent-framework-go's agent/harness/toolautocall package (see
-// withReconstructedApprovalFunctionCalls's doc comment in agent_service.go
-// for the full mechanism and evidence) where the second turn answering a
-// pending tool approval never resends the assistant's original
-// *message.FunctionCallContent to the provider — only the tool result. Every
-// provider's wire protocol expects a tool-result message to follow a
-// matching assistant tool-call message; Gemini's provider additionally does
-// its own client-side validation (buildRequestParts's callIDToName scan)
-// before ever making a network call, so it fails immediately with
-// "geminiprovider: missing function name for result with call ID ..." —
-// verified by capturing this exact error from this test before
-// AgentService.RunMessages/RunMessagesStream gained the
-// withReconstructedApprovalFunctionCalls workaround. Since every MCP tool is
-// unconditionally approval-required (mcpclient.Connect's own doc comment),
-// this made every MCP tool completely unusable with the Gemini provider the
-// moment a pending approval was answered — not a hang, but a turn that,
-// through the real Gemini API's stricter validation, would have surfaced
-// this error to the user (this test's earlier sibling tests, which only
-// exercise turn 1's approval *request*, could never catch it).
-//
-// This test drives the full two-turn flow — request the MCP tool, approve
-// it, and continue — through the real RunMessagesStream code path
-// internal/tui/stream.go uses, against a fake Gemini backend that performs
-// the actual real tool call (over HTTP to a real MCP server, not a stub),
-// and additionally inspects the raw second request body to assert the
-// reconstructed assistant function-call message is actually present —
-// guarding against a regression that only "happens not to error" without
-// actually sending a well-formed request.
-func TestRunMessagesStream_MCPTool_Gemini_ApproveThenContinue_ActuallyCallsTheTool(t *testing.T) {
+// TestRunMessagesStream_MCPTool_Gemini_SendsWellFormedFollowUpRequest asserts
+// toolautocall's own follow-up request (the second HTTP call it makes after
+// actually executing the tool, within this one turn) is well-formed:
+// Gemini's provider does its own client-side validation (buildRequestParts's
+// callIDToName scan) before ever making a network call, failing immediately
+// with "geminiprovider: missing function name for result with call ID ..."
+// if the assistant's functionCall part is missing — this guards against that
+// regression by inspecting the raw second request body.
+func TestRunMessagesStream_MCPTool_Gemini_SendsWellFormedFollowUpRequest(t *testing.T) {
 	var callCount int32
 	var secondRequestBody []byte
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -368,33 +332,16 @@ func TestRunMessagesStream_MCPTool_Gemini_ApproveThenContinue_ActuallyCallsTheTo
 	require.NoError(t, err)
 
 	runWithTimeout(t, 10*time.Second, func() {
-		// Turn 1: request the tool, get an approval prompt.
-		result1, err := drainStreamForTest(t, svc, ctx, "chat-1", []*message.Message{message.NewText("please echo hi")})
-		require.NoError(t, err)
-		approvalReq := findApprovalRequest(t, lastMessage(t, result1.Response))
-		require.NotNil(t, approvalReq, "turn 1 must surface an approval request for the MCP tool call")
+		result, err := drainStreamForTest(t, svc, ctx, "chat-1", []*message.Message{message.NewText("please echo hi")})
+		require.NoError(t, err, "the tool call and its follow-up completion must not fail")
+		require.NotNil(t, result)
+		assert.Contains(t, result.Response.String(), "done")
 
-		// Turn 2: approve it and continue — this is the turn that failed
-		// before withReconstructedApprovalFunctionCalls existed.
-		approvalMsg := &message.Message{
-			Role:     message.RoleUser,
-			Contents: []message.Content{approvalReq.CreateResponse(true, "")},
-		}
-		result2, err := drainStreamForTest(t, svc, ctx, "chat-1", []*message.Message{approvalMsg})
-		require.NoError(t, err, "approving the MCP tool call and continuing must not fail")
-		require.NotNil(t, result2)
-		assert.Contains(t, result2.Response.String(), "done")
-
-		require.NotEmpty(t, secondRequestBody, "the second turn must have actually reached the fake Gemini backend")
-		var req map[string]any
-		require.NoError(t, json.Unmarshal(secondRequestBody, &req))
+		require.NotEmpty(t, secondRequestBody, "the follow-up request must have actually reached the fake Gemini backend")
 		assert.Contains(t, string(secondRequestBody), `"functionCall"`,
-			"the second request must include the reconstructed assistant function-call part, "+
-				"not just the tool result — this is exactly what agent-framework-go's toolautocall "+
-				"bug drops")
+			"the follow-up request must include the assistant's function-call part, not just the tool result")
 		assert.Contains(t, string(secondRequestBody), `"name":"echo"`,
-			"the reconstructed function call must name the tool, matching what Gemini's own "+
-				"FunctionResponse requires")
+			"the function call must name the tool, matching what Gemini's own FunctionResponse requires")
 	})
 }
 
@@ -443,67 +390,17 @@ func TestRunMessages_MCPTool_ToolCalled(t *testing.T) {
 	runWithTimeout(t, 10*time.Second, func() {
 		result, err := svc.RunText(ctx, "chat-1", "please echo hi")
 		require.NoError(t, err)
-		require.NotNil(t, findApprovalRequest(t, lastMessage(t, result.Response)), "an approval request must have been surfaced for the MCP tool call")
+		assert.Contains(t, result.Response.String(), "done", "the turn must complete after the tool executes directly, with no approval round trip")
 	})
 }
 
-// TestRunMessages_MCPTool_Gemini_ApproveThenContinue_ActuallyCallsTheTool is
-// TestRunMessagesStream_MCPTool_Gemini_ApproveThenContinue_ActuallyCallsTheTool's
-// non-streaming (RunMessages/RunText) counterpart — withReconstructedApprovalFunctionCalls
-// is applied in both RunMessages and RunMessagesStream (see agent_service.go),
-// so both entry points need their own regression coverage rather than
-// assuming one implies the other.
-func TestRunMessages_MCPTool_Gemini_ApproveThenContinue_ActuallyCallsTheTool(t *testing.T) {
-	var callCount int32
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		callCount++
-		w.Header().Set("Content-Type", "application/json")
-		if callCount == 1 {
-			_ = json.NewEncoder(w).Encode(geminiFunctionCallResponse("call-1", "echo", map[string]any{"message": "hi"}))
-			return
-		}
-		_ = json.NewEncoder(w).Encode(geminiTextResponse("done"))
-	}))
-	t.Cleanup(server.Close)
-
-	provider := entities.ProviderConfig{Name: "p", Type: entities.ProviderTypeGemini, APIKey: "test-key", BaseURL: server.URL}
-	model := entities.ModelConfig{Name: "m", Provider: provider.Name, ModelName: "gemini-test"}
-
-	svc, _ := newMCPBackedAgentService(t, provider, model)
-
-	ctx := context.Background()
-	_, err := svc.StartChat(ctx, "chat-1", "assistant")
-	require.NoError(t, err)
-
-	runWithTimeout(t, 10*time.Second, func() {
-		result1, err := svc.RunText(ctx, "chat-1", "please echo hi")
-		require.NoError(t, err)
-		approvalReq := findApprovalRequest(t, lastMessage(t, result1.Response))
-		require.NotNil(t, approvalReq)
-
-		approvalMsg := &message.Message{
-			Role:     message.RoleUser,
-			Contents: []message.Content{approvalReq.CreateResponse(true, "")},
-		}
-		result2, err := svc.RunMessages(ctx, "chat-1", []*message.Message{approvalMsg})
-		require.NoError(t, err, "approving the MCP tool call and continuing via RunMessages must not fail")
-		assert.Contains(t, result2.Response.String(), "done")
-	})
-}
-
-// TestRunMessagesStream_MCPTool_OpenAI_ApproveThenContinue_SendsWellFormedRequest
-// asserts the same withReconstructedApprovalFunctionCalls fix also restores
-// a well-formed request for the OpenAI provider: the second turn's request
+// TestRunMessagesStream_MCPTool_OpenAI_SendsWellFormedFollowUpRequest asserts
+// toolautocall's own follow-up request (the second HTTP call it makes after
+// actually executing the tool, within this one turn) is well-formed: it
 // must include an assistant message with matching "tool_calls" naming the
-// approved call, immediately preceding the "tool" role result message —
-// exactly what a real OpenAI Chat Completions API requires (a "tool" role
-// message must answer a preceding "tool_calls" message) but which
-// agent-framework-go's toolautocall silently dropped before this fix. The
-// existing OpenAI-backed approval tests in this package and
-// internal/tui/model_test.go never caught this because their fake HTTP
-// servers return a canned response unconditionally, without validating the
-// request shape the way this test (and a real OpenAI API) does.
-func TestRunMessagesStream_MCPTool_OpenAI_ApproveThenContinue_SendsWellFormedRequest(t *testing.T) {
+// call, immediately preceding the "tool" role result message — exactly what
+// a real OpenAI Chat Completions API requires.
+func TestRunMessagesStream_MCPTool_OpenAI_SendsWellFormedFollowUpRequest(t *testing.T) {
 	var callCount int32
 	var secondRequestBody []byte
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -529,18 +426,9 @@ func TestRunMessagesStream_MCPTool_OpenAI_ApproveThenContinue_SendsWellFormedReq
 	require.NoError(t, err)
 
 	runWithTimeout(t, 10*time.Second, func() {
-		result1, err := drainStreamForTest(t, svc, ctx, "chat-1", []*message.Message{message.NewText("please echo hi")})
+		result, err := drainStreamForTest(t, svc, ctx, "chat-1", []*message.Message{message.NewText("please echo hi")})
 		require.NoError(t, err)
-		approvalReq := findApprovalRequest(t, lastMessage(t, result1.Response))
-		require.NotNil(t, approvalReq)
-
-		approvalMsg := &message.Message{
-			Role:     message.RoleUser,
-			Contents: []message.Content{approvalReq.CreateResponse(true, "")},
-		}
-		result2, err := drainStreamForTest(t, svc, ctx, "chat-1", []*message.Message{approvalMsg})
-		require.NoError(t, err)
-		assert.Contains(t, result2.Response.String(), "done")
+		assert.Contains(t, result.Response.String(), "done")
 
 		require.NotEmpty(t, secondRequestBody)
 		var req map[string]any
@@ -563,8 +451,8 @@ func TestRunMessagesStream_MCPTool_OpenAI_ApproveThenContinue_SendsWellFormedReq
 				toolResultIdx = i
 			}
 		}
-		require.NotEqual(t, -1, toolCallsIdx, "the second request must include an assistant message with tool_calls — the exact message agent-framework-go's toolautocall bug drops")
-		require.NotEqual(t, -1, toolResultIdx, "the second request must include the tool-result message")
+		require.NotEqual(t, -1, toolCallsIdx, "the follow-up request must include an assistant message with tool_calls")
+		require.NotEqual(t, -1, toolResultIdx, "the follow-up request must include the tool-result message")
 		assert.Less(t, toolCallsIdx, toolResultIdx, "the assistant tool_calls message must precede the tool result message, matching OpenAI's own wire-protocol requirement")
 	})
 }

@@ -43,7 +43,7 @@ import (
 
 // newLeakTestService builds a real AgentService (JSON-backed repository in a
 // temp dir, one OpenAI-compatible provider pointed at an httptest server
-// running handler) — the same construction shape newApprovalTestService
+// running handler) — the same construction shape newBashToolTestService
 // (model_test.go) and newMCPTestService (mcp_stream_test.go) already use in
 // this package, factored out here so each leak test below can supply its
 // own handler shape while still explicitly controlling the server's

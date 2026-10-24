@@ -54,8 +54,7 @@ import (
 type Client struct {
 	// Name is the server's key from .mcp.json's mcpServers object.
 	Name string
-	// Tools are the tools this server exposed at connect time, each wrapped
-	// with tool.ApprovalRequiredFunc — see Connect's doc comment.
+	// Tools are the tools this server exposed at connect time.
 	Tools []tool.Tool
 
 	session *mcp.ClientSession
@@ -82,26 +81,11 @@ func (c *Client) Close() error {
 // subprocess's environment); http/sse connect to cfg.URL — and lists the
 // tools the server exposes.
 //
-// # Every MCP tool is wrapped as approval-required
-//
-// Design §3.2/Requirements FR5 approval-gate Canopy's own mutating built-ins
-// (Bash, FileWrite) individually, because Canopy wrote them and knows which
-// ones mutate. An MCP server's tools carry no such classification reaching
-// this code — a server can name a tool "list_files" or "delete_database" and
-// Canopy has no reliable way to tell which is safe from the name or JSON
-// schema alone. Requirements §7 is explicit that this needs a conservative
-// default: "MCP server configs are read, not auto-executed with elevated
-// trust — approval-gating (FR5) applies to MCP-provided mutating tools too."
-// So every MCP-provided tool.FuncTool returned here is unconditionally
-// wrapped with tool.ApprovalRequiredFunc, regardless of what the server
-// itself might claim about its own safety — treating "potentially mutating"
-// as the default assumption rather than trying to guess per tool. See
-// domain/services.AgentService's plan-mode handling for the matching
-// decision to withhold MCP tools entirely while planning, for the same
-// reason Bash/FileWrite are withheld outright rather than left merely
-// approval-gated (Design §3.8's mechanism: approval-gating alone doesn't
-// change plan mode's guarantee, since these tools are already
-// approval-gated in every mode).
+// MCP tools are not approval-gated (approval-gating was removed entirely —
+// it only ever auto-approved silently, adding an extra round trip and the
+// risk of malformed-history bugs with no actual safety benefit). See
+// domain/services.AgentService's plan-mode handling, which still withholds
+// MCP tools entirely while planning regardless of approval status.
 func Connect(ctx context.Context, cfg mcpsource.MCPServerConfig) (*Client, error) {
 	transport, err := buildTransport(cfg)
 	if err != nil {
@@ -131,7 +115,7 @@ func Connect(ctx context.Context, cfg mcpsource.MCPServerConfig) (*Client, error
 			_ = session.Close()
 			return nil, fmt.Errorf("MCP server %q: tool %q does not implement tool.FuncTool", cfg.Name, t.Name())
 		}
-		wrapped = append(wrapped, tool.ApprovalRequiredFunc(ft))
+		wrapped = append(wrapped, ft)
 	}
 
 	return &Client{Name: cfg.Name, Tools: wrapped, session: session}, nil

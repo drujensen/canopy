@@ -6,7 +6,6 @@ import (
 
 	"github.com/microsoft/agent-framework-go/agent"
 	"github.com/microsoft/agent-framework-go/agent/harness/todo"
-	"github.com/microsoft/agent-framework-go/agent/harness/toolapproval"
 
 	"github.com/drujensen/canopy/internal/domain/entities"
 	"github.com/drujensen/canopy/internal/domain/interfaces"
@@ -64,12 +63,12 @@ func Build(ctx context.Context, params BuildParams) (*agent.Agent, error) {
 	return providers.New(ctx, params.Provider, params.Model, cfg)
 }
 
-// WireLoopQuality attaches Phase 5's four loop-quality features to
+// WireLoopQuality attaches the loop-quality context providers to
 // params.Config and returns the resulting agent.Config, without touching
 // history or constructing anything provider-specific — split out from Build
-// so the exact middleware/context-provider composition it produces is
-// directly testable (see toolapproval_ordering_test.go) against a fake
-// agent.ProviderConfig.Run, without needing a real provider client.
+// so the exact context-provider composition it produces is directly
+// testable against a fake agent.ProviderConfig.Run, without needing a real
+// provider client.
 //
 //   - Compaction (Design §3.5/FR10): agent/compaction.NewContextProvider,
 //     appended to Config.ContextProviders.
@@ -78,27 +77,13 @@ func Build(ctx context.Context, params BuildParams) (*agent.Agent, error) {
 //     raw conversation before todo injects its own per-turn instructional
 //     messages — otherwise those freshly-injected messages could be
 //     immediately compacted away on the same turn they were added.
-//   - Approvals (Design §3.6/FR5): agent/harness/toolapproval.New, prepended
-//     to Config.Middlewares. It must land in Config.Middlewares (which wraps
-//     an agent's entire invoke lifecycle, including history/context
-//     providers) rather than ProviderConfig.Middlewares (which wraps only
-//     the provider Run call, and is where every per-provider constructor
-//     already places agent/harness/toolautocall per Design §3.3's own
-//     finding): toolautocall lives inside ProviderConfig.Middlewares, so
-//     placing toolapproval in Config.Middlewares makes it the outer
-//     wrapper — it sees (and can intercept) a tool-approval request
-//     toolautocall surfaces before that request ever reaches the caller,
-//     and it sees inbound approval-response messages before toolautocall
-//     gets a chance to process them itself. Getting this backwards (or
-//     placing toolapproval alongside toolautocall in
-//     ProviderConfig.Middlewares, which Canopy has no seam to do anyway —
-//     ProviderConfig.Middlewares is assembled inside each per-provider
-//     constructor, not caller-supplied) would mean toolapproval never
-//     actually gates anything. toolapproval_ordering_test.go proves this
-//     ordering empirically: a stub ApprovalRequiredTool's underlying action
-//     is asserted to NOT have run immediately after a turn that would
-//     otherwise have called it, then confirmed to run once approval is
-//     simulated.
+//
+// Approval-gating (agent/harness/toolapproval) was removed entirely: it only
+// ever auto-approved every request silently (no human ever saw a prompt),
+// so it added an extra provider round trip and the risk of malformed-history
+// bugs for no actual safety benefit. No tool in this codebase implements
+// tool.ApprovalRequiredTool anymore, so toolautocall never generates an
+// approval request in the first place.
 func WireLoopQuality(params BuildParams) agent.Config {
 	cfg := params.Config
 
@@ -106,8 +91,6 @@ func WireLoopQuality(params BuildParams) agent.Config {
 	if params.TodoProvider != nil {
 		cfg.ContextProviders = append(cfg.ContextProviders, params.TodoProvider)
 	}
-
-	cfg.Middlewares = append([]agent.Middleware{toolapproval.New(toolapproval.Config{})}, slices.Clone(cfg.Middlewares)...)
 
 	return cfg
 }

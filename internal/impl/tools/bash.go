@@ -22,8 +22,7 @@ type BashConfig struct {
 
 	// Policy is an optional allow/deny regex guardrail evaluated before a
 	// command reaches the shell. It is a UX guardrail, not a security
-	// boundary (see shelltool's package doc) — approval-gating below is the
-	// real control.
+	// boundary (see shelltool's package doc).
 	Policy *shelltool.Policy
 }
 
@@ -36,22 +35,24 @@ type BashConfig struct {
 // calls, which matches how Canopy invokes tools per-turn from potentially
 // concurrent sessions.
 //
-// The returned tool always reports ApprovalRequired() == true: it is
-// explicitly wrapped with tool.ApprovalRequiredFunc per docs/REQUIREMENTS.md
-// FR5, on top of shelltool's own default (AcknowledgeUnsafe is left false,
-// so shelltool would already require approval) — the explicit wrap documents
-// the requirement at the call site and keeps behavior correct even if
-// shelltool's default ever changes.
+// Approval-gating was removed (it only ever auto-approved silently, adding
+// an extra round trip and the risk of malformed-history bugs with no actual
+// safety benefit). AcknowledgeUnsafe: true opts out of shelltool's own
+// default approval-required gate (shelltool.Local.ApprovalRequired returns
+// !AcknowledgeUnsafe) — without this, shelltool itself still requires
+// approval regardless of Canopy's own wrapping, since that default is
+// independent of tool.ApprovalRequiredFunc.
 func NewBashTool(cfg BashConfig) (tool.FuncTool, error) {
 	local, err := shelltool.NewLocal(shelltool.LocalConfig{
-		Mode:             shelltool.ModeStateless,
-		WorkingDirectory: cfg.WorkingDirectory,
-		Timeout:          cfg.Timeout,
-		MaxOutputBytes:   cfg.MaxOutputBytes,
-		Policy:           cfg.Policy,
+		Mode:              shelltool.ModeStateless,
+		WorkingDirectory:  cfg.WorkingDirectory,
+		Timeout:           cfg.Timeout,
+		MaxOutputBytes:    cfg.MaxOutputBytes,
+		Policy:            cfg.Policy,
+		AcknowledgeUnsafe: true,
 	})
 	if err != nil {
 		return nil, err
 	}
-	return tool.ApprovalRequiredFunc(local), nil
+	return local, nil
 }

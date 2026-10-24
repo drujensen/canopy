@@ -76,25 +76,25 @@ type ChatHistoryProvider struct {
 	chatID     string
 	repository interfaces.ChatRepository
 
-	// persistedThisTurn deduplicates Invoked across agent/harness/
-	// toolapproval's internal auto-approval loop (Config.Middlewares'
-	// toolapproval.New — see harness.WireLoopQuality and
-	// RemoveOrphanedApprovalRequests' doc comment for the sibling bug found
-	// in the same area): that loop makes one complete, independent invoke()
-	// round trip — its own Invoking reload *and* its own Invoked persist —
-	// per newly-issued tool call, not one combined round trip for the whole
-	// outer turn. Its own *message.Message slice for the turn (the
-	// original new messages the caller passed to a.Run, e.g. the user's
-	// own new text message) is a single Go slice built once, reused
-	// unchanged across every one of those internal next() calls — so
-	// without deduplication, each internal round treats it as "new" all
-	// over again (Invoked's existing SourceTypeHistoryProvider filter only
-	// catches content loaded by *that same round's own* Invoking call, not
-	// content already persisted by an *earlier* round of the same turn),
-	// and Invoked re-appends and re-persists it every single time. A real
-	// user report confirmed this directly: a chat resumed via --continue
-	// showed one typed message duplicated up to 8 times, tracking the
-	// number of internal auto-approval rounds that turn happened to make.
+	// persistedThisTurn deduplicates Invoked in case anything ever causes
+	// a.invoke to run more than once for a single outer a.Run call within
+	// this provider's lifetime (one outer turn, per this type's own doc
+	// comment) — a real, previously-confirmed case was agent/harness/
+	// toolapproval's internal auto-approval loop, which made one complete,
+	// independent invoke() round trip (its own Invoking reload *and* its own
+	// Invoked persist) per newly-issued tool call rather than one combined
+	// round trip for the whole outer turn, resending the turn's own
+	// *message.Message slice unchanged across every internal round. That
+	// specific cause no longer applies (approval-gating, and therefore
+	// toolapproval, has been removed entirely — no tool in this codebase
+	// requires approval, so toolautocall never loops back into a.invoke this
+	// way), but the dedup itself is kept as a cheap, general-purpose
+	// safeguard: without it, any future middleware with the same
+	// re-invocation shape would silently re-persist the same message once
+	// per round (confirmed empirically before the fix: a chat resumed via
+	// --continue showed one typed message duplicated up to 8 times, tracking
+	// the number of internal auto-approval rounds that turn happened to
+	// make).
 	//
 	// Keyed by *message.Message pointer identity, not content: since the
 	// framework hands back the exact same Go objects across every internal
@@ -194,15 +194,6 @@ func (p *ChatHistoryProvider) Invoked(ctx context.Context, invoked agent.Invoked
 		chat.Messages = append(chat.Messages, m)
 	}
 	chat.UpdatedAt = time.Now().UTC()
-
-	// Repair on every single persist, not just once per outer turn — see
-	// RemoveOrphanedApprovalRequests' doc comment (approval_repair.go) for
-	// why toolapproval's internal auto-approval loop calls Invoked multiple
-	// times per turn, and why an orphan left behind by one of those internal
-	// calls has to be caught right here to stop a *later* internal call in
-	// the *same* turn from reloading it and failing before AgentService ever
-	// gets control back.
-	RemoveOrphanedApprovalRequests(chat)
 
 	if err := p.repository.Update(ctx, chat); err != nil {
 		return fmt.Errorf("chat history provider: updating chat %q: %w", p.chatID, err)

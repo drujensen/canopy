@@ -49,7 +49,9 @@ memory in this phase (Requirements §5) — if one of those turns out to be genu
 should show up as an MCP server in Phase 3.5, not a built-in here.
 
 **Exit criteria:** the seven core tools exist, pass contract tests, and are callable end-to-end by
-a test agent; approval-gating verified for bash and file-write.
+a test agent; approval-gating verified for bash and file-write. **Removed (post-v0.1.0):**
+approval-gating was tried and then removed entirely — see Phase 5's addendum below and
+DESIGN.md §3.6 for why. Bash and file-write execute directly like every other tool now.
 
 ## Phase 3.5 — Claude Code file-format compatibility layer
 
@@ -90,7 +92,15 @@ Give this real time — it's the phase that actually earns "as good as Claude Co
 - **Compaction (FR10):** `TokensExceed(N)`-triggered `PipelineStrategy` per agent; regression test
   against a long-conversation fixture for task continuity.
 - **Approvals (FR5):** wire `agent/harness/toolapproval`; persist `Rule` state via the
-  `Chat.SessionState` blob (Phase 1) so "always allow" survives a restart.
+  `Chat.SessionState` blob (Phase 1) so "always allow" survives a restart. **Removed
+  (post-v0.1.0): approval-gating is gone, not superseded by anything.** It added no real safety
+  value — the prompt itself had already been replaced by silent auto-approval of every request, so
+  no human was ever actually asked anything — while the approve-then-continue round trip was a
+  confirmed source of chat-corrupting bugs (orphaned tool-call content that some providers, e.g.
+  DeepSeek, rejected outright on a later turn, permanently breaking the chat). `toolapproval` is no
+  longer imported; `tool.ApprovalRequiredFunc` is not used anywhere. **Current policy: no tool call
+  is ever blocked on a human decision — do not reintroduce approval-gating.** See DESIGN.md §3.6's
+  addendum for the full rationale.
 - **Todo (FR11):** wire `agent/harness/todo`.
 - **Mode (FR12):** wire `agent/harness/agentmode` (default plan/execute); decide and implement how
   plan mode restricts mutating tools (Design §3.8's flagged open point). **Superseded
@@ -99,26 +109,32 @@ Give this real time — it's the phase that actually earns "as good as Claude Co
 
 **Exit criteria:** all four work end-to-end against a real provider: a session compacts under
 load, an approval rule persists across a process restart, a todo list updates as the agent works,
-a mode switch (agent- and user-initiated) changes tool availability.
+a mode switch (agent- and user-initiated) changes tool availability. (Post-v0.1.0: the approval
+leg of this criterion no longer applies — see the Approvals bullet's addendum above.)
 
 ## Phase 6 — TUI
 
 - Chat view consuming `ResponseStream` for incremental rendering.
-- Approval-prompt component, live todo panel, mode indicator/switcher (Design §5).
+- Approval-prompt component, live todo panel, mode indicator/switcher (Design §5). **Removed
+  (post-v0.1.0):** the approval-prompt component never actually shipped as a blocking prompt — see
+  Phase 5's addendum; approval-gating itself was later removed entirely.
 - Agent picker sourced from `agentsource`, not a database list.
-- Manual QA pass in a real terminal: multi-turn chat that triggers compaction, an approval-gated
-  tool call, a todo-tracked task, a mode switch, and at least one dynamic subagent dispatch.
+- Manual QA pass in a real terminal: multi-turn chat that triggers compaction, a tool call, a
+  todo-tracked task, a mode switch, and at least one dynamic subagent dispatch.
 
-**Exit criteria:** a full session — chat, approvals, todo, mode, subagent dispatch — works
-end-to-end in the TUI against a real provider.
+**Exit criteria:** a full session — chat, todo, mode, subagent dispatch — works end-to-end in the
+TUI against a real provider. (Post-v0.1.0: "approvals" dropped from this list — see Phase 5's
+addendum.)
 
 ## Phase 7 — Observability, security, packaging
 
 - `Config.Logger` → zap bridge finished; `provider/otelprovider` wired as optional (not required
   for v1 usage).
-- Security pass: no secrets in logs by default, bash/file input validation and approval-gating
-  re-verified, MCP-provided mutating tools respect approval-gating the same as built-ins, standing
-  "always allow" rules can't be tricked into covering a broader call than approved. Specifically
+- Security pass: no secrets in logs by default, bash/file input validation re-verified. (Post-v0.1.0:
+  the approval-gating re-verification this bullet originally described no longer applies —
+  approval-gating was removed entirely; see Phase 5's addendum. Bash/file/MCP tools execute
+  directly on the model's request, same as every other tool — input validation is the real
+  control, not a confirmation step.) Specifically
   revisit `internal/impl/tools/web_fetch.go`: it currently allows fetching any http(s) URL,
   including internal/link-local addresses (e.g. cloud metadata endpoints, localhost) — decide
   whether to add an IP-range denylist before this ships, flagged during Phase 3 review.

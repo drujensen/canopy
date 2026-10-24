@@ -105,9 +105,9 @@ func TestConnect_Stdio_RealSubprocess(t *testing.T) {
 	echoTool := client.Tools[0]
 	assert.Equal(t, "echo", echoTool.Name())
 
-	approval, ok := echoTool.(tool.ApprovalRequiredTool)
-	require.True(t, ok, "MCP tools must implement tool.ApprovalRequiredTool")
-	assert.True(t, approval.ApprovalRequired(), "MCP tools must default to approval-required")
+	if approval, ok := echoTool.(tool.ApprovalRequiredTool); ok {
+		assert.False(t, approval.ApprovalRequired(), "MCP tools must not require approval — approval-gating was removed")
+	}
 
 	funcTool, ok := echoTool.(tool.FuncTool)
 	require.True(t, ok)

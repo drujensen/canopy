@@ -41,8 +41,6 @@ loop, and this is what Canopy is actually building:
 - **Tight, composable tools** (a small set of well-scoped tools, not a kitchen sink — §6, FR4).
 - **Context management** so long sessions don't blow the context window — compaction, not just
   hoping the conversation stays short (§6, FR10).
-- **A permission/approval layer** for risky actions, with both one-off and "always allow this"
-  semantics (§6, FR5).
 - **Progress visibility** — a todo/plan list the agent maintains and the user can see (§6, FR11).
 - **Mode separation** — a "plan" mode that can't mutate anything vs. an "execute" mode that can
   (§6, FR12; superseded post-v0.1.0 by the 4-persona SDLC agent workflow — see FR12's row in §6).
@@ -78,7 +76,7 @@ because it's what makes existing Claude Code projects portable to Canopy (§6, F
 1. **Bubble Tea TUI, v1 only.** No web UI in v1 (§5).
 2. **JSON file storage, v1 only.** No MongoDB in v1 (§5).
 3. **MAF-Go as the harness** for provider calls, tool-calling, the agentic loop, streaming,
-   history, compaction, approvals, and subagent dispatch (unchanged from prior drafts).
+   history, compaction, and subagent dispatch (unchanged from prior drafts).
 4. **Provider parity with aiagent**, not Claude Code — this is Canopy's actual value-add. OpenAI,
    Anthropic, Gemini natively via MAF-Go; DeepSeek, Ollama, Groq, Mistral, Together, xAI via a
    generic OpenAI-compatible adapter.
@@ -86,9 +84,11 @@ because it's what makes existing Claude Code projects portable to Canopy (§6, F
 6. **File-based, Claude-Code-format-compatible configuration** for agents (`.claude/agents/*.md`),
    skills (`.claude/skills/*/SKILL.md`), MCP servers (`.mcp.json`), and project instructions
    (`CLAUDE.md`/`AGENTS.md`) — §6, FR17–FR20.
-7. **Loop quality**: compaction, approvals with standing rules, todo/progress tracking, plan/execute
-   mode — all first-class and visible in the TUI (unchanged from prior drafts, §6 FR5/FR10–FR12;
-   the plan/execute mode half of FR12 is superseded post-v0.1.0 — see FR12's row in §6).
+7. **Loop quality**: compaction, todo/progress tracking, plan/execute mode — all first-class and
+   visible in the TUI (unchanged from prior drafts, §6 FR10–FR12; the plan/execute mode half of
+   FR12 is superseded post-v0.1.0 — see FR12's row in §6). Tool-call approval-gating (originally
+   FR5) was tried and removed post-v0.1.0 — see FR5's row in §6; Canopy deliberately does not
+   block a tool call on any human decision.
 8. **Dynamic subagent dispatch**, not a graph engine (unchanged, §6 FR9).
 9. **Faster and lighter than Claude Code** at the things that are directly comparable: process
    startup time, idle memory footprint, and binary distribution (a single static binary, no
@@ -129,7 +129,7 @@ because it's what makes existing Claude Code projects portable to Canopy (§6, F
 | FR2 | Provider calls run through MAF-Go provider adapters: native for OpenAI, Anthropic, Gemini; a generic OpenAI-compatible adapter (custom base URL + key) for DeepSeek, Ollama, Groq, Mistral, Together, xAI. |
 | FR3 | Provider/Model configuration is a small JSON file (not a database), consistent with FR-storage decisions in §5. |
 | FR4 | The built-in tool set is comparable in breadth to Claude Code's: shell/bash execution, file read/write/search, directory listing, web search, and web fetch. That's the core set for v1 — see §5 for what's deliberately excluded. |
-| FR5 | Tools that mutate state (bash, file write) require approval before running, using MAF-Go's `tool.ApprovalRequiredTool` and `agent/harness/toolapproval`, including one-off approval and standing "always allow this tool" / "always allow this tool with these arguments" rules that persist across restarts. |
+| FR5 | ~~Tools that mutate state (bash, file write) require approval before running, using MAF-Go's `tool.ApprovalRequiredTool` and `agent/harness/toolapproval`, including one-off approval and standing "always allow this tool" / "always allow this tool with these arguments" rules that persist across restarts.~~ **Removed (post-v0.1.0):** approval-gating is gone entirely, not superseded by something else. It added no real safety value (every request was already being auto-approved silently before this was removed — no human was ever actually asked), while the approve-then-continue round trip was a confirmed source of chat-corrupting bugs. No tool call is ever blocked on a human decision now, and none should be added back — see DESIGN.md §3.6's addendum for the full rationale and what was deleted. |
 | FR6 | MCP servers configured in `.mcp.json` (FR18) contribute additional tools automatically via `tool/mcptool` — this is the extensibility mechanism, not a growing built-in tool list. |
 | FR7 | The agentic run loop (send message → model responds → tool calls execute → results fed back → repeat until final answer) is provided by MAF-Go's `agent/harness/loop` and `toolautocall`, not hand-written. |
 | FR8 | Responses stream incrementally to the TUI, backed by MAF-Go's `ResponseStream` (`iter.Seq2[*ResponseUpdate, error]`). |
@@ -138,7 +138,7 @@ because it's what makes existing Claude Code projects portable to Canopy (§6, F
 | FR11 | Agents can maintain and surface a todo/progress list during multi-step tasks, using MAF-Go's `agent/harness/todo`; the TUI renders the current list live. |
 | FR12 | ~~Agents can operate in distinct modes (at minimum plan vs. execute), using MAF-Go's `agent/harness/agentmode`; the TUI shows the current mode and lets the user switch it.~~ **Superseded (post-v0.1.0):** replaced by four SDLC-persona agents (`research`, `design`, `plan`, `execute`) switched via the existing agent picker (FR9's `ctrl+a`), not a separate mode toggle — see DESIGN.md §3.8's addendum for the full rationale and DESIGN.md §3.11's addendum for the four agents themselves. |
 | FR13 | Chat history persists per session across turns and process restarts, via a JSON-backed `HistoryProvider`/`ChatRepository`. |
-| FR14 | Session-scoped state from FR5/FR11 (approval rules, todo items) persists as one serialized `*agent.Session` blob on the Chat record (see DESIGN.md), so it survives a restart. (Post-v0.1.0: this blob also carried FR12's mode state before FR12 was superseded — an old chat's now-orphaned mode key persists harmlessly alongside the rest, per DESIGN.md §3.8's addendum.) |
+| FR14 | Session-scoped state from FR11 (todo items) persists as one serialized `*agent.Session` blob on the Chat record (see DESIGN.md), so it survives a restart. (Post-v0.1.0: this blob also carried FR12's mode state before FR12 was superseded, and FR5's standing approval rules before FR5 was removed — an old chat's now-orphaned mode/approval-rule keys persist harmlessly alongside the rest, per DESIGN.md §3.8/§3.6's addenda.) |
 | FR15 | The CLI supports at minimum: default TUI mode, `--storage=file` (the only supported value in v1, but the flag stays for forward compatibility with FR-deferred mongo support), `--global`/`-g`, `--version`. |
 | FR16 | Structured logging (zap) captures run, middleware, and provider diagnostics; API keys and full sensitive payloads are never logged by default. |
 | FR17 | Canopy discovers and loads agent definitions from `.claude/agents/*.md` (project, recursive) and `~/.claude/agents/*.md` (personal, recursive), parsing YAML frontmatter (`name`, `description` required; `tools`, `model` optional) with the markdown body as the system prompt — the same format and locations Claude Code uses, so an existing project's subagents load unmodified. Project-level definitions win name conflicts with personal ones. |
@@ -218,18 +218,22 @@ directly. See DESIGN.md §3.4's addendum.
 ## 7. Non-functional requirements
 
 - **Security.** No API keys or secrets in logs by default. Bash/file tools retain input validation
-  (command injection, path traversal) and approval-gating. MCP server configs are read, not
-  auto-executed with elevated trust — approval-gating (FR5) applies to MCP-provided mutating tools
-  too, wherever the tool is marked as requiring approval.
+  (command injection, path traversal) as their real control — there is deliberately no
+  approval-gating layer (FR5 was removed; see DESIGN.md §3.6). MCP server configs are read, not
+  auto-executed with elevated trust in the sense that Canopy doesn't grant them any capability a
+  built-in tool lacks, but a connected MCP server's tools execute exactly like built-ins: on the
+  model's request, with no blocking confirmation step.
 - **Portability.** Single static Go binary; no Node/npm runtime dependency (this is part of the
   "lighter" claim in §4.9, not just a footnote).
 - **Performance.** Startup time and idle memory footprint should be measured against the `claude`
   CLI and against aiagent as a baseline once Canopy is functional (Plan, Phase 9) — this is a goal
   to validate, not a number to promise before measuring.
 - **Toolchain.** Go 1.25+ (MAF-Go requires `go 1.25.0`).
-- **Testability.** Unit test coverage with `testify`; dedicated tests for compaction, approval
-  persistence, and the three file-format loaders (FR17–FR19), since those are Canopy's own code
-  (not MAF-Go's) and the most likely place for subtle format-compatibility bugs.
+- **Testability.** Unit test coverage with `testify`; dedicated tests for compaction and the three
+  file-format loaders (FR17–FR19), since those are Canopy's own code (not MAF-Go's) and the most
+  likely place for subtle format-compatibility bugs. Tool contract tests also assert no built-in
+  or MCP-provided tool requires approval (FR5 was removed; a regression here would reintroduce a
+  blocking step).
 - **Extensibility.** Adding a new provider should not require touching unrelated layers. Adding a
   new *tool* is deliberately supposed to mean "point at an MCP server," not "extend Canopy's Go
   code" — that's the point of FR6/FR18.
@@ -242,18 +246,17 @@ directly. See DESIGN.md §3.4's addendum.
 ## 8. Risks / open questions
 
 - **MAF-Go is public preview** — pin version, re-evaluate on upgrade. The loop-quality subsystems
-  (`agent/compaction`, `agent/harness/{toolapproval,todo}`) are the least stable surface within an
-  already-preview framework. (Post-v0.1.0: `agentmode` was in this list too, before FR12 was
-  superseded — Canopy no longer imports it.)
+  (`agent/compaction`, `agent/harness/todo`) are the least stable surface within an already-preview
+  framework. (Post-v0.1.0: `agentmode` was in this list too, before FR12 was superseded, and
+  `toolapproval` was in this list too, before FR5 was removed — Canopy no longer imports either.)
 - **Claude Code's file formats are not all a versioned, stable spec.** Agent Skills became an open
   spec in December 2025 and is the most stable of the three; the subagent markdown frontmatter and
   `.mcp.json` schema are documented but not formally versioned. Canopy should implement against
   the current documented format, expect occasional drift, and treat "reads Claude Code's config"
   as a compatibility target to maintain, not a one-time port.
 - **"Faster and lighter" is unverified until measured.** Go's static-binary startup advantage over
-  a Node CLI is a reasonable expectation, not a guarantee — MAF-Go's own dependency graph, tool
-  execution overhead, and the compaction/approval bridging work could offset it. Flagged
-  explicitly so Phase 9 benchmarking isn't skipped.
+  a Node CLI is a reasonable expectation, not a guarantee — MAF-Go's own dependency graph and tool
+  execution overhead could offset it. Flagged explicitly so Phase 9 benchmarking isn't skipped.
 - **No decision yet on data-migration tooling** from aiagent's `~/.aiagent` storage.
 - **Web UI and MongoDB are deferred, not designed away** — when either is picked back up, revisit
   whether the JSON-only/TUI-only decisions made here (e.g., flat-file provider config, `Chat`
@@ -265,8 +268,9 @@ directly. See DESIGN.md §3.4's addendum.
   `CLAUDE.md`), running Canopy in that directory picks up the same agents, skills, and MCP
   servers without any Canopy-specific configuration.
 - A long-running chat session automatically compacts without losing task continuity.
-- Approval prompts support "approve once" and "always allow," and "always allow" survives a
-  restart.
+- ~~Approval prompts support "approve once" and "always allow," and "always allow" survives a
+  restart.~~ **Removed (post-v0.1.0):** no approval prompt exists; every tool call executes
+  immediately. See FR5's row in §6.
 - A multi-step task shows a live todo/progress list in the TUI.
 - ~~A user can see and switch the agent's current mode (plan vs. execute) in the TUI.~~
   **Superseded (post-v0.1.0):** a user switches between the `research`/`design`/`plan`/`execute`

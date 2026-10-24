@@ -56,10 +56,8 @@ type transcriptEntry struct {
 }
 
 // chatModel is the chat screen (Design §5): a scrolling transcript fed by
-// AgentService's streaming entry points, a composer (tool-approval requests
-// are auto-answered rather than ever pausing it on a prompt — post-v0.1.0
-// addendum, see pendingApprovals), and a sidebar showing the live todo
-// panel (Design §3.7).
+// AgentService's streaming entry points, a composer, and a sidebar showing
+// the live todo panel (Design §3.7).
 type chatModel struct {
 	chatID    string
 	agentName string
@@ -116,28 +114,12 @@ type chatModel struct {
 	// immediately after a ctrl+o switch (modelChangedMsg, see model.go).
 	model string
 
-	// pendingApprovals accumulates every *message.ToolApprovalRequestContent
-	// seen so far this turn (Design §3.6 originally had a user decide here;
-	// post-v0.1.0 addendum: approvals are annoying enough in practice that
-	// Canopy now auto-approves every one instead of ever blocking on a
-	// prompt). Collected as a slice, not a single field, specifically because
-	// a model turn can request several tools at once and every one of them
-	// needs its own answer — a single-value field here previously meant only
-	// the *last* request of a multi-call turn ever got an answer, leaving
-	// earlier ones permanently unanswered in chat history (which some
-	// providers, e.g. DeepSeek, reject outright as a malformed request:
-	// "insufficient tool messages following tool_calls message"). Drained
-	// and answered by handleStreamMsg's streamDoneMsg case once the turn
-	// that produced them is fully over.
-	pendingApprovals []*message.ToolApprovalRequestContent
-
 	// picker, when non-nil, is the in-chat overlay currently shown — the
 	// ctrl+a agent-switch, ctrl+o model-switch, or ctrl+s skills-browser
 	// picker (post-v0.1.0 addendum, Design §3.4/§4/§5/§3.11), pre-empting the
-	// composer/transcript the same way a pending approval prompt used to.
-	// pickerKind says
-	// which one, so handlePickerKey knows whether a selection calls
-	// SetAgent/SetModel or just displays the chosen skill's body.
+	// composer/transcript. pickerKind says which one, so handlePickerKey
+	// knows whether a selection calls SetAgent/SetModel or just displays the
+	// chosen skill's body.
 	picker     *list.Model
 	pickerKind pickerKind
 
@@ -174,8 +156,8 @@ func newChatModel(chatID, agentName string, todos []todo.Item, model string, wid
 const sidebarWidth = 28
 
 // resize adjusts the viewport/composer to fit width x height, reserving
-// sidebarWidth columns for the todo sidebar and a couple of rows for
-// the composer/approval-prompt line.
+// sidebarWidth columns for the todo sidebar and a couple of rows for the
+// composer.
 func (c *chatModel) resize(width, height int) {
 	c.width, c.height = width, height
 	mainWidth := width - sidebarWidth
@@ -194,10 +176,7 @@ func (c *chatModel) resize(width, height int) {
 
 // handleKey processes a key press for the chat screen: overlay-picker
 // navigation while picker is set, agent/model-switch or message-submit
-// otherwise, and composer text editing as the fallback. Tool approval
-// (Design §3.6) no longer has a key of its own here — it's auto-answered by
-// handleStreamMsg the moment a turn surfaces it, never blocking on a
-// keypress.
+// otherwise, and composer text editing as the fallback.
 func (c *chatModel) handleKey(msg tea.KeyMsg, svc *services.AgentService, ctx context.Context) tea.Cmd {
 	if c.picker != nil {
 		return c.handlePickerKey(msg, svc, ctx)
@@ -425,32 +404,6 @@ func (c *chatModel) showSkill(svc *services.AgentService, skillName string) {
 	c.refreshViewport()
 }
 
-// sendAutoApprovals drains c.pendingApprovals (every tool-approval request
-// the turn that just finished surfaced — see that field's doc comment) and
-// starts a new turn answering every single one of them with
-// AlwaysApproveToolResponse(), in one combined message rather than one turn
-// per request: an assistant message's tool_calls must all be answered
-// together before the next provider call (some providers, e.g. DeepSeek,
-// reject a request otherwise — see pendingApprovals' doc comment), so
-// batching the responses here matches what the wire format actually
-// requires, not just what's convenient. AlwaysApproveToolResponse (rather
-// than a one-off approval) installs a standing "always allow this tool"
-// rule, so Canopy never has to ask about that tool again either — the whole
-// point of removing the prompt is that nothing here ever blocks on a user
-// decision again. A no-op, returning nil, when there's nothing pending.
-func (c *chatModel) sendAutoApprovals(svc *services.AgentService, ctx context.Context) tea.Cmd {
-	if len(c.pendingApprovals) == 0 {
-		return nil
-	}
-	contents := make([]message.Content, len(c.pendingApprovals))
-	for i, req := range c.pendingApprovals {
-		contents[i] = req.AlwaysApproveToolResponse()
-	}
-	c.pendingApprovals = nil
-	approvalMsg := &message.Message{Role: message.RoleUser, Contents: contents}
-	return tea.Batch(c.startTurnCmd(svc, ctx, []*message.Message{approvalMsg}), c.spinner.Tick)
-}
-
 // setModelCmd calls AgentService.SetModel for chosen (a ModelConfig.Name
 // from the ctrl+o picker's list, post-v0.1.0 addendum) and returns a
 // modelChangedMsg Model.Update applies to refresh the sidebar.
@@ -494,7 +447,7 @@ func (c *chatModel) setAgentCmd(svc *services.AgentService, ctx context.Context,
 // startChatCmd does, deliberately: Model.Update's chatStartedMsg case
 // already does exactly the reset ctrl+n needs — it discards the old
 // *chatModel entirely and constructs a brand-new one via newChatModel,
-// which zero-values transcript/streaming/pendingApprovals and seeds
+// which zero-values transcript/streaming and seeds
 // todos/model fresh from the new (empty) chat's own state. Reusing
 // that message means ctrl+n's "reset" is not a second, hand-rolled reset
 // code path that could drift from what starting a chat from the picker
@@ -561,10 +514,10 @@ func (c *chatModel) startNewChatCmd(svc *services.AgentService, ctx context.Cont
 // batching here would make drainCmd return after the very first tick
 // without ever reading the real stream, silently orphaning startTurn's
 // forwarding goroutine (exactly the leak stream_leak_test.go exists to
-// catch). handleKey's "enter" case and sendAutoApprovals — the two real
-// entry points into this function — batch the spinner tick in themselves
-// instead, where the real Bubble Tea runtime (which does understand
-// tea.BatchMsg) is what ends up running it.
+// catch). handleKey's "enter" case — the real entry point into this
+// function — batches the spinner tick in itself instead, where the real
+// Bubble Tea runtime (which does understand tea.BatchMsg) is what ends up
+// running it.
 func (c *chatModel) startTurnCmd(svc *services.AgentService, ctx context.Context, msgs []*message.Message) tea.Cmd {
 	c.streamActive = true
 	c.streaming.Reset()
@@ -596,15 +549,12 @@ func (c *chatModel) cancelTurn() {
 }
 
 // handleStreamMsg applies one streaming event (see stream.go) to the chat's
-// state: accumulating text/collecting any tool-approval request for
-// streamChunkMsg, folding the finished reply into the transcript, updating
-// Todos, and auto-answering any tool-approval requests the turn surfaced
-// for streamDoneMsg, or surfacing an error for streamErrMsg. svc/ctx are
-// only used by the streamDoneMsg case, to start the follow-up turn
-// sendAutoApprovals needs when the finished turn left anything pending —
-// every other case ignores them. Returns the next Cmd to run: re-arming
-// waitForStreamEvent for a non-terminal chunk, sendAutoApprovals' follow-up
-// turn if the finished turn needs one, or nil otherwise.
+// state: accumulating text for streamChunkMsg, folding the finished reply
+// into the transcript and updating Todos for streamDoneMsg, or surfacing an
+// error for streamErrMsg. svc/ctx are unused here (kept for signature
+// symmetry with callers) — every case only touches c's own fields. Returns
+// the next Cmd to run: re-arming waitForStreamEvent for a non-terminal
+// chunk, or nil otherwise.
 func (c *chatModel) handleStreamMsg(msg tea.Msg, svc *services.AgentService, ctx context.Context) tea.Cmd {
 	switch msg := msg.(type) {
 	case streamChunkMsg:
@@ -618,7 +568,7 @@ func (c *chatModel) handleStreamMsg(msg tea.Msg, svc *services.AgentService, ctx
 			c.model = msg.result.Model
 		}
 		c.refreshViewport()
-		return c.sendAutoApprovals(svc, ctx)
+		return nil
 	case streamErrMsg:
 		c.finishStreaming()
 		if errors.Is(msg.err, context.Canceled) {
@@ -639,11 +589,8 @@ func (c *chatModel) handleStreamMsg(msg tea.Msg, svc *services.AgentService, ctx
 
 // applyUpdate folds one *agent.ResponseUpdate's contents into the chat's
 // in-flight state: text is appended to the streaming buffer so it renders
-// incrementally (Requirements FR8); a tool-approval request is queued onto
-// pendingApprovals for handleStreamMsg's streamDoneMsg case to auto-answer
-// once the turn is over, rather than pausing the composer the way Design
-// §3.6 originally specified (post-v0.1.0 addendum — see pendingApprovals'
-// doc comment).
+// incrementally (Requirements FR8), and a tool call surfaces a
+// "[calling toolname...]" marker.
 func (c *chatModel) applyUpdate(update *agent.ResponseUpdate) {
 	if update == nil {
 		return
@@ -652,14 +599,6 @@ func (c *chatModel) applyUpdate(update *agent.ResponseUpdate) {
 		switch t := content.(type) {
 		case *message.TextContent:
 			c.streaming.WriteString(t.Text)
-		case *message.ToolApprovalRequestContent:
-			// Queued, not rendered: the follow-up turn sendAutoApprovals
-			// starts already surfaces a "[calling toolname...]" marker
-			// (the *message.FunctionCallContent case below) once the tool
-			// actually runs, so noting the approval itself here too would
-			// just be a second, redundant transcript entry for the same
-			// tool call.
-			c.pendingApprovals = append(c.pendingApprovals, t)
 		case *message.FunctionCallContent:
 			if t.Name != "" {
 				c.streaming.WriteString(fmt.Sprintf("\n[calling %s...]\n", t.Name))
@@ -685,26 +624,6 @@ func (c *chatModel) finishStreaming() {
 		c.streamCancel()
 		c.streamCancel = nil
 	}
-}
-
-// toolCallName extracts a human-readable tool name from a
-// message.ToolCallContent for display in the approval prompt, falling back
-// to the call ID for a tool-call shape this package doesn't special-case.
-func toolCallName(tc message.ToolCallContent) string {
-	switch t := tc.(type) {
-	case *message.FunctionCallContent:
-		if t != nil {
-			return t.Name
-		}
-	case *message.MCPServerToolCallContent:
-		if t != nil {
-			return t.Name
-		}
-	}
-	if tc != nil {
-		return tc.GetCallID()
-	}
-	return "unknown tool"
 }
 
 // refreshViewport re-renders the transcript (plus any in-flight streaming
