@@ -243,16 +243,21 @@ func (c *chatModel) handleKey(msg tea.KeyMsg, svc *services.AgentService, ctx co
 		// active — esc has no other meaning on this screen.
 		c.cancelTurn()
 		return nil
-	case "pgup":
+	case "pgup", "ctrl+up":
 		// Scrolls the transcript back through earlier history. Deliberately
 		// not forwarded to the composer at all (unlike the default fallthrough
-		// below) — "pgup"/"pgdown" aren't bound to anything in the composer's
-		// own keymap, so there's no ambiguity to guard against. Works
-		// regardless of streamActive: scrolling back to read while a turn is
-		// still running is a reasonable thing to want.
+		// below) — none of these are bound to anything in the composer's own
+		// keymap, so there's no ambiguity to guard against. Works regardless
+		// of streamActive: scrolling back to read while a turn is still
+		// running is a reasonable thing to want. "ctrl+up" is a second
+		// binding for the same action (post-v0.1.0 addendum) — most Apple
+		// keyboards have no physical PgUp/PgDn keys at all (fn+up/fn+down is
+		// macOS's own translation to a real Page Up/Page Down keystroke,
+		// which already worked before this addendum; ctrl+up/ctrl+down needs
+		// no fn key and reaches the same action).
 		c.viewport.PageUp()
 		return nil
-	case "pgdown":
+	case "pgdown", "ctrl+down":
 		c.viewport.PageDown()
 		return nil
 	case "ctrl+b":
@@ -861,7 +866,9 @@ func (c *chatModel) renderSidebar() string {
 	b.WriteString("(ctrl+s to view skills)\n")
 	b.WriteString("(ctrl+h for history)\n")
 	b.WriteString("(ctrl+n for new chat)\n")
-	b.WriteString("(ctrl+b to hide this)\n\n")
+	b.WriteString("(ctrl+b to hide this)\n")
+	b.WriteString("(scroll: pgup/pgdn)\n")
+	b.WriteString("(or ctrl+up/down)\n\n")
 	b.WriteString("Todos:\n")
 	if len(c.todos) == 0 {
 		b.WriteString("  (none yet)\n")

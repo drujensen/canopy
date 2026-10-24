@@ -1212,6 +1212,27 @@ func TestChatModel_PageUpPageDown_ScrollsTranscript(t *testing.T) {
 	assert.True(t, c.viewport.AtBottom(), "pgdown must scroll back down to the bottom of this short transcript")
 }
 
+// TestChatModel_CtrlUpCtrlDown_AlsoScrollsTranscript is this package's
+// coverage for the post-v0.1.0 addendum adding ctrl+up/ctrl+down as a
+// second binding for the same scroll action pgup/pgdown already perform —
+// most Apple keyboards have no physical PgUp/PgDn keys at all.
+func TestChatModel_CtrlUpCtrlDown_AlsoScrollsTranscript(t *testing.T) {
+	c := newChatModel("chat-1", "assistant", nil, "m1", 40, 10)
+	for i := 0; i < 30; i++ {
+		c.transcript = append(c.transcript, transcriptEntry{role: message.RoleAssistant, text: fmt.Sprintf("line %d", i)})
+	}
+	c.refreshViewport()
+	require.True(t, c.viewport.AtBottom())
+
+	cmd := c.handleKey(tea.KeyMsg{Type: tea.KeyCtrlUp}, nil, nil)
+	assert.Nil(t, cmd)
+	assert.False(t, c.viewport.AtBottom(), "ctrl+up must scroll the transcript away from the bottom")
+
+	cmd = c.handleKey(tea.KeyMsg{Type: tea.KeyCtrlDown}, nil, nil)
+	assert.Nil(t, cmd)
+	assert.True(t, c.viewport.AtBottom(), "ctrl+down must scroll back down to the bottom of this short transcript")
+}
+
 // TestChatModel_CtrlJ_InsertsNewlineThenEnterSubmitsWholeMessage is this
 // package's coverage for the post-v0.1.0 multi-line-composer addendum:
 // ctrl+j inserts a literal newline into the composer without submitting
