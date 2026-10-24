@@ -560,11 +560,13 @@ func run() error {
 		}
 	}
 
-	// WithMouseCellMotion (post-v0.1.0 addendum): lets the mouse wheel scroll
-	// the chat transcript (tui.Model.Update forwards tea.MouseMsg to the
-	// active chat's viewport) — see that case's own doc comment for why
-	// cell-motion rather than all-motion mouse reporting is enough.
-	program := tea.NewProgram(tui.NewModel(ctx, svc, agents, startAgent, resumeChatID), tea.WithAltScreen(), tea.WithMouseCellMotion())
+	// Deliberately no mouse-mode option (tried and reverted, post-v0.1.0):
+	// any tea.WithMouse* option makes the terminal hand every mouse event to
+	// the program instead of handling click-drag text selection itself, so
+	// gaining wheel-scroll would cost the user the ability to select/copy
+	// transcript text with the mouse at all — a worse trade than it's worth
+	// given pgup/pgdown/ctrl+b (chat.go) already cover scrolling without it.
+	program := tea.NewProgram(tui.NewModel(ctx, svc, agents, startAgent, resumeChatID), tea.WithAltScreen())
 	if _, err := program.Run(); err != nil {
 		return fmt.Errorf("running the TUI: %w", err)
 	}
