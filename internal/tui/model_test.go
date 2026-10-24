@@ -1163,3 +1163,112 @@ func TestModel_TopLevelAgentPicker_FilterActuallyNarrowsVisibleItems(t *testing.
 	require.Len(t, visible, 1)
 	assert.Equal(t, "reviewer", visible[0].(agentItem).def.Name)
 }
+
+// TestChatModel_CtrlB_TogglesSidebarVisibility is this package's coverage
+// for the post-v0.1.0 sidebar-hide addendum: ctrl+b hides the sidebar
+// entirely (so a terminal's own line-based copy/paste selection has nothing
+// but transcript columns to grab) and the transcript/composer reclaim the
+// full width; a second ctrl+b restores it.
+func TestChatModel_CtrlB_TogglesSidebarVisibility(t *testing.T) {
+	c := newChatModel("chat-1", "assistant", nil, "m1", 80, 24)
+
+	assert.Contains(t, c.View(80, 24), "Agent: assistant", "the sidebar renders by default")
+	assert.False(t, c.sidebarHidden)
+
+	cmd := c.handleKey(tea.KeyMsg{Type: tea.KeyCtrlB}, nil, nil)
+	assert.Nil(t, cmd)
+	assert.True(t, c.sidebarHidden)
+	hiddenView := c.View(80, 24)
+	assert.NotContains(t, hiddenView, "Agent: assistant", "ctrl+b must hide the sidebar")
+	assert.Equal(t, c.width, c.viewport.Width, "the transcript must reclaim the full width once the sidebar is hidden")
+
+	cmd = c.handleKey(tea.KeyMsg{Type: tea.KeyCtrlB}, nil, nil)
+	assert.Nil(t, cmd)
+	assert.False(t, c.sidebarHidden)
+	assert.Contains(t, c.View(80, 24), "Agent: assistant", "a second ctrl+b must show the sidebar again")
+}
+
+// TestChatModel_PageUpPageDown_ScrollsTranscript is this package's coverage
+// for the post-v0.1.0 scrolling fix: before this, pgup/pgdown fell through
+// handleKey's default case straight into the composer, which silently
+// ignored them — the transcript viewport never moved, so a long
+// conversation's earlier messages were permanently unreachable once they
+// scrolled past the bottom-anchored view. pgup/pgdown are now handled
+// directly against c.viewport, bypassing the composer entirely.
+func TestChatModel_PageUpPageDown_ScrollsTranscript(t *testing.T) {
+	c := newChatModel("chat-1", "assistant", nil, "m1", 40, 10)
+	for i := 0; i < 30; i++ {
+		c.transcript = append(c.transcript, transcriptEntry{role: message.RoleAssistant, text: fmt.Sprintf("line %d", i)})
+	}
+	c.refreshViewport()
+	require.True(t, c.viewport.AtBottom(), "refreshViewport must leave the transcript scrolled to the bottom")
+
+	cmd := c.handleKey(tea.KeyMsg{Type: tea.KeyPgUp}, nil, nil)
+	assert.Nil(t, cmd)
+	assert.False(t, c.viewport.AtBottom(), "pgup must scroll the transcript away from the bottom, not be silently swallowed")
+
+	cmd = c.handleKey(tea.KeyMsg{Type: tea.KeyPgDown}, nil, nil)
+	assert.Nil(t, cmd)
+	assert.True(t, c.viewport.AtBottom(), "pgdown must scroll back down to the bottom of this short transcript")
+}
+
+// TestChatModel_CtrlJ_InsertsNewlineThenEnterSubmitsWholeMessage is this
+// package's coverage for the post-v0.1.0 multi-line-composer addendum:
+// ctrl+j inserts a literal newline into the composer without submitting
+// (unlike a plain "enter", handleKey's own switch never claims "ctrl+j", so
+// it falls through to the composer's own textarea.KeyMap, rebound to treat
+// ctrl+j/shift+enter as InsertNewline instead of "enter"), and the entire
+// multi-line value submits as a single transcript entry once the user
+// does press plain "enter".
+func TestChatModel_CtrlJ_InsertsNewlineThenEnterSubmitsWholeMessage(t *testing.T) {
+	svc, closeServer := newLeakTestService(t, t.TempDir(), func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(chatCompletionResponse("ok"))
+	})
+	t.Cleanup(closeServer)
+
+	ctx := context.Background()
+	_, err := svc.StartChat(ctx, "chat-1", "assistant")
+	require.NoError(t, err)
+
+	c := newChatModel("chat-1", "assistant", nil, "m1", 80, 24)
+
+	for _, r := range "first line" {
+		c.handleKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{r}}, svc, ctx)
+	}
+	c.handleKey(tea.KeyMsg{Type: tea.KeyCtrlJ}, svc, ctx)
+	assert.Empty(t, c.transcript, "ctrl+j must not submit the turn")
+	for _, r := range "second line" {
+		c.handleKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{r}}, svc, ctx)
+	}
+	require.Equal(t, "first line\nsecond line", c.composer.Value(), "ctrl+j must insert a literal newline rather than submitting")
+	require.Empty(t, c.transcript, "nothing should be sent to the model until a plain enter")
+
+	submitCmd := c.handleKey(tea.KeyMsg{Type: tea.KeyEnter}, svc, ctx)
+	require.NotNil(t, submitCmd)
+	require.Len(t, c.transcript, 1)
+	assert.Equal(t, "first line\nsecond line", c.transcript[0].text, "the whole multi-line message must submit as one entry, newline included")
+	assert.Empty(t, c.composer.Value(), "the composer must be cleared after submitting")
+
+	drainCmd(t, c, svc, ctx, submitCmd)
+}
+
+// TestChatModel_View_NoRoleLabels is this package's coverage for the
+// post-v0.1.0 addendum removing the "you"/"assistant" role labels from the
+// rendered transcript — renderEntry now renders a user message as a
+// background-highlighted block and an assistant reply as plain text, with
+// no label line preceding either.
+func TestChatModel_View_NoRoleLabels(t *testing.T) {
+	c := newChatModel("chat-1", "assistant", nil, "m1", 80, 24)
+	c.transcript = append(c.transcript,
+		transcriptEntry{role: message.RoleUser, text: "hello there"},
+		transcriptEntry{role: message.RoleAssistant, text: "hi, how can I help"},
+	)
+	c.refreshViewport()
+
+	content := c.viewport.View()
+	assert.Contains(t, content, "hello there")
+	assert.Contains(t, content, "hi, how can I help")
+	assert.NotContains(t, content, "you", "the old 'you' role label must no longer render")
+	assert.NotContains(t, content, "assistant", "the old 'assistant' role label must no longer render")
+}

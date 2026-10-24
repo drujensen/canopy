@@ -12,9 +12,13 @@ var (
 
 	modeStyle = lipgloss.NewStyle().Bold(true)
 
-	userLabelStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("6"))
-
-	assistantLabelStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("2"))
+	// userMessageStyle sets a user message off from an assistant reply
+	// with a lighter background block instead of a "you"/"assistant" label
+	// (post-v0.1.0 addendum) — an AdaptiveColor so it reads as "slightly
+	// lighter than the terminal's own background" in both a dark and a
+	// light color scheme, rather than a fixed shade that only looks right
+	// in one.
+	userMessageStyle = lipgloss.NewStyle().Background(lipgloss.AdaptiveColor{Light: "254", Dark: "236"})
 
 	// systemLabelStyle labels a system-style informational transcript entry
 	// (post-v0.1.0 addendum: the ctrl+s skills-browser folding a skill's Body

@@ -560,7 +560,11 @@ func run() error {
 		}
 	}
 
-	program := tea.NewProgram(tui.NewModel(ctx, svc, agents, startAgent, resumeChatID), tea.WithAltScreen())
+	// WithMouseCellMotion (post-v0.1.0 addendum): lets the mouse wheel scroll
+	// the chat transcript (tui.Model.Update forwards tea.MouseMsg to the
+	// active chat's viewport) — see that case's own doc comment for why
+	// cell-motion rather than all-motion mouse reporting is enough.
+	program := tea.NewProgram(tui.NewModel(ctx, svc, agents, startAgent, resumeChatID), tea.WithAltScreen(), tea.WithMouseCellMotion())
 	if _, err := program.Run(); err != nil {
 		return fmt.Errorf("running the TUI: %w", err)
 	}

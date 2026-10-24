@@ -6,9 +6,10 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/charmbracelet/bubbles/key"
 	"github.com/charmbracelet/bubbles/list"
 	"github.com/charmbracelet/bubbles/spinner"
-	"github.com/charmbracelet/bubbles/textinput"
+	"github.com/charmbracelet/bubbles/textarea"
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
@@ -102,8 +103,17 @@ type chatModel struct {
 	// newChatModel's caller — see Model.Update's chatStartedMsg case.
 	titleAttempted bool
 
-	composer textinput.Model
+	composer textarea.Model
 	viewport viewport.Model
+
+	// sidebarHidden toggles the agent/model/todo sidebar off (ctrl+b), so a
+	// terminal's own line-based text selection (triple-click, click-drag)
+	// doesn't also grab the sidebar's columns alongside the transcript —
+	// there's no way to exclude a screen region from a terminal's own copy
+	// selection, so hiding the sidebar entirely is the only real fix. The
+	// transcript/composer simply take the full width while hidden; see
+	// mainWidth.
+	sidebarHidden bool
 
 	todos []todo.Item
 
@@ -128,12 +138,34 @@ type chatModel struct {
 	width, height int
 }
 
+// composerKeyMap is textarea.DefaultKeyMap with InsertNewline rebound off
+// "enter" (handleKey's own "enter" case submits the turn; the default
+// InsertNewline binding of "enter"/"ctrl+m" would otherwise fight it for
+// the same keypress — textarea.Update is only ever reached for keys
+// handleKey's switch doesn't already claim) and onto "shift+enter"/"ctrl+j"
+// instead, per the user-facing multi-line-input request. "ctrl+j" is the
+// reliable one: it's the literal line-feed byte (0x0A), distinct from
+// "enter"'s carriage-return byte (0x0D) at the wire level, so every
+// terminal reports it unambiguously. "shift+enter" is wired too, for
+// terminals that negotiate a distinct escape sequence for it, but Bubble
+// Tea v1.3.10 has no built-in parsing for one — most terminals simply
+// report plain "enter" for that keypress, so ctrl+j is what's documented
+// to the user (composer's Placeholder) as the one that always works.
+var composerKeyMap = func() textarea.KeyMap {
+	km := textarea.DefaultKeyMap
+	km.InsertNewline = key.NewBinding(key.WithKeys("shift+enter", "ctrl+j"), key.WithHelp("ctrl+j", "insert newline"))
+	return km
+}()
+
 // newChatModel constructs a chatModel for a just-started or resumed chat,
 // seeded with its current Todos/Model snapshot (Design §3.7,
 // post-v0.1.0 Model addendum).
 func newChatModel(chatID, agentName string, todos []todo.Item, model string, width, height int) *chatModel {
-	composer := textinput.New()
-	composer.Placeholder = "Type a message and press enter..."
+	composer := textarea.New()
+	composer.Placeholder = "Type a message (ctrl+j for a new line) and press enter..."
+	composer.ShowLineNumbers = false
+	composer.Prompt = ""
+	composer.KeyMap = composerKeyMap
 	composer.Focus()
 	composer.CharLimit = 4000
 
@@ -153,24 +185,41 @@ func newChatModel(chatID, agentName string, todos []todo.Item, model string, wid
 	return c
 }
 
-const sidebarWidth = 28
+const (
+	sidebarWidth  = 28
+	composerLines = 3
+)
+
+// mainWidth returns how many columns the transcript/composer get: the full
+// terminal width when the sidebar is hidden (ctrl+b) or too narrow a
+// terminal to spare sidebarWidth columns for it, otherwise width minus the
+// sidebar.
+func (c *chatModel) mainWidth() int {
+	if c.sidebarHidden {
+		return c.width
+	}
+	w := c.width - sidebarWidth
+	if w < 10 {
+		return c.width
+	}
+	return w
+}
 
 // resize adjusts the viewport/composer to fit width x height, reserving
-// sidebarWidth columns for the todo sidebar and a couple of rows for the
+// sidebarWidth columns for the todo sidebar (unless hidden, see
+// mainWidth/sidebarHidden) and composerLines-plus-a-couple rows for the
 // composer.
 func (c *chatModel) resize(width, height int) {
 	c.width, c.height = width, height
-	mainWidth := width - sidebarWidth
-	if mainWidth < 10 {
-		mainWidth = width
-	}
+	mainWidth := c.mainWidth()
 	c.viewport.Width = mainWidth
-	viewportHeight := height - 4
+	viewportHeight := height - 3 - composerLines
 	if viewportHeight < 1 {
 		viewportHeight = 1
 	}
 	c.viewport.Height = viewportHeight
-	c.composer.Width = mainWidth - 2
+	c.composer.SetWidth(mainWidth - 2)
+	c.composer.SetHeight(composerLines)
 	c.refreshViewport()
 }
 
@@ -193,6 +242,30 @@ func (c *chatModel) handleKey(msg tea.KeyMsg, svc *services.AgentService, ctx co
 		// does, is what actually resets state. A no-op when no turn is
 		// active — esc has no other meaning on this screen.
 		c.cancelTurn()
+		return nil
+	case "pgup":
+		// Scrolls the transcript back through earlier history. Deliberately
+		// not forwarded to the composer at all (unlike the default fallthrough
+		// below) — "pgup"/"pgdown" aren't bound to anything in the composer's
+		// own keymap, so there's no ambiguity to guard against. Works
+		// regardless of streamActive: scrolling back to read while a turn is
+		// still running is a reasonable thing to want.
+		c.viewport.PageUp()
+		return nil
+	case "pgdown":
+		c.viewport.PageDown()
+		return nil
+	case "ctrl+b":
+		// Toggles the sidebar (post-v0.1.0 addendum): a terminal's own
+		// line-based copy/paste selection has no way to skip over the
+		// sidebar's columns, so hiding it is the only way to select/copy a
+		// transcript line cleanly. "ctrl+b" is otherwise only a redundant
+		// alt-binding for "left" in the composer's own keymap
+		// (textarea.DefaultKeyMap's CharacterBackward), so claiming it here
+		// loses no composer functionality — "left" still moves the cursor
+		// identically. Works regardless of streamActive, same as pgup/pgdown.
+		c.sidebarHidden = !c.sidebarHidden
+		c.resize(c.width, c.height)
 		return nil
 	case "ctrl+a":
 		// Same guard streaming-sensitive actions elsewhere in this file
@@ -271,7 +344,7 @@ func (c *chatModel) handleKey(msg tea.KeyMsg, svc *services.AgentService, ctx co
 // same way the ctrl+s skills browser shows each skill's description.
 func (c *chatModel) openPicker(svc *services.AgentService, kind pickerKind) {
 	if kind == pickerAgent {
-		l := newPickerList(svc.ListAgents(), "Select an agent", c.width-sidebarWidth, c.height-4)
+		l := newPickerList(svc.ListAgents(), "Select an agent", c.mainWidth(), c.height-4)
 		c.picker = &l
 		c.pickerKind = kind
 		return
@@ -286,7 +359,7 @@ func (c *chatModel) openPicker(svc *services.AgentService, kind pickerKind) {
 			outputCostPerMillion: m.OutputCostPerMillionTokens,
 		})
 	}
-	l := list.New(items, list.NewDefaultDelegate(), c.width-sidebarWidth, c.height-4)
+	l := list.New(items, list.NewDefaultDelegate(), c.mainWidth(), c.height-4)
 	l.Title = "Select a model"
 	l.SetShowStatusBar(false)
 	l.SetFilteringEnabled(true)
@@ -318,7 +391,7 @@ func (c *chatModel) openSkillPicker(svc *services.AgentService) {
 	for _, sk := range skills {
 		items = append(items, skillPickerItem{name: sk.Name, description: sk.Description})
 	}
-	l := list.New(items, list.NewDefaultDelegate(), c.width-sidebarWidth, c.height-4)
+	l := list.New(items, list.NewDefaultDelegate(), c.mainWidth(), c.height-4)
 	l.Title = "Skills"
 	l.SetShowStatusBar(false)
 	l.SetFilteringEnabled(true)
@@ -707,32 +780,51 @@ func reconstructTranscript(messages []*message.Message) []transcriptEntry {
 // always sets c.viewport.Width before the first refreshViewport call, but
 // defensive against a zero-value chatModel in a test) skips wrapping
 // entirely rather than passing a nonsensical width to lipgloss.
+//
+// No "you"/"assistant" label is rendered (post-v0.1.0 addendum) — a user
+// message is instead set off by a lighter background block (userMessageStyle)
+// spanning the full content width; an assistant reply renders as plain,
+// unstyled text, the same visual convention Claude Code itself uses. A
+// system-style entry (ctrl+s skill body, "Cancelled.", etc.) keeps its
+// "system" label, since removing that one specifically wasn't asked for and
+// it's the only cue distinguishing it from a real assistant reply.
 func renderEntry(e transcriptEntry, width int) string {
+	if e.system {
+		text := e.text
+		if width > 0 {
+			text = lipgloss.NewStyle().Width(width).Render(text)
+		}
+		return systemLabelStyle.Render("system") + "\n" + text
+	}
+	if e.role == message.RoleUser {
+		style := userMessageStyle
+		if width > 0 {
+			style = style.Width(width)
+		}
+		return style.Render(e.text)
+	}
 	text := e.text
 	if width > 0 {
 		text = lipgloss.NewStyle().Width(width).Render(text)
 	}
-	if e.system {
-		return systemLabelStyle.Render("system") + "\n" + text
-	}
-	label := userLabelStyle.Render("you")
-	if e.role == message.RoleAssistant {
-		label = assistantLabelStyle.Render("assistant")
-	}
-	return label + "\n" + text
+	return text
 }
 
-// View renders the chat screen: a sidebar (agent + model + todos)
-// beside either an open overlay picker (ctrl+a/ctrl+o, post-v0.1.0 addendum)
-// or the transcript with either the composer or the "thinking" spinner at
-// the bottom, plus a status line for the last stream error, if any. Tool
+// View renders the chat screen: either an open overlay picker (ctrl+a/
+// ctrl+o, post-v0.1.0 addendum) or the transcript with either the composer
+// or the "thinking" spinner at the bottom, plus a status line for the last
+// stream error, if any — beside the sidebar (agent + model + todos), unless
+// ctrl+b has hidden it (post-v0.1.0 addendum: hiding it is what lets a
+// terminal's own line-based copy/paste selection grab a transcript line
+// cleanly, with no sidebar columns mixed into the same lines). Tool
 // approval no longer has a bottom-bar state of its own — it's auto-answered
 // without ever stopping the spinner (post-v0.1.0 addendum).
 func (c *chatModel) View(width, height int) string {
-	sidebar := c.renderSidebar()
-
 	if c.picker != nil {
-		return lipgloss.JoinHorizontal(lipgloss.Top, sidebar, c.picker.View())
+		if c.sidebarHidden {
+			return c.picker.View()
+		}
+		return lipgloss.JoinHorizontal(lipgloss.Top, c.renderSidebar(), c.picker.View())
 	}
 
 	var bottom string
@@ -752,7 +844,10 @@ func (c *chatModel) View(width, height int) string {
 		main = lipgloss.JoinVertical(lipgloss.Left, main, errorStyle.Render(c.renderStatusErrLine()))
 	}
 
-	return lipgloss.JoinHorizontal(lipgloss.Top, sidebar, main)
+	if c.sidebarHidden {
+		return main
+	}
+	return lipgloss.JoinHorizontal(lipgloss.Top, c.renderSidebar(), main)
 }
 
 // renderSidebar renders the agent/model indicators (post-v0.1.0 §3.4/§4
@@ -765,7 +860,8 @@ func (c *chatModel) renderSidebar() string {
 	b.WriteString("\n(ctrl+o to switch)\n")
 	b.WriteString("(ctrl+s to view skills)\n")
 	b.WriteString("(ctrl+h for history)\n")
-	b.WriteString("(ctrl+n for new chat)\n\n")
+	b.WriteString("(ctrl+n for new chat)\n")
+	b.WriteString("(ctrl+b to hide this)\n\n")
 	b.WriteString("Todos:\n")
 	if len(c.todos) == 0 {
 		b.WriteString("  (none yet)\n")
@@ -810,10 +906,7 @@ func height(c *chatModel) int {
 func (c *chatModel) renderStatusErrLine() string {
 	text := "error: " + strings.ReplaceAll(strings.ReplaceAll(c.statusErr.Error(), "\r\n", " "), "\n", " ")
 
-	maxWidth := c.width - sidebarWidth
-	if maxWidth < 10 {
-		maxWidth = c.width
-	}
+	maxWidth := c.mainWidth()
 	if maxWidth <= 0 {
 		return text
 	}
