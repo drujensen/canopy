@@ -7,6 +7,8 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"os/exec"
+	"runtime"
 	"strings"
 	"time"
 
@@ -298,20 +300,74 @@ func newChatModel(chatID, agentName string, todos []todo.Item, model string, wid
 		spinner:         sp,
 		composer:        composer,
 		viewport:        viewport.New(width, height),
-		copyToClipboard: writeOSC52ToStdout,
+		copyToClipboard: defaultCopyToClipboard,
 	}
 	c.resize(width, height)
 	return c
 }
 
-// writeOSC52ToStdout is copyToClipboard's real implementation: writes text
-// to the system clipboard via an OSC 52 terminal escape sequence, wrapped
-// for tmux's own passthrough requirement when running inside one (tmux
-// swallows an unwrapped OSC 52 sequence from a pane unless
-// `set -g allow-passthrough on` is set — wrapping it removes that
+// defaultCopyToClipboard is copyToClipboard's real implementation
+// (post-v0.1.0 addendum: mouse-driven text selection). It prefers shelling
+// out to the host's own clipboard tool (copyViaSystemTool) over OSC 52:
+// OSC 52 support turned out to be unreliable in practice — some
+// terminals (observed: Ptyxis on Wayland/GNOME) never update the
+// clipboard despite the escape sequence reaching them intact, since
+// honoring a clipboard-*write* request is each terminal's own choice to
+// implement (or not) and there's no way to detect support short of
+// trying it and seeing). Shelling out to wl-copy/xclip/xsel/pbcopy talks
+// to the display server's clipboard directly, bypassing the terminal
+// entirely. OSC 52 is kept only as the fallback for a session with no
+// local display to shell a clipboard command against in the first
+// place — chiefly SSH, where the terminal emulator (running on the
+// user's actual local machine) can still forward the escape sequence
+// back to a real local clipboard even though there's no $DISPLAY/
+// $WAYLAND_DISPLAY to speak of on the remote end running Canopy.
+func defaultCopyToClipboard(text string) {
+	if copyViaSystemTool(text) {
+		return
+	}
+	writeOSC52ToStdout(text)
+}
+
+// copyViaSystemTool shells out to whichever local clipboard tool matches
+// the current platform/display server, feeding it text on stdin. Returns
+// false — never having written anything — if none applies, or the one
+// that does isn't installed, or it exits non-zero, so the caller can fall
+// back to OSC 52.
+func copyViaSystemTool(text string) bool {
+	var name string
+	var args []string
+	switch {
+	case runtime.GOOS == "darwin":
+		name = "pbcopy"
+	case os.Getenv("WAYLAND_DISPLAY") != "":
+		name = "wl-copy"
+	case os.Getenv("DISPLAY") != "":
+		if _, err := exec.LookPath("xclip"); err == nil {
+			name, args = "xclip", []string{"-selection", "clipboard"}
+		} else {
+			name, args = "xsel", []string{"--clipboard", "--input"}
+		}
+	default:
+		return false
+	}
+	if _, err := exec.LookPath(name); err != nil {
+		return false
+	}
+	cmd := exec.Command(name, args...)
+	cmd.Stdin = strings.NewReader(text)
+	return cmd.Run() == nil
+}
+
+// writeOSC52ToStdout is defaultCopyToClipboard's fallback for a session
+// with no local clipboard tool to shell out to (copyViaSystemTool):
+// writes text to the system clipboard via an OSC 52 terminal escape
+// sequence, wrapped for tmux's own passthrough requirement when running
+// inside one (tmux swallows an unwrapped OSC 52 sequence from a pane
+// unless `set -g allow-passthrough on` is set — wrapping it removes that
 // dependency on the user's tmux config). Writes through syncStdout
 // (output.go), not raw os.Stdout directly — see stdoutMu's doc comment for
-// why a direct write here used to silently corrupt the clipboard on some
+// why a direct write here used to risk corrupting the clipboard on some
 // terminals.
 func writeOSC52ToStdout(text string) {
 	seq := osc52.New(text)
