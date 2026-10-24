@@ -71,7 +71,7 @@ func run() error {
 	flag.StringVar(&storage, "storage", "file", `storage backend; "file" is the only supported value in v1 (Requirements FR15)`)
 	flag.BoolVar(&showVersion, "version", false, "print the version and exit")
 	flag.BoolVar(&enableOTel, "otel", false, "enable optional OpenTelemetry tracing (Design §3.10); also enabled implicitly when OTEL_EXPORTER_OTLP_ENDPOINT or OTEL_EXPORTER_OTLP_TRACES_ENDPOINT is set")
-	flag.BoolVar(&refreshProviders, "refresh-providers", false, "force a live re-fetch of the models.dev catalog: add newly-detectable providers, sync each already-configured provider's model list (add new, remove ones the catalog no longer lists) and refresh cost data — a provider not re-detected this run (env var unset, or manually added/self-hosted) is never touched (every field of an already-present provider stays untouched too — Design §4 addendum)")
+	flag.BoolVar(&refreshProviders, "refresh-providers", false, "force a live re-fetch of the models.dev catalog right now, bypassing the cache, and hard-fail if it can't be reached (every startup already does this sync against the cached catalog — see the provider-sync block in run() — so this flag is only for forcing it to happen immediately with fresh data instead of waiting out modelsDevCacheMaxAge)")
 	flag.BoolVar(&continueLatest, "continue", false, "resume the most recently updated chat session (across any agent) instead of starting a new one or auto-resuming the last-used agent — Design §5 addendum")
 	flag.Parse()
 
@@ -211,24 +211,24 @@ func run() error {
 		fmt.Fprintln(os.Stderr, "canopy: warning: couldn't read last-used model:", err)
 	}
 
-	// Explicit refresh (post-v0.1.0 addendum, Design §4 addendum):
-	// --refresh-providers forces a live re-fetch (bypasses the
-	// cache-freshness check entirely — FetchCached's maxAge<=0 contract) and
-	// re-runs detection, ADDING any newly-detectable providers to the
-	// existing file rather than regenerating it — an already-present
-	// provider itself, matched by Name (its BaseURL/APIKey/APIKeyEnv/
+	// Automatic provider sync (post-v0.1.0 addendum, Design §4 addendum):
+	// every startup with at least one provider/model already configured
+	// re-runs detection against the models.dev catalog and merges in
+	// whatever's new, ADDING any newly-detectable providers to the existing
+	// file rather than regenerating it — an already-present provider
+	// itself, matched by Name (its BaseURL/APIKey/APIKeyEnv/
 	// TimeoutSeconds), is never touched even if the catalog's data for it
-	// changed, since the user may have hand-edited it. This is the escape
-	// hatch for "I added a new API key to my environment after first run
-	// and want Canopy to notice without hand-editing JSON."
+	// changed, since the user may have hand-edited it. This used to require
+	// remembering to pass --refresh-providers; now it just happens, the
+	// same zero-manual-config spirit as the first-run detection below.
 	//
 	// A provider's *model list*, and per-model cost, are the deliberate
-	// exceptions to "never touched" — post-v0.1.0 addendum, "sync, not just
-	// add": models.dev listing more (or fewer) tool-call-capable models for
-	// an already-configured provider than it did when that provider was
-	// first configured is common (see mergeNewModelsForExistingProviders'
-	// doc comment for a real, confirmed case), so an already-known
-	// provider's model list is kept in sync both ways —
+	// exceptions to "never touched" — "sync, not just add": models.dev
+	// listing more (or fewer) tool-call-capable models for an
+	// already-configured provider than it did when that provider was first
+	// configured is common (see mergeNewModelsForExistingProviders' doc
+	// comment for a real, confirmed case), so an already-known provider's
+	// model list is kept in sync both ways —
 	// mergeNewModelsForExistingProviders adds what's newly listed,
 	// removeStaleModelsForRedetectedProviders removes what's no longer
 	// listed — and updateExistingModelCosts refreshes cost on whatever
@@ -242,69 +242,92 @@ func run() error {
 	// to providers this run actually re-detected (never a self-hosted or
 	// otherwise manually-added provider like a private Ollama server, whose
 	// models the catalog has no opinion on at all).
-	if refreshProviders {
-		catalog, _, err := modelsdev.FetchCached(detectCtx, modelsCachePath, 0)
+	//
+	// Catalog freshness: this consults the same on-disk cache the
+	// first-run path below uses (modelsDevCacheMaxAge, 24h) rather than
+	// hitting the network on every single launch — a fresh cache read is a
+	// local file read, not a network round-trip, so this adds no
+	// noticeable startup latency on most runs. --refresh-providers forces
+	// an immediate live re-fetch (maxAge<=0) instead of waiting out the
+	// cache.
+	//
+	// Fetch failure handling deliberately differs by how the sync was
+	// triggered: on a plain startup, a catalog fetch failure (offline,
+	// models.dev down, cache just went stale) must never block a user who
+	// already has a working provider config — it's silently skipped,
+	// falling through to run with providersFile exactly as loaded from
+	// disk. --refresh-providers, by contrast, is the user explicitly asking
+	// to see this happen right now, so a failure there is a real error
+	// worth surfacing loudly instead of silently doing nothing.
+	alreadyConfigured := len(providersFile.Providers) > 0 && len(providersFile.Models) > 0
+	if alreadyConfigured {
+		catalogMaxAge := modelsDevCacheMaxAge
+		if refreshProviders {
+			catalogMaxAge = 0
+		}
+		catalog, _, err := modelsdev.FetchCached(detectCtx, modelsCachePath, catalogMaxAge)
 		if err != nil {
-			return fmt.Errorf("refreshing models.dev catalog: %w", err)
-		}
-		detectedFile, _, _ := config.DetectProviders(catalog, os.Environ())
-
-		// Merge into a fresh, UNRESOLVED read of what's actually on disk
-		// (LoadRaw, not the already-loaded providersFile above): providersFile
-		// went through Load's APIKeyEnv->APIKey resolution, and saving that
-		// back out would write a resolved literal secret into providers.json
-		// — exactly what APIKeyEnv exists to avoid. See ProviderStore.Load's
-		// doc comment.
-		raw, err := providerStore.LoadRaw()
-		if err != nil {
-			return fmt.Errorf("re-reading provider config for --refresh-providers: %w", err)
-		}
-		addedProviders := mergeNewProviders(raw, detectedFile)
-		addedModels := mergeNewModelsForExistingProviders(raw, detectedFile)
-		removedModels := removeStaleModelsForRedetectedProviders(raw, detectedFile)
-		updatedCosts := updateExistingModelCosts(raw, detectedFile)
-
-		if len(addedProviders) > 0 || len(addedModels) > 0 || len(removedModels) > 0 || updatedCosts > 0 {
-			if err := providerStore.Save(raw); err != nil {
-				return fmt.Errorf("saving refreshed provider config: %w", err)
+			if refreshProviders {
+				return fmt.Errorf("refreshing models.dev catalog: %w", err)
 			}
-			// Reload (resolved) so this run's AgentService picks up the
-			// added/removed model(s)/refreshed cost immediately, no restart
-			// needed — same as the zero-config first-run path below.
-			providersFile, err = providerStore.Load()
-			if err != nil {
-				return fmt.Errorf("reloading provider config after refresh: %w", err)
-			}
-		}
-
-		var notes []string
-		if len(addedProviders) > 0 {
-			notes = append(notes, fmt.Sprintf("added %d new provider(s):\n  %s",
-				len(addedProviders), strings.Join(describeProviders(providersFile.Providers, addedProviders), "\n  ")))
-		}
-		if len(addedModels) > 0 {
-			names := make([]string, len(addedModels))
-			for i, m := range addedModels {
-				names[i] = m.Name
-			}
-			notes = append(notes, fmt.Sprintf("added %d new model(s) for already-configured providers:\n  %s",
-				len(addedModels), strings.Join(names, "\n  ")))
-		}
-		if len(removedModels) > 0 {
-			names := make([]string, len(removedModels))
-			for i, m := range removedModels {
-				names[i] = m.Name
-			}
-			notes = append(notes, fmt.Sprintf("removed %d model(s) the catalog no longer lists:\n  %s",
-				len(removedModels), strings.Join(names, "\n  ")))
-		}
-		if updatedCosts > 0 {
-			notes = append(notes, fmt.Sprintf("refreshed cost data for %d existing model(s)", updatedCosts))
-		}
-		if len(notes) > 0 {
-			fmt.Fprintf(os.Stderr, "canopy: --refresh-providers %s (%s)\n", strings.Join(notes, "; "), providerStore.Path())
 		} else {
-			fmt.Fprintln(os.Stderr, "canopy: --refresh-providers found nothing to add, remove, or update (already up to date, or no new provider env vars set)")
+			detectedFile, _, _ := config.DetectProviders(catalog, os.Environ())
+
+			// Merge into a fresh, UNRESOLVED read of what's actually on disk
+			// (LoadRaw, not the already-loaded providersFile above): providersFile
+			// went through Load's APIKeyEnv->APIKey resolution, and saving that
+			// back out would write a resolved literal secret into providers.json
+			// — exactly what APIKeyEnv exists to avoid. See ProviderStore.Load's
+			// doc comment.
+			raw, err := providerStore.LoadRaw()
+			if err != nil {
+				return fmt.Errorf("re-reading provider config to sync against the catalog: %w", err)
+			}
+			addedProviders := mergeNewProviders(raw, detectedFile)
+			addedModels := mergeNewModelsForExistingProviders(raw, detectedFile)
+			removedModels := removeStaleModelsForRedetectedProviders(raw, detectedFile)
+			updatedCosts := updateExistingModelCosts(raw, detectedFile)
+
+			if len(addedProviders) > 0 || len(addedModels) > 0 || len(removedModels) > 0 || updatedCosts > 0 {
+				if err := providerStore.Save(raw); err != nil {
+					return fmt.Errorf("saving refreshed provider config: %w", err)
+				}
+				// Reload (resolved) so this run's AgentService picks up the
+				// added/removed model(s)/refreshed cost immediately, no restart
+				// needed — same as the zero-config first-run path below.
+				providersFile, err = providerStore.Load()
+				if err != nil {
+					return fmt.Errorf("reloading provider config after refresh: %w", err)
+				}
+
+				var notes []string
+				if len(addedProviders) > 0 {
+					notes = append(notes, fmt.Sprintf("added %d new provider(s):\n  %s",
+						len(addedProviders), strings.Join(describeProviders(providersFile.Providers, addedProviders), "\n  ")))
+				}
+				if len(addedModels) > 0 {
+					names := make([]string, len(addedModels))
+					for i, m := range addedModels {
+						names[i] = m.Name
+					}
+					notes = append(notes, fmt.Sprintf("added %d new model(s) for already-configured providers:\n  %s",
+						len(addedModels), strings.Join(names, "\n  ")))
+				}
+				if len(removedModels) > 0 {
+					names := make([]string, len(removedModels))
+					for i, m := range removedModels {
+						names[i] = m.Name
+					}
+					notes = append(notes, fmt.Sprintf("removed %d model(s) the catalog no longer lists:\n  %s",
+						len(removedModels), strings.Join(names, "\n  ")))
+				}
+				if updatedCosts > 0 {
+					notes = append(notes, fmt.Sprintf("refreshed cost data for %d existing model(s)", updatedCosts))
+				}
+				fmt.Fprintf(os.Stderr, "canopy: provider sync %s (%s)\n", strings.Join(notes, "; "), providerStore.Path())
+			} else if refreshProviders {
+				fmt.Fprintln(os.Stderr, "canopy: --refresh-providers found nothing to add, remove, or update (already up to date, or no new provider env vars set)")
+			}
 		}
 	}
 

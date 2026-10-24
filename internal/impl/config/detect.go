@@ -56,6 +56,28 @@ var fallbackBaseURLs = map[string]string{
 	"togetherai": "https://api.together.ai/v1",
 }
 
+// baseURLOverrides corrects a catalog "api" field known to be wrong for
+// Canopy's OpenAI-compatible dispatch, taking priority over whatever
+// models.dev's catalog supplies — unlike fallbackBaseURLs above, which only
+// fills a gap when the catalog field is empty, this replaces a non-empty
+// one that's been confirmed to misroute requests.
+//
+//   - deepseek: models.dev's catalog lists "https://api.deepseek.com" (no
+//     "/v1"). impl/providers.newOpenAICompatible points openai-go at
+//     BaseURL verbatim, and openai-go joins relative request paths (e.g.
+//     "chat/completions") onto it the same way it does for its own default
+//     "https://api.openai.com/v1/" — so a BaseURL missing "/v1" sends
+//     requests to ".../chat/completions" instead of ".../v1/chat/completions".
+//     Confirmed live: selecting DeepSeek with the catalog's unmodified
+//     BaseURL 404s; appending "/v1" fixes it.
+//
+// Add an entry here only after confirming the catalog's value is actually
+// wrong (not just different from what you expected) — same bar as
+// fallbackBaseURLs' individually-verified entries.
+var baseURLOverrides = map[string]string{
+	"deepseek": "https://api.deepseek.com/v1",
+}
+
 // releaseDateLayout is the "YYYY-MM-DD" layout the large majority of
 // models.dev models use for release_date. Some (~3% in a live fetch) use a
 // coarser "YYYY-MM"; those are skipped rather than erroring (see
@@ -73,9 +95,9 @@ const releaseDateLayout = "2006-01-02"
 // stays testable without mutating real process env), a ProviderConfig is
 // built with APIKeyEnv set to whichever Env name matched first (never the
 // literal key — see entities.ProviderConfig's doc comment) and BaseURL
-// taken from the catalog's "api" field, falling back to fallbackBaseURLs
-// when the catalog omits it (see that var's doc comment — catalog data
-// always wins when present).
+// taken from baseURLOverrides when a catalog entry is known to need
+// correcting, else the catalog's own "api" field, else fallbackBaseURLs
+// when the catalog omits it entirely (see each var's doc comment).
 //
 // Type mapping: the 3 catalog providers Canopy has a native adapter for
 // (openai, anthropic, google — see nativeProviderTypes) get the matching
@@ -150,7 +172,10 @@ func DetectProviders(catalog *modelsdev.Catalog, environ []string) (file Provide
 			continue // env var not set: not a candidate at all, not a "skip"
 		}
 
-		baseURL := provider.BaseURL
+		baseURL := baseURLOverrides[id]
+		if baseURL == "" {
+			baseURL = provider.BaseURL
+		}
 		if baseURL == "" {
 			baseURL = fallbackBaseURLs[id]
 		}

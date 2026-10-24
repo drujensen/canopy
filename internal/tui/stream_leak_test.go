@@ -114,7 +114,7 @@ func TestStartTurn_NoLeak_ManyTurnsBackToBack(t *testing.T) {
 
 	const turns = 30
 	for i := 0; i < turns; i++ {
-		drainCmdWithTimeout(t, c, c.startTurnCmd(svc, ctx, []*message.Message{message.NewText(fmt.Sprintf("turn %d", i))}), 5*time.Second)
+		drainCmdWithTimeout(t, c, svc, ctx, c.startTurnCmd(svc, ctx, []*message.Message{message.NewText(fmt.Sprintf("turn %d", i))}), 5*time.Second)
 		require.Nil(t, c.statusErr, "turn %d must not have errored", i)
 	}
 
@@ -165,7 +165,7 @@ func TestStartTurn_NoLeak_ErrorMidStream(t *testing.T) {
 	// 30s, not 10s: openai-go's own retry backoff for the repeated 500s
 	// (5 retries, exponential up to 8s/attempt) can take up to roughly 15s
 	// cumulative on its own before the request finally gives up.
-	drainCmdWithTimeout(t, c, c.startTurnCmd(svc, ctx, []*message.Message{message.NewText("please read hello.txt")}), 30*time.Second)
+	drainCmdWithTimeout(t, c, svc, ctx, c.startTurnCmd(svc, ctx, []*message.Message{message.NewText("please read hello.txt")}), 30*time.Second)
 	require.GreaterOrEqual(t, atomic.LoadInt32(&callCount), int32(2), "the tool call must have triggered a second, failing HTTP round trip within the same turn")
 	require.Error(t, c.statusErr, "the second round trip's failure must surface as a streamErrMsg")
 
@@ -251,7 +251,7 @@ func TestStartTurn_NoLeak_ContextCancelledMidTurn(t *testing.T) {
 		cancel()
 	}()
 
-	drainCmdWithTimeout(t, c, cmd, 10*time.Second)
+	drainCmdWithTimeout(t, c, svc, runCtx, cmd, 10*time.Second)
 	<-cancelled
 	require.Nil(t, c.statusErr, "a user-initiated cancellation must not be shown as a turn error")
 	require.NotEmpty(t, c.transcript, "the cancellation must still be visibly acknowledged in the transcript")
@@ -310,7 +310,7 @@ func TestChatModel_Esc_CancelsInFlightTurnViaHandleKey(t *testing.T) {
 		require.Nil(t, c.handleKey(tea.KeyMsg{Type: tea.KeyEsc}, svc, ctx))
 	}()
 
-	drainCmdWithTimeout(t, c, cmd, 10*time.Second)
+	drainCmdWithTimeout(t, c, svc, ctx, cmd, 10*time.Second)
 	require.False(t, c.streamActive, "the turn must have finished (cancelled) by the time drainCmd returns")
 	require.Nil(t, c.statusErr)
 	require.NotEmpty(t, c.transcript)

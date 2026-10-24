@@ -14,9 +14,11 @@ import (
 // DetectProviders cares about: a native type (openai) with a recent
 // tool-call model and an older non-tool-call model; a native type (google)
 // whose only tool-call model should win over a newer non-tool-call one; a
-// generic/non-native provider (deepseek) with a BaseURL, detectable via the
-// generalized fallback dispatch; and a generic provider with no BaseURL at
-// all, which must never be detected regardless of its env var.
+// generic/non-native provider (deepseek) with a BaseURL missing "/v1" (the
+// catalog's real-world value — baseURLOverrides should correct it),
+// detectable via the generalized fallback dispatch; and a generic provider
+// with no BaseURL at all, which must never be detected regardless of its
+// env var.
 func fixtureCatalog() *modelsdev.Catalog {
 	return &modelsdev.Catalog{
 		"openai": {
@@ -193,7 +195,10 @@ func TestDetectProviders_GenericProviderUsesCatalogIDAsType(t *testing.T) {
 		}
 	}
 	assert.Equal(t, entities.ProviderType("deepseek"), provider.Type)
-	assert.Equal(t, "https://api.deepseek.com", provider.BaseURL)
+	// baseURLOverrides corrects the catalog's "https://api.deepseek.com"
+	// (missing "/v1", confirmed to 404) to the working URL — see that var's
+	// doc comment in detect.go.
+	assert.Equal(t, "https://api.deepseek.com/v1", provider.BaseURL)
 }
 
 func TestDetectProviders_EnvVarNotSetIsSkipped(t *testing.T) {

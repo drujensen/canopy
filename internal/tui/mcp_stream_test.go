@@ -99,12 +99,12 @@ func newMCPTestService(t *testing.T) *services.AgentService {
 // hanging forever if a Cmd never produces a terminal message — reproducing
 // the live-tmux bug (if it lives in this package) as a fast test failure
 // instead of a real hang.
-func drainCmdWithTimeout(t *testing.T, c *chatModel, cmd tea.Cmd, d time.Duration) {
+func drainCmdWithTimeout(t *testing.T, c *chatModel, svc *services.AgentService, ctx context.Context, cmd tea.Cmd, d time.Duration) {
 	t.Helper()
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		drainCmd(t, c, cmd)
+		drainCmd(t, c, svc, ctx, cmd)
 	}()
 	select {
 	case <-done:
@@ -113,13 +113,17 @@ func drainCmdWithTimeout(t *testing.T, c *chatModel, cmd tea.Cmd, d time.Duratio
 	}
 }
 
-// TestChatModel_MCPTool_ToolApprovalPromptAppears drives the real
+// TestChatModel_MCPTool_AutoApprovedExecutesToolAndCompletes drives the real
 // chatModel.startTurnCmd -> startTurn -> AgentService.RunMessagesStream path
 // (exactly what a live keypress in the TUI does) with a real, connected MCP
 // tool the fake provider requests, asserting the resulting
-// ToolApprovalRequestContent actually reaches chatModel's state (a rendered
-// approval prompt), not silently lost.
-func TestChatModel_MCPTool_ToolApprovalPromptAppears(t *testing.T) {
+// ToolApprovalRequestContent actually reaches chatModel's state and gets
+// auto-answered (post-v0.1.0 addendum: no prompt ever blocks here anymore —
+// see chat.go's pendingApprovals/sendAutoApprovals) — the real MCP tool Call
+// (a real network round trip to the httptest-backed MCP server) executes,
+// and the turn completes with the follow-up model response folded into the
+// transcript, with no approval decision left pending.
+func TestChatModel_MCPTool_AutoApprovedExecutesToolAndCompletes(t *testing.T) {
 	svc := newMCPTestService(t)
 	ctx := context.Background()
 	_, err := svc.StartChat(ctx, "chat-1", "assistant")
@@ -127,11 +131,12 @@ func TestChatModel_MCPTool_ToolApprovalPromptAppears(t *testing.T) {
 
 	c := newChatModel("chat-1", "assistant", nil, "m1", 80, 24)
 
-	drainCmdWithTimeout(t, c, c.startTurnCmd(svc, ctx, []*message.Message{message.NewText("please use the echo tool to say hi")}), 10*time.Second)
+	drainCmdWithTimeout(t, c, svc, ctx, c.startTurnCmd(svc, ctx, []*message.Message{message.NewText("please use the echo tool to say hi")}), 10*time.Second)
 
-	require.NotNil(t, c.pendingApproval, "an MCP tool call must surface a real approval prompt through the full chatModel/stream.go path")
-	require.Equal(t, "echo", c.pendingApprovalTool)
-	require.Contains(t, c.View(80, 24), "Tool approval requested: echo")
+	require.Empty(t, c.pendingApprovals, "the MCP tool's approval request must have been auto-answered, through the full chatModel/stream.go path")
+	require.NotContains(t, c.View(80, 24), "Tool approval requested", "no blocking prompt should ever render")
+	require.Len(t, c.transcript, 1)
+	require.Contains(t, c.transcript[0].text, "done")
 }
 
 // TestChatModel_MCPTool_PlainMessage_NoHang isolates whether merely having
@@ -194,40 +199,10 @@ func TestChatModel_MCPTool_PlainMessage_NoHang(t *testing.T) {
 	require.NoError(t, err)
 
 	c := newChatModel("chat-1", "assistant", nil, "m1", 80, 24)
-	drainCmdWithTimeout(t, c, c.startTurnCmd(svc, ctx, []*message.Message{message.NewText("hi")}), 10*time.Second)
+	drainCmdWithTimeout(t, c, svc, ctx, c.startTurnCmd(svc, ctx, []*message.Message{message.NewText("hi")}), 10*time.Second)
 
 	require.Len(t, c.transcript, 1)
 	require.Contains(t, c.transcript[0].text, "hello, no tools needed")
-}
-
-// TestChatModel_MCPTool_ApproveOnce_ExecutesToolAndCompletes drives the
-// approval decision itself ("y") through the real chatModel/stream.go path,
-// asserting the actual MCP tool Call (a real network round trip to the
-// httptest-backed MCP server) executes and the turn completes with the
-// follow-up model response folded into the transcript — the second half of
-// the live-tmux repro this package's other MCP tests above don't reach.
-func TestChatModel_MCPTool_ApproveOnce_ExecutesToolAndCompletes(t *testing.T) {
-	svc := newMCPTestService(t)
-	ctx := context.Background()
-	_, err := svc.StartChat(ctx, "chat-1", "assistant")
-	require.NoError(t, err)
-
-	c := newChatModel("chat-1", "assistant", nil, "m1", 80, 24)
-
-	drainCmdWithTimeout(t, c, c.startTurnCmd(svc, ctx, []*message.Message{message.NewText("please use the echo tool to say hi")}), 10*time.Second)
-	require.NotNil(t, c.pendingApproval)
-
-	drainCmdWithTimeout(t, c, c.handleApprovalKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'y'}}, svc, ctx), 10*time.Second)
-
-	require.Nil(t, c.pendingApproval, "approving must clear the pending prompt")
-	// Turn 1 (the request that surfaced the approval prompt) never wrote any
-	// text into the streaming buffer — only a ToolApprovalRequestContent,
-	// which applyUpdate doesn't accumulate as text — so finishStreaming's
-	// "only append if non-empty" check means it contributed no transcript
-	// entry of its own; turn 2 (post-approval) is the only one, and it
-	// contains both the "[calling echo...]" marker and the final reply.
-	require.Len(t, c.transcript, 1)
-	require.Contains(t, c.transcript[0].text, "done")
 }
 
 // TestRealProgram_MCPTool_AsyncRuntime drives the actual tea.Program runtime
@@ -268,13 +243,16 @@ func TestRealProgram_MCPTool_AsyncRuntime(t *testing.T) {
 	}
 	p.Send(tea.KeyMsg{Type: tea.KeyEnter})
 
-	// Give the real async runtime time to run the fake HTTP round trip and
-	// process the resulting streamChunkMsg/streamDoneMsg. There's no direct
-	// read access to the live model without racing the Update goroutine, so
-	// this just waits a fixed window — generous relative to the fake
-	// provider's near-instant response, but far short of the live-tmux
-	// repro's 35+ second hang, so a genuine reproduction here still fails
-	// fast — then Quits and inspects the final model Run() hands back.
+	// Give the real async runtime time to run both fake HTTP round trips
+	// (the initial request, then the auto-approval follow-up turn
+	// sendAutoApprovals starts automatically — post-v0.1.0 addendum, no
+	// prompt or keypress needed) and process the resulting
+	// streamChunkMsg/streamDoneMsg events. There's no direct read access to
+	// the live model without racing the Update goroutine, so this just
+	// waits a fixed window — generous relative to the fake provider's
+	// near-instant responses, but far short of the live-tmux repro's 35+
+	// second hang, so a genuine reproduction here still fails fast — then
+	// Quits and inspects the final model Run() hands back.
 	time.Sleep(500 * time.Millisecond)
 
 	p.Quit()
@@ -285,7 +263,8 @@ func TestRealProgram_MCPTool_AsyncRuntime(t *testing.T) {
 		finalModel, ok := res.model.(Model)
 		require.True(t, ok)
 		require.NotNil(t, finalModel.chat, "chat must still be set on the final model")
-		require.NotNil(t, finalModel.chat.pendingApproval, "the real async tea.Program runtime must have surfaced the MCP tool's approval prompt, matching the synchronous drainCmd tests above")
+		require.Empty(t, finalModel.chat.pendingApprovals, "the real async tea.Program runtime must have auto-answered the MCP tool's approval request, matching the synchronous drainCmd tests above")
+		require.NotEmpty(t, finalModel.chat.transcript, "the auto-approved follow-up turn must have completed and folded a reply into the transcript")
 	case <-time.After(15 * time.Second):
 		t.Fatal("tea.Program.Run() never returned after Quit — reproduces the live hang under the real async runtime")
 	}
@@ -358,7 +337,7 @@ func TestRealProgram_MCPTool_Gemini400Error(t *testing.T) {
 	require.NoError(t, err)
 
 	c := newChatModel("chat-1", "assistant", nil, "m1", 80, 24)
-	drainCmdWithTimeout(t, c, c.startTurnCmd(svc, ctx, []*message.Message{message.NewText("hi")}), 10*time.Second)
+	drainCmdWithTimeout(t, c, svc, ctx, c.startTurnCmd(svc, ctx, []*message.Message{message.NewText("hi")}), 10*time.Second)
 
 	require.NotNil(t, c.statusErr, "a real 400 from the provider must surface as a rendered error, not be silently swallowed")
 	t.Logf("statusErr: %v", c.statusErr)

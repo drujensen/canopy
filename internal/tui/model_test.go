@@ -43,7 +43,7 @@ func TestChatModel_StreamedContentAccumulates(t *testing.T) {
 
 	cmd := c.handleStreamMsg(streamChunkMsg{update: &agent.ResponseUpdate{
 		Contents: message.Contents{&message.TextContent{Text: "Hello"}},
-	}})
+	}}, nil, nil)
 	assert.Equal(t, "Hello", c.streaming.String())
 	assert.Contains(t, c.View(80, 24), "Hello", "in-flight streamed text must be visible before the turn finishes")
 	// A real chunk re-arms waitForStreamEvent; here streamCh is nil (no real
@@ -52,15 +52,18 @@ func TestChatModel_StreamedContentAccumulates(t *testing.T) {
 
 	c.handleStreamMsg(streamChunkMsg{update: &agent.ResponseUpdate{
 		Contents: message.Contents{&message.TextContent{Text: ", world"}},
-	}})
+	}}, nil, nil)
 	assert.Equal(t, "Hello, world", c.streaming.String())
 
 	require.Empty(t, c.transcript, "nothing should be folded into the transcript until the turn's stream is done")
 
+	// nil svc/ctx is safe here: no approval content was ever produced, so
+	// sendAutoApprovals (streamDoneMsg's case) short-circuits before either
+	// is touched.
 	c.handleStreamMsg(streamDoneMsg{result: &services.RunResult{
 		Response: &agent.Response{},
 		Todos:    nil,
-	}})
+	}}, nil, nil)
 
 	require.Len(t, c.transcript, 1)
 	assert.Equal(t, "Hello, world", c.transcript[0].text)
@@ -80,7 +83,7 @@ func TestChatModel_TodoPanelReflectsRunResult(t *testing.T) {
 			{ID: 1, Title: "Write the report", IsComplete: false},
 			{ID: 2, Title: "Send the email", IsComplete: true},
 		},
-	}})
+	}}, nil, nil)
 
 	require.Len(t, c.todos, 2)
 	view := c.View(80, 24)
@@ -89,10 +92,14 @@ func TestChatModel_TodoPanelReflectsRunResult(t *testing.T) {
 	assert.Contains(t, view, "[ ] Write the report")
 }
 
-// TestChatModel_ApprovalPromptAppears drives a synthetic streamChunkMsg
-// carrying a *message.ToolApprovalRequestContent and asserts the approval
-// prompt (Design §3.6) becomes visible, pre-empting the composer.
-func TestChatModel_ApprovalPromptAppears(t *testing.T) {
+// TestChatModel_ApprovalRequestIsQueuedNotPrompted drives a synthetic
+// streamChunkMsg carrying a *message.ToolApprovalRequestContent and asserts
+// it's queued onto c.pendingApprovals for later auto-answering (post-v0.1.0
+// addendum) rather than ever blocking the composer on a visible prompt the
+// way Design §3.6 originally specified — see
+// TestChatModel_ToolApproval_AutoApprovedWithoutPrompting, further down,
+// for the real end-to-end path that actually answers it.
+func TestChatModel_ApprovalRequestIsQueuedNotPrompted(t *testing.T) {
 	c := newChatModel("chat-1", "assistant", nil, "m1", 80, 24)
 
 	req := &message.ToolApprovalRequestContent{
@@ -101,14 +108,13 @@ func TestChatModel_ApprovalPromptAppears(t *testing.T) {
 	}
 	c.handleStreamMsg(streamChunkMsg{update: &agent.ResponseUpdate{
 		Contents: message.Contents{req},
-	}})
+	}}, nil, nil)
 
-	require.NotNil(t, c.pendingApproval)
-	assert.Equal(t, "run_shell", c.pendingApprovalTool)
+	require.Len(t, c.pendingApprovals, 1)
+	assert.Same(t, req, c.pendingApprovals[0])
 	view := c.View(80, 24)
-	assert.Contains(t, view, "Tool approval requested: run_shell")
-	assert.Contains(t, view, "approve once")
-	assert.Contains(t, view, "always allow this tool")
+	assert.NotContains(t, view, "Tool approval requested", "no blocking prompt should ever render")
+	assert.Empty(t, c.streaming.String(), "an approval request alone, with no text, must not render anything in the streaming buffer")
 }
 
 // TestChatModel_View_LongMultilineError_StaysOneLineAndKeepsSidebarVisible
@@ -228,7 +234,7 @@ func TestChatModel_StartTurnCmd_ClearsPriorStatusErr(t *testing.T) {
 	cmd := c.startTurnCmd(svc, ctx, []*message.Message{message.NewText("hi")})
 	assert.Nil(t, c.statusErr, "statusErr must already be cleared once startTurnCmd returns, before the turn even completes")
 
-	drainCmd(t, c, cmd)
+	drainCmd(t, c, svc, ctx, cmd)
 	assert.Nil(t, c.statusErr, "a successful turn must not have re-introduced an error")
 }
 
@@ -396,7 +402,7 @@ func chatCompletionResponse(text string) map[string]any {
 // runtime performs — until a nil Cmd (or nil Msg, i.e. a closed channel)
 // ends the turn.
 //
-// handleKey's "enter" case and respondApproval (post-v0.1.0 addendum: the
+// handleKey's "enter" case and sendAutoApprovals (post-v0.1.0 addendum: the
 // "still working" spinner) return tea.Batch(startTurnCmd(...), spinner.Tick)
 // rather than startTurnCmd's bare Cmd, so cmd() can yield a tea.BatchMsg —
 // unlike every other Msg this loop sees, that's not something
@@ -407,7 +413,13 @@ func chatCompletionResponse(text string) map[string]any {
 // spinner tick, whose own resulting spinner.TickMsg isn't relevant to any
 // test using this helper — none of them assert on spinner animation, only
 // on the underlying turn completing without hanging or leaking).
-func drainCmd(t *testing.T, c *chatModel, cmd tea.Cmd) {
+//
+// svc/ctx are threaded through to every handleStreamMsg call (post-v0.1.0
+// addendum: auto-approval) since a streamDoneMsg that leaves anything in
+// c.pendingApprovals now starts a real follow-up turn right there — this
+// loop has to keep draining that follow-up turn's own events too, same as
+// any other.
+func drainCmd(t *testing.T, c *chatModel, svc *services.AgentService, ctx context.Context, cmd tea.Cmd) {
 	t.Helper()
 	for cmd != nil {
 		msg := cmd()
@@ -426,12 +438,12 @@ func drainCmd(t *testing.T, c *chatModel, cmd tea.Cmd) {
 				}
 				switch subMsg.(type) {
 				case streamChunkMsg, streamDoneMsg, streamErrMsg:
-					cmd = c.handleStreamMsg(subMsg)
+					cmd = c.handleStreamMsg(subMsg, svc, ctx)
 				}
 			}
 			continue
 		}
-		cmd = c.handleStreamMsg(msg)
+		cmd = c.handleStreamMsg(msg, svc, ctx)
 	}
 }
 
@@ -480,11 +492,21 @@ func newApprovalTestService(t *testing.T) (svc *services.AgentService, marker st
 	return svc, marker
 }
 
-// TestChatModel_ApprovalFlow_ApproveOnce_DoesNotPersist drives the real
-// keybinding path: "y" (approve once) lets the pending tool call execute,
-// but a *second* run request still surfaces a fresh approval prompt,
-// proving "approve once" really is once — not a standing rule.
-func TestChatModel_ApprovalFlow_ApproveOnce_DoesNotPersist(t *testing.T) {
+// TestChatModel_ToolApproval_AutoApprovedWithoutPrompting is this package's
+// coverage for the post-v0.1.0 addendum that replaced Design §3.6's
+// blocking "y / a / n" prompt entirely: approvals were annoying enough in
+// practice that Canopy now auto-approves every tool-approval request the
+// instant it surfaces, via a standing "always allow" rule, never pausing on
+// a keypress. Drives the real path (startTurnCmd, drainCmd) for two
+// consecutive run_shell requests in the same chat and asserts neither one
+// ever leaves anything in c.pendingApprovals, and both actually execute the
+// tool — proving the first request's auto-approval really did install the
+// standing rule the second request's own auto-approval then also benefits
+// from (same mechanism agent-framework-go's toolapproval middleware already
+// gives a human's "always allow" decision — see
+// domain/services/toolapproval_scope_test.go for that machinery's own
+// coverage).
+func TestChatModel_ToolApproval_AutoApprovedWithoutPrompting(t *testing.T) {
 	svc, marker := newApprovalTestService(t)
 	ctx := context.Background()
 	_, err := svc.StartChat(ctx, "chat-1", "assistant")
@@ -492,45 +514,16 @@ func TestChatModel_ApprovalFlow_ApproveOnce_DoesNotPersist(t *testing.T) {
 
 	c := newChatModel("chat-1", "assistant", nil, "m1", 80, 24)
 
-	drainCmd(t, c, c.startTurnCmd(svc, ctx, []*message.Message{message.NewText("please run the marker command")}))
-	require.NotNil(t, c.pendingApproval, "the first run_shell request must surface an approval prompt")
+	drainCmd(t, c, svc, ctx, c.startTurnCmd(svc, ctx, []*message.Message{message.NewText("please run the marker command")}))
+	assert.Empty(t, c.pendingApprovals, "the run_shell request must have been auto-approved, never left pending")
 	_, statErr := os.Stat(marker)
-	assert.True(t, os.IsNotExist(statErr))
-
-	drainCmd(t, c, c.handleApprovalKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'y'}}, svc, ctx))
-	assert.Nil(t, c.pendingApproval, "approving once must clear the pending prompt")
-	_, statErr = os.Stat(marker)
-	require.NoError(t, statErr, "the tool must have executed once approved")
+	require.NoError(t, statErr, "the tool must have executed automatically, with no approval prompt in the way")
 
 	require.NoError(t, os.Remove(marker))
-	drainCmd(t, c, c.startTurnCmd(svc, ctx, []*message.Message{message.NewText("please run it again")}))
-	assert.NotNil(t, c.pendingApproval, "approve-once must not have installed a standing rule — the second request must prompt again")
-}
-
-// TestChatModel_ApprovalFlow_AlwaysAllow_Persists drives the "a" (always
-// allow this tool) keybinding and proves the standing rule it installs
-// actually suppresses the prompt on a subsequent run within the same chat.
-func TestChatModel_ApprovalFlow_AlwaysAllow_Persists(t *testing.T) {
-	svc, marker := newApprovalTestService(t)
-	ctx := context.Background()
-	_, err := svc.StartChat(ctx, "chat-1", "assistant")
-	require.NoError(t, err)
-
-	c := newChatModel("chat-1", "assistant", nil, "m1", 80, 24)
-
-	drainCmd(t, c, c.startTurnCmd(svc, ctx, []*message.Message{message.NewText("please run the marker command")}))
-	require.NotNil(t, c.pendingApproval)
-
-	drainCmd(t, c, c.handleApprovalKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'a'}}, svc, ctx))
-	assert.Nil(t, c.pendingApproval)
-	_, statErr := os.Stat(marker)
-	require.NoError(t, statErr, "the tool must have executed once always-allowed")
-
-	require.NoError(t, os.Remove(marker))
-	drainCmd(t, c, c.startTurnCmd(svc, ctx, []*message.Message{message.NewText("please run it again")}))
-	assert.Nil(t, c.pendingApproval, "always-allow must have installed a standing rule that auto-approves the second request")
+	drainCmd(t, c, svc, ctx, c.startTurnCmd(svc, ctx, []*message.Message{message.NewText("please run it again")}))
+	assert.Empty(t, c.pendingApprovals, "a second request for the same tool must also auto-approve, under the standing rule the first auto-approval installed")
 	_, statErr = os.Stat(marker)
-	assert.NoError(t, statErr, "the tool must have executed again automatically under the standing rule")
+	assert.NoError(t, statErr, "the tool must have executed again automatically")
 }
 
 // --- ctrl+a (switch agent) / ctrl+o (switch model) overlay tests
@@ -649,34 +642,6 @@ func TestChatModel_CtrlO_OpensModelPicker_SelectingSwitchesModel(t *testing.T) {
 	assert.Equal(t, "m2", gotModel, "SetModel must have actually persisted the switch, not just produced a message")
 }
 
-// TestChatModel_CtrlA_CtrlO_NoopDuringPendingApproval asserts ctrl+a/ctrl+o
-// are swallowed (not opening the overlay) while an approval prompt is
-// pending — routed to handleApprovalKey instead, which has no case for
-// either key, matching "approve"/"always allow"/"deny" being the only valid
-// responses while a tool call awaits a decision.
-func TestChatModel_CtrlA_CtrlO_NoopDuringPendingApproval(t *testing.T) {
-	svc := newSwitchTestService(t)
-	ctx := context.Background()
-	_, err := svc.StartChat(ctx, "chat-1", "assistant")
-	require.NoError(t, err)
-
-	c := newChatModel("chat-1", "assistant", nil, "m1", 80, 24)
-	c.pendingApproval = &message.ToolApprovalRequestContent{
-		RequestID: "req-1",
-		ToolCall:  &message.FunctionCallContent{CallID: "call-1", Name: "run_shell", Arguments: "{}"},
-	}
-
-	cmd := c.handleKey(tea.KeyMsg{Type: tea.KeyCtrlA}, svc, ctx)
-	assert.Nil(t, cmd)
-	assert.Nil(t, c.picker, "ctrl+a must not open the agent-switch overlay while an approval prompt is pending")
-	assert.NotNil(t, c.pendingApproval, "the pending approval must be untouched")
-
-	cmd = c.handleKey(tea.KeyMsg{Type: tea.KeyCtrlO}, svc, ctx)
-	assert.Nil(t, cmd)
-	assert.Nil(t, c.picker, "ctrl+o must not open the model-switch overlay while an approval prompt is pending")
-	assert.NotNil(t, c.pendingApproval)
-}
-
 // TestChatModel_CtrlA_CtrlO_NoopDuringActiveStream asserts ctrl+a/ctrl+o are
 // no-ops while a turn is actively streaming, the same guard "enter"
 // (sending a message) already applies — switching agent/model mid-tool-call
@@ -719,7 +684,7 @@ func TestModel_CtrlN_StartsGenuinelyNewChat_ResetsState(t *testing.T) {
 	c := newChatModel("chat-1", "assistant", nil, "m1", 80, 24)
 	c.transcript = append(c.transcript, transcriptEntry{role: message.RoleUser, text: "hello before new chat"})
 	c.todos = []todo.Item{{ID: 1, Title: "leftover todo"}}
-	c.pendingApproval = nil // starts nil; asserted below on the fresh chat too
+	c.pendingApprovals = nil // starts nil; asserted below on the fresh chat too
 
 	m := Model{svc: svc, ctx: ctx, screen: screenChat, chat: c, width: 80, height: 24}
 
@@ -742,7 +707,7 @@ func TestModel_CtrlN_StartsGenuinelyNewChat_ResetsState(t *testing.T) {
 	assert.Equal(t, startedMsg.chatID, next.chat.chatID)
 	assert.Empty(t, next.chat.transcript, "a genuinely new chat must start with an empty transcript")
 	assert.Empty(t, next.chat.todos, "a genuinely new chat must start with no leftover todos")
-	assert.Nil(t, next.chat.pendingApproval, "a genuinely new chat must start with no pending approval")
+	assert.Empty(t, next.chat.pendingApprovals, "a genuinely new chat must start with no pending approvals")
 	assert.False(t, next.chat.streamActive)
 	assert.Equal(t, "m1", next.chat.model)
 
@@ -804,27 +769,6 @@ func TestChatModel_CtrlN_NoopDuringActiveStream(t *testing.T) {
 	assert.Nil(t, cmd, "ctrl+n must be a no-op while a turn is actively streaming")
 	assert.True(t, c.streamActive, "streamActive must be untouched by the no-op key press")
 	assert.Equal(t, "chat-1", c.chatID, "the chat must not have been replaced while streaming")
-}
-
-// TestChatModel_CtrlN_NoopDuringPendingApproval asserts ctrl+n is swallowed
-// (routed to handleApprovalKey, which has no case for it) while a tool
-// approval is pending, rather than abandoning that pending decision.
-func TestChatModel_CtrlN_NoopDuringPendingApproval(t *testing.T) {
-	svc := newSwitchTestService(t)
-	ctx := context.Background()
-	_, err := svc.StartChat(ctx, "chat-1", "assistant")
-	require.NoError(t, err)
-
-	c := newChatModel("chat-1", "assistant", nil, "m1", 80, 24)
-	c.pendingApproval = &message.ToolApprovalRequestContent{
-		RequestID: "req-1",
-		ToolCall:  &message.FunctionCallContent{CallID: "call-1", Name: "run_shell", Arguments: "{}"},
-	}
-
-	cmd := c.handleKey(tea.KeyMsg{Type: tea.KeyCtrlN}, svc, ctx)
-	assert.Nil(t, cmd, "ctrl+n must be a no-op while an approval prompt is pending")
-	assert.NotNil(t, c.pendingApproval, "the pending approval must be untouched")
-	assert.Equal(t, "chat-1", c.chatID, "the chat must not have been replaced while an approval is pending")
 }
 
 // --- ctrl+s (skills browser) tests (post-v0.1.0 addendum, Design §3.11/FR19) ---

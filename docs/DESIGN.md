@@ -259,6 +259,22 @@ future calls. State lives on `*agent.Session` (§3.9) under its own key.
 TUI renders a pending approval request as a prompt with "approve once" / "always allow this
 tool" — Claude Code's two-tier permission model.
 
+**Addendum (post-v0.1.0): the prompt was removed — every tool approval is now auto-answered.**
+The two-tier prompt above was found annoying enough in practice that `tui/chat.go` no longer
+blocks the composer on a `ToolApprovalRequestContent` at all: `chatModel.applyUpdate` queues each
+one onto `pendingApprovals` (a slice, not a single field — a turn can request several tools at
+once and every one needs its own answer) instead of setting a pending-decision field, and once the
+turn is fully over, `handleStreamMsg`'s `streamDoneMsg` case calls `sendAutoApprovals`, which
+answers every queued request with `AlwaysApproveToolResponse()` in one combined follow-up message
+and starts the next turn automatically — no keypress, no visible prompt. `ApprovalRequired()` on
+`Bash`/`FileWrite`/MCP tools, `agent/harness/toolapproval`'s own `Rule`-based reconciliation, and
+every fix in the two bugfix addenda directly below are all still exercised exactly as before; only
+the TUI-level human-in-the-loop decision was removed, which also incidentally fixes a real bug the
+single-field `pendingApproval` had: a multi-tool-call turn where more than one call needed approval
+only ever let the *last* one's request be answered, permanently losing the earlier ones (some
+OpenAI-compatible providers, e.g. DeepSeek, reject the resulting malformed request outright:
+"insufficient tool messages following tool_calls message").
+
 **Bugfix addenda (post-v0.1.0): two confirmed agent-framework-go bugs in this exact area, both
 fixed at Canopy's own boundary with the framework (`domain/services.AgentService` and
 `impl/harness.ChatHistoryProvider`) rather than patching the vendored framework itself.**
@@ -757,8 +773,10 @@ calls the new `AgentService.SetAgent`/`SetModel` against the *same* chat ID and 
 screen — neither ends the chat or clears its history; only `Chat.AgentName`/`Chat.ModelOverride`
 change, and `buildTopLevelAgent` already re-resolves both fresh on every turn, so the very next
 message is driven by the switched agent/model with the full prior transcript intact. Both
-keybindings are no-ops while a tool-approval prompt is pending or a turn is actively streaming, the
-same guard `enter` (sending a message) already applies. The sidebar gained `Agent: ...` and
+keybindings are no-ops while a turn is actively streaming, the same guard `enter` (sending a
+message) already applies — §3.6's addendum removed the separate "tool-approval prompt pending"
+no-op case entirely, since approval is now auto-answered before the user ever gets a chance to
+press anything. The sidebar gained `Agent: ...` and
 `Model: ...` lines, each with its own `(ctrl+x to switch)` hint. (Post-v0.1.0: a third `Mode: ...`
 line with a `ctrl+p` hint lived here too, before §3.8's addendum superseded it — the sidebar now
 shows only Agent/Model plus the live todo panel.)

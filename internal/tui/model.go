@@ -276,7 +276,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if _, ok := msg.(streamDoneMsg); ok {
 			firstExchangeJustCompleted = len(m.chat.transcript) == 1 && !m.chat.titleAttempted
 		}
-		cmd := m.chat.handleStreamMsg(msg)
+		cmd := m.chat.handleStreamMsg(msg, m.svc, m.ctx)
 		if firstExchangeJustCompleted {
 			m.chat.titleAttempted = true
 			cmd = tea.Batch(cmd, generateTitleCmd(m.svc, m.ctx, m.chat.chatID))
