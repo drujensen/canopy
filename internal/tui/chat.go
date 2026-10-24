@@ -318,7 +318,7 @@ func writeOSC52ToStdout(text string) {
 	if os.Getenv("TMUX") != "" {
 		seq = seq.Tmux()
 	}
-	_, _ = seq.WriteTo(syncStdout{})
+	_, _ = seq.WriteTo(syncStdout{File: os.Stdout})
 }
 
 const (
