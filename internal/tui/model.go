@@ -193,17 +193,38 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m.handleKey(msg)
 
 	case tea.MouseMsg:
-		// Mouse-wheel scrolling (post-v0.1.0 addendum, cmd/canopy's
-		// tea.WithMouseCellMotion — see that call's own doc comment for the
-		// click-drag-selection tradeoff and the Shift-drag workaround) —
+		// Mouse-wheel scrolling and, post-v0.1.0 addendum, click-drag text
+		// selection (cmd/canopy's tea.WithMouseCellMotion — see that call's
+		// own doc comment for the Shift-drag-native-selection fallback) —
 		// only meaningful on the chat screen, and only when no overlay
 		// picker (ctrl+a/ctrl+o/ctrl+s/ctrl+h) is showing instead of the
-		// transcript; bubbles/viewport.Model.Update itself ignores anything
-		// but a wheel event, so no further filtering is needed here.
-		if m.screen == screenChat && m.chat != nil && m.chat.picker == nil {
+		// transcript. A wheel event still goes to bubbles/viewport.Model.
+		// Update directly (it ignores anything else); every other button/
+		// motion/release event goes to chatModel's own handleMouse instead,
+		// which is what actually implements selection.
+		if m.screen != screenChat || m.chat == nil || m.chat.picker != nil {
+			return m, nil
+		}
+		switch msg.Button {
+		case tea.MouseButtonWheelUp, tea.MouseButtonWheelDown, tea.MouseButtonWheelLeft, tea.MouseButtonWheelRight:
 			var cmd tea.Cmd
 			m.chat.viewport, cmd = m.chat.viewport.Update(msg)
 			return m, cmd
+		default:
+			return m, m.chat.handleMouse(msg)
+		}
+
+	case clearCopyToastMsg:
+		// Fades chatModel.copySelectionCmd's "Copied N lines" callout a
+		// couple of seconds after it was shown (post-v0.1.0 addendum).
+		// rerenderContent, not refreshViewport: clearing the toast frees up
+		// the row viewportHeight was borrowing for it, same reasoning as
+		// copySelectionCmd's own comment on why it doesn't call
+		// refreshViewport (which would also reset the scroll position).
+		if m.chat != nil && m.chat.copyToast != "" {
+			m.chat.copyToast = ""
+			m.chat.viewport.Height = m.chat.viewportHeight()
+			m.chat.rerenderContent()
 		}
 		return m, nil
 

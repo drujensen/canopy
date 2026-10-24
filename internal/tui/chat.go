@@ -6,8 +6,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
 	"strings"
+	"time"
 
+	"github.com/aymanbagabas/go-osc52/v2"
 	"github.com/charmbracelet/bubbles/key"
 	"github.com/charmbracelet/bubbles/list"
 	"github.com/charmbracelet/bubbles/spinner"
@@ -85,6 +88,33 @@ type textSegment struct {
 	text string
 }
 
+// renderedLine is one physical row of the rendered transcript — already
+// word-wrapped and padded to the viewport's content width, tagged with the
+// lipgloss style that applies to it (post-v0.1.0 addendum: mouse-driven
+// text selection). Flattening the transcript to this line-granular form
+// (buildContentLines) rather than rendering each entry straight to a
+// single multi-line string is what makes selection possible at all: a
+// mouse coordinate maps directly to one (line index, rune column) pair,
+// and highlighting a selection is just re-rendering the affected lines
+// with an extra Reverse(true) on the selected rune range — see
+// renderLine.
+type renderedLine struct {
+	text  string
+	style lipgloss.Style
+}
+
+// selPoint identifies one end of a mouse-drag text selection as a
+// position in c.contentLines: line is an index into that slice; col is a
+// rune index into that line's (already-padded) text.
+type selPoint struct {
+	line, col int
+}
+
+// clearCopyToastMsg clears chatModel.copyToast a couple of seconds after a
+// mouse-driven copy (copySelectionCmd's tea.Tick) — the same
+// "acknowledge, then fade" convention Claude Code's own copy callout uses.
+type clearCopyToastMsg struct{}
+
 // chatModel is the chat screen (Design §5): a scrolling transcript fed by
 // AgentService's streaming entry points, a composer, and a sidebar showing
 // the live todo panel (Design §3.7).
@@ -139,13 +169,14 @@ type chatModel struct {
 	composer textarea.Model
 	viewport viewport.Model
 
-	// sidebarHidden toggles the agent/model/todo sidebar off (ctrl+b), so a
-	// terminal's own line-based text selection (triple-click, click-drag)
-	// doesn't also grab the sidebar's columns alongside the transcript —
-	// there's no way to exclude a screen region from a terminal's own copy
-	// selection, so hiding the sidebar entirely is the only real fix. The
-	// transcript/composer simply take the full width while hidden; see
-	// mainWidth.
+	// sidebarHidden toggles the agent/model/todo sidebar off (ctrl+b) for
+	// anyone who just wants the extra width — the transcript/composer
+	// simply take the full width while hidden; see mainWidth. Originally
+	// added because a terminal's own line-based text selection had no way
+	// to skip over the sidebar's columns; superseded for that specific
+	// purpose by this package's own mouse-driven selection (hitTest/
+	// mainColOffset), which is scoped to the main content pane regardless
+	// of whether the sidebar is shown.
 	sidebarHidden bool
 
 	// pendingToolCalls maps a tool call's CallID to its tool Name, recorded
@@ -178,6 +209,51 @@ type chatModel struct {
 	statusErr error
 
 	width, height int
+
+	// contentLines is the transcript's current flattened, line-granular
+	// render (buildContentLines) — the source of truth refreshViewport's
+	// SetContent is built from, and what hitTest/selectedText read against
+	// for mouse-driven text selection (post-v0.1.0 addendum). Rebuilt
+	// whenever the transcript actually changes; untouched by a selection
+	// drag itself, which only changes *which* existing lines render
+	// highlighted (rerenderContent).
+	contentLines []renderedLine
+
+	// selecting is true from a left-button mouse press until its matching
+	// release — see handleMouse. selAnchor is where the drag started;
+	// selCurrent is the drag's current (or final, once released) point.
+	// hasSel is true once a drag has actually moved to a second point (a
+	// plain click with no drag never becomes a selection to render or
+	// copy) and stays true after release so the highlight persists until a
+	// new press clears it, the same "stays highlighted until you click
+	// elsewhere" convention every text editor uses.
+	selecting             bool
+	selAnchor, selCurrent selPoint
+	hasSel                bool
+
+	// mainColOffset is the screen column the main content pane (transcript/
+	// composer) starts at — 0 when the sidebar is hidden, otherwise the
+	// sidebar's own actual rendered width (border/padding included).
+	// Recomputed by View on every render (the one place that already knows
+	// it, having just measured the sidebar to lipgloss.JoinHorizontal it)
+	// so hitTest can translate a raw mouse X coordinate into a column
+	// within the transcript without re-rendering the sidebar itself.
+	mainColOffset int
+
+	// copyToast is a transient "Copied N lines" acknowledgment shown below
+	// the composer after a mouse-driven copy (post-v0.1.0 addendum,
+	// matching the callout Claude Code itself shows), cleared a couple of
+	// seconds later by clearCopyToastMsg. Takes the same borrowed row
+	// statusErr does (viewportHeight) — the two are never expected
+	// simultaneously enough to need two reserved rows.
+	copyToast string
+
+	// copyToClipboard sends text to the system clipboard via an OSC 52
+	// terminal escape sequence (copySelectionCmd) — a field rather than a
+	// hardcoded call so tests can substitute a recording stub instead of
+	// writing a real escape sequence to os.Stdout. Always non-nil: set to
+	// the real OSC 52 writer by newChatModel.
+	copyToClipboard func(string)
 }
 
 // composerKeyMap is textarea.DefaultKeyMap with InsertNewline rebound off
@@ -215,16 +291,38 @@ func newChatModel(chatID, agentName string, todos []todo.Item, model string, wid
 	sp.Spinner = spinner.Dot
 
 	c := &chatModel{
-		chatID:    chatID,
-		agentName: agentName,
-		todos:     todos,
-		model:     model,
-		spinner:   sp,
-		composer:  composer,
-		viewport:  viewport.New(width, height),
+		chatID:          chatID,
+		agentName:       agentName,
+		todos:           todos,
+		model:           model,
+		spinner:         sp,
+		composer:        composer,
+		viewport:        viewport.New(width, height),
+		copyToClipboard: writeOSC52ToStdout,
 	}
 	c.resize(width, height)
 	return c
+}
+
+// writeOSC52ToStdout is copyToClipboard's real implementation: writes text
+// to the system clipboard via an OSC 52 terminal escape sequence, wrapped
+// for tmux's own passthrough requirement when running inside one (tmux
+// swallows an unwrapped OSC 52 sequence from a pane unless
+// `set -g allow-passthrough on` is set — wrapping it removes that
+// dependency on the user's tmux config). Writing directly to os.Stdout
+// from here, concurrently with Bubble Tea's own renderer, is deliberate
+// and safe in practice: OSC 52 produces no visible output at all (nothing
+// for the two writers to visually race over), and a short escape sequence
+// is written in one os.File.Write syscall, which doesn't interleave bytes
+// with another same-sized write the way a naive buffered/chunked writer
+// could — the same technique tmux and Neovim's own clipboard integration
+// use.
+func writeOSC52ToStdout(text string) {
+	seq := osc52.New(text)
+	if os.Getenv("TMUX") != "" {
+		seq = seq.Tmux()
+	}
+	_, _ = seq.WriteTo(os.Stdout)
 }
 
 const (
@@ -249,14 +347,15 @@ func (c *chatModel) mainWidth() int {
 
 // viewportHeight returns how many rows the transcript viewport itself
 // gets: the whole chat screen height minus the composer/spinner bar, minus
-// one more row while a status error line is currently being shown below it
-// (View appends that line dynamically, outside the viewport) — borrowed
-// only while it's actually displayed, rather than permanently reserved,
-// so the common case (no error) renders using the terminal's full height
-// instead of leaving rows permanently blank at the bottom.
+// one more row while a status error line or a copy-toast (post-v0.1.0
+// addendum) is currently being shown below it (View appends whichever one
+// dynamically, outside the viewport) — borrowed only while one is actually
+// displayed, rather than permanently reserved, so the common case (neither)
+// renders using the terminal's full height instead of leaving rows
+// permanently blank at the bottom.
 func (c *chatModel) viewportHeight() int {
 	h := c.height - composerLines
-	if c.statusErr != nil {
+	if c.statusErr != nil || c.copyToast != "" {
 		h--
 	}
 	if h < 1 {
@@ -317,10 +416,11 @@ func (c *chatModel) handleKey(msg tea.KeyMsg, svc *services.AgentService, ctx co
 		c.viewport.PageDown()
 		return nil
 	case "ctrl+b":
-		// Toggles the sidebar (post-v0.1.0 addendum): a terminal's own
-		// line-based copy/paste selection has no way to skip over the
-		// sidebar's columns, so hiding it is the only way to select/copy a
-		// transcript line cleanly. "ctrl+b" is otherwise only a redundant
+		// Toggles the sidebar (post-v0.1.0 addendum), for anyone who just
+		// wants the extra width — no longer required for clean mouse
+		// selection the way it originally was, since selection is now
+		// scoped to the main content pane's own columns regardless (see
+		// hitTest/mainColOffset). "ctrl+b" is otherwise only a redundant
 		// alt-binding for "left" in the composer's own keymap
 		// (textarea.DefaultKeyMap's CharacterBackward), so claiming it here
 		// loses no composer functionality — "left" still moves the cursor
@@ -687,6 +787,221 @@ func (c *chatModel) cancelTurn() {
 	}
 }
 
+// handleMouse applies one tea.MouseMsg to the chat's mouse-driven text
+// selection (post-v0.1.0 addendum): a left-button press starts a fresh
+// selection (clearing whatever was selected before) at the clicked
+// position; motion while a press is active extends it to wherever the
+// drag currently is; release commits it and, if the drag actually moved
+// (a plain click with no drag selects nothing), copies the selected text
+// to the system clipboard. model.go's Update routes every non-wheel
+// MouseMsg here — wheel events go to c.viewport.Update instead, handling
+// scroll the way they always have.
+//
+// Edge-autoscroll — continuing to scroll and extend the selection once the
+// drag reaches the viewport's top/bottom edge — is a deliberately separate
+// follow-up, not handled here: a drag that leaves the viewport's rows
+// simply stops extending until it comes back, the same way clampToContent
+// already clamps a drag that leaves the *columns* (into the sidebar, or
+// past the right edge) rather than losing track of it entirely.
+func (c *chatModel) handleMouse(msg tea.MouseMsg) tea.Cmd {
+	switch msg.Action {
+	case tea.MouseActionPress:
+		if msg.Button != tea.MouseButtonLeft {
+			return nil
+		}
+		line, col, ok := c.hitTest(msg.X, msg.Y)
+		if !ok {
+			return nil
+		}
+		c.selecting = true
+		c.hasSel = false
+		c.selAnchor = selPoint{line: line, col: col}
+		c.selCurrent = c.selAnchor
+		c.rerenderContent()
+		return nil
+
+	case tea.MouseActionMotion:
+		if !c.selecting {
+			return nil
+		}
+		line, col, ok := c.hitTest(msg.X, msg.Y)
+		if !ok {
+			line, col = c.clampToContent(msg.X, msg.Y)
+		}
+		next := selPoint{line: line, col: col}
+		if next == c.selCurrent {
+			return nil
+		}
+		c.selCurrent = next
+		if c.selCurrent != c.selAnchor {
+			c.hasSel = true
+		}
+		c.rerenderContent()
+		return nil
+
+	case tea.MouseActionRelease:
+		if !c.selecting {
+			return nil
+		}
+		c.selecting = false
+		if !c.hasSel {
+			return nil
+		}
+		return c.copySelectionCmd()
+	}
+	return nil
+}
+
+// hitTest maps a screen coordinate to a (line, col) position in
+// c.contentLines — col is clamped into [0, len(line)] so a click past the
+// end of a short (padded-with-spaces-but-still-shorter-in-rune-terms...
+// no — every stored line is already padded to exactly the viewport's width,
+// so this clamp is purely defensive) line still lands validly. Returns
+// ok=false for a coordinate outside the viewport's own rows (the sidebar,
+// composer, or an overlay picker occupy other rows/columns entirely) or
+// to the left of the main content pane's columns (the sidebar, when
+// shown) — there's nothing in the transcript to select there.
+func (c *chatModel) hitTest(x, y int) (line, col int, ok bool) {
+	if y < 0 || y >= c.viewport.Height {
+		return 0, 0, false
+	}
+	mainX := x - c.mainColOffset
+	if mainX < 0 {
+		return 0, 0, false
+	}
+	lineIdx := c.viewport.YOffset + y
+	if lineIdx < 0 || lineIdx >= len(c.contentLines) {
+		return 0, 0, false
+	}
+	return lineIdx, clampCol(mainX, c.contentLines[lineIdx].text), true
+}
+
+// clampToContent is hitTest's fallback for a drag that has moved outside
+// the viewport's rows/columns (but not necessarily outside the terminal
+// screen) — clamping to the nearest valid line/column keeps the drag
+// extending the selection right up to that edge instead of freezing the
+// moment the cursor leaves the content area.
+func (c *chatModel) clampToContent(x, y int) (line, col int) {
+	if len(c.contentLines) == 0 {
+		return 0, 0
+	}
+	if y < 0 {
+		y = 0
+	} else if y >= c.viewport.Height {
+		y = c.viewport.Height - 1
+	}
+	lineIdx := c.viewport.YOffset + y
+	if lineIdx < 0 {
+		lineIdx = 0
+	} else if lineIdx >= len(c.contentLines) {
+		lineIdx = len(c.contentLines) - 1
+	}
+	return lineIdx, clampCol(x-c.mainColOffset, c.contentLines[lineIdx].text)
+}
+
+// clampCol clamps a raw column into [0, len([]rune(text))].
+func clampCol(col int, text string) int {
+	if col < 0 {
+		return 0
+	}
+	if n := len([]rune(text)); col > n {
+		return n
+	}
+	return col
+}
+
+// selectionLineRange returns the current selection's line range in
+// top-to-bottom order, regardless of whether the drag ran upward or
+// downward from its anchor.
+func (c *chatModel) selectionLineRange() (minLine, maxLine int) {
+	a, b := c.selAnchor.line, c.selCurrent.line
+	if a > b {
+		return b, a
+	}
+	return a, b
+}
+
+// selectionColsForLine returns the [start, end) rune range selected on
+// content line lineIdx, lineRuneCount runes long, given the current
+// (possibly either-direction) anchor/current selection — the full line for
+// any line strictly between the selection's first and last line, and the
+// actual column range for the first/last line, the same convention every
+// text editor uses: it's the characters *between* the two click points,
+// not whole lines, unless the drag happens to span more than one line.
+func (c *chatModel) selectionColsForLine(lineIdx, lineRuneCount int) (start, end int) {
+	a, b := c.selAnchor, c.selCurrent
+	if a.line > b.line || (a.line == b.line && a.col > b.col) {
+		a, b = b, a
+	}
+	switch {
+	case lineIdx == a.line && lineIdx == b.line:
+		return a.col, b.col
+	case lineIdx == a.line:
+		return a.col, lineRuneCount
+	case lineIdx == b.line:
+		return 0, b.col
+	default:
+		return 0, lineRuneCount
+	}
+}
+
+// selectedText extracts the current selection's plain text (trailing pad
+// spaces trimmed off each line — c.contentLines' lines are always padded
+// to the viewport's full width, which would otherwise show up as trailing
+// whitespace on every copied line) and reports how many lines it spans,
+// for copySelectionCmd's clipboard payload and toast.
+func (c *chatModel) selectedText() (text string, lineCount int) {
+	if !c.hasSel {
+		return "", 0
+	}
+	minLine, maxLine := c.selectionLineRange()
+	out := make([]string, 0, maxLine-minLine+1)
+	for i := minLine; i <= maxLine && i < len(c.contentLines); i++ {
+		runes := []rune(c.contentLines[i].text)
+		start, end := c.selectionColsForLine(i, len(runes))
+		if start < 0 {
+			start = 0
+		}
+		if end > len(runes) {
+			end = len(runes)
+		}
+		if start > end {
+			start = end
+		}
+		out = append(out, strings.TrimRight(string(runes[start:end]), " "))
+	}
+	return strings.Join(out, "\n"), len(out)
+}
+
+// copySelectionCmd sends the current selection to the system clipboard
+// (c.copyToClipboard) and shows a transient "Copied N lines" acknowledgment
+// — the same callout Claude Code itself shows on mouse-release — cleared a
+// couple of seconds later by clearCopyToastMsg. Returns nil (not even a
+// no-op tea.Cmd) if there's nothing selected, which handleMouse's release
+// case already guards against but this checks again defensively since it's
+// exported-shaped enough to call directly from a test.
+func (c *chatModel) copySelectionCmd() tea.Cmd {
+	text, lines := c.selectedText()
+	if text == "" {
+		return nil
+	}
+	c.copyToClipboard(text)
+	label := "line"
+	if lines != 1 {
+		label = "lines"
+	}
+	c.copyToast = fmt.Sprintf("Copied %d %s", lines, label)
+	// Not refreshViewport: that also calls GotoBottom, which would yank
+	// the scroll position out from under a selection the user just made
+	// by deliberately scrolling to a spot that likely isn't the bottom.
+	// copyToast changes viewportHeight's own return value (it borrows a
+	// row the same way statusErr does), so the height does need resizing
+	// here; rerenderContent alone wouldn't pick that up.
+	c.viewport.Height = c.viewportHeight()
+	c.rerenderContent()
+	return tea.Tick(2*time.Second, func(time.Time) tea.Msg { return clearCopyToastMsg{} })
+}
+
 // handleStreamMsg applies one streaming event (see stream.go) to the chat's
 // state: accumulating text for streamChunkMsg, folding the finished reply
 // into the transcript and updating Todos for streamDoneMsg, or surfacing an
@@ -900,30 +1215,72 @@ func (c *chatModel) finishStreaming() {
 	}
 }
 
-// refreshViewport re-renders the transcript (plus any in-flight streaming
-// text) into the viewport and scrolls to the bottom, so new content is
-// always visible as it streams in. Each entry is word-wrapped to the
-// viewport's own width (renderEntry) rather than left to run off-screen —
-// without this, any line longer than the terminal's width (a long
-// assistant reply, a pasted user message, a skill body shown via ctrl+s)
-// either gets silently clipped by the terminal or scrolls off unreadably,
-// exactly the bug this addendum fixes.
+// refreshViewport rebuilds the transcript's flattened line representation
+// (buildContentLines — plus any in-flight streaming text) and scrolls to
+// the bottom, so new content is always visible as it streams in. Each
+// entry is word-wrapped to the viewport's own width rather than left to
+// run off-screen — without this, any line longer than the terminal's width
+// (a long assistant reply, a pasted user message, a skill body shown via
+// ctrl+s) either gets silently clipped by the terminal or scrolls off
+// unreadably, exactly the bug this addendum fixes. Call this whenever the
+// transcript's actual *content* changes; for a mouse-driven selection
+// changing only which already-built lines render highlighted, use
+// rerenderContent instead — it doesn't rebuild content or move the scroll
+// position, which GotoBottom here deliberately does.
 func (c *chatModel) refreshViewport() {
 	// Recomputed on every call, not just resize: viewportHeight depends on
-	// c.statusErr, which changes independently of any resize (startTurnCmd
-	// clearing it, handleStreamMsg's streamErrMsg case setting it) — see
-	// viewportHeight's own doc comment.
+	// c.statusErr/c.copyToast, which change independently of any resize
+	// (startTurnCmd clearing statusErr, handleStreamMsg's streamErrMsg case
+	// setting it, copySelectionCmd setting copyToast) — see viewportHeight's
+	// own doc comment.
 	c.viewport.Height = c.viewportHeight()
+	c.contentLines = c.buildContentLines()
+	c.viewport.SetContent(c.renderContentLines())
+	c.viewport.GotoBottom()
+}
+
+// rerenderContent re-applies styling to the already-built c.contentLines
+// without rebuilding them or moving the scroll position (bubbles/
+// viewport.SetContent doesn't reset YOffset on its own unless it's now out
+// of bounds, so this is safe mid-scroll) — used while a mouse-drag
+// selection is active or just released, since the user is deliberately
+// looking at content that may not be at the bottom and extending/
+// committing a selection must never yank the view out from under them.
+func (c *chatModel) rerenderContent() {
+	c.viewport.SetContent(c.renderContentLines())
+}
+
+// buildContentLines flattens the whole transcript (plus any in-flight
+// streaming reply) into one line-per-renderedLine slice — see that type's
+// own doc comment for why this flattened form, rather than one multi-line
+// string per entry, is what mouse-driven selection needs. One blank
+// (whitespace-padded, unstyled) separator line follows every entry,
+// mirroring the "\n\n" join refreshViewport used before this addendum.
+func (c *chatModel) buildContentLines() []renderedLine {
 	width := c.viewport.Width
-	var b strings.Builder
+	var lines []renderedLine
+	blank := renderedLine{text: strings.Repeat(" ", max(width, 0)), style: lipgloss.NewStyle()}
 	for _, e := range c.transcript {
-		b.WriteString(renderEntry(e, width))
-		b.WriteString("\n\n")
+		lines = append(lines, entryLines(e, width)...)
+		lines = append(lines, blank)
 	}
 	if len(c.streaming) > 0 {
-		b.WriteString(renderEntry(transcriptEntry{role: message.RoleAssistant, segments: c.streaming}, width))
+		lines = append(lines, entryLines(transcriptEntry{role: message.RoleAssistant, segments: c.streaming}, width)...)
 	}
-	if b.Len() == 0 {
+	return lines
+}
+
+// renderContentLines joins c.contentLines into the string c.viewport.
+// SetContent wants, applying each line's style — and, for any line
+// c.hasSelection overlaps, an extra Reverse(true) highlight over the
+// selected rune range (renderLine) — rather than the lines' plain text.
+// An empty transcript (nothing in c.contentLines at all) renders the
+// purely cosmetic empty-chat greeting instead of a blank scrollback; that
+// never happens once c.contentLines has anything in it (even a single
+// blank separator line counts), so a selection is never possible to make
+// against the greeting in the first place.
+func (c *chatModel) renderContentLines() string {
+	if len(c.contentLines) == 0 {
 		// A brand-new (or freshly ctrl+n'd) chat has nothing in transcript
 		// and nothing streaming yet — rather than an empty scrollback,
 		// render a purely cosmetic greeting to avoid dead space. This is
@@ -933,10 +1290,38 @@ func (c *chatModel) refreshViewport() {
 		// that has real content (the first user message, via handleKey's
 		// "enter" case) replaces it outright rather than needing to be
 		// explicitly cleared anywhere.
-		b.WriteString(greetingStyle.Render(defaultGreeting))
+		return greetingStyle.Render(defaultGreeting)
 	}
-	c.viewport.SetContent(b.String())
-	c.viewport.GotoBottom()
+	rendered := make([]string, len(c.contentLines))
+	for i, l := range c.contentLines {
+		rendered[i] = c.renderLine(i, l)
+	}
+	return strings.Join(rendered, "\n")
+}
+
+// renderLine renders one content line, splitting it into pre/selected/post
+// rune ranges and layering Reverse(true) onto just the selected piece when
+// idx falls within the current selection (post-v0.1.0 addendum: mouse-
+// driven text selection) — the line's own style still applies to all three
+// pieces, so e.g. a selected run of assistant prose keeps its background
+// and merely inverts on top of it, the same way a real text editor's
+// selection highlight layers over existing syntax coloring rather than
+// replacing it.
+func (c *chatModel) renderLine(idx int, l renderedLine) string {
+	if !c.hasSel {
+		return l.style.Render(l.text)
+	}
+	minLine, maxLine := c.selectionLineRange()
+	if idx < minLine || idx > maxLine {
+		return l.style.Render(l.text)
+	}
+	runes := []rune(l.text)
+	start, end := c.selectionColsForLine(idx, len(runes))
+	if start >= end {
+		return l.style.Render(l.text)
+	}
+	pre, sel, post := string(runes[:start]), string(runes[start:end]), string(runes[end:])
+	return l.style.Render(pre) + l.style.Reverse(true).Render(sel) + l.style.Render(post)
 }
 
 // defaultGreeting is the placeholder shown in place of an empty transcript
@@ -983,18 +1368,19 @@ func reconstructTranscript(messages []*message.Message) []transcriptEntry {
 	return entries
 }
 
-// renderEntry renders one transcript entry, word-wrapping its body text to
-// width (the viewport's content width) via lipgloss's Width-based Render —
-// the same wrap-not-clip idiom renderStatusErrLine already established for
-// the status line. width <= 0 (not expected in practice, since resize
-// always sets c.viewport.Width before the first refreshViewport call, but
-// defensive against a zero-value chatModel in a test) skips wrapping
-// entirely rather than passing a nonsensical width to lipgloss.
+// entryLines renders one transcript entry into renderedLines, word-wrapped
+// to width (the viewport's content width) via lipgloss's Width-based
+// Render — the same wrap-not-clip idiom renderStatusErrLine already
+// established for the status line. width <= 0 (not expected in practice,
+// since resize always sets c.viewport.Width before the first
+// refreshViewport call, but defensive against a zero-value chatModel in a
+// test) skips wrapping entirely rather than passing a nonsensical width to
+// lipgloss.
 //
 // No "you"/"assistant" label is rendered (post-v0.1.0 addendum) — a user
 // message is instead set off by a lighter background block
 // (userMessageStyle) spanning the full content width; an assistant reply
-// renders segment-by-segment (renderSegments) — its own background block
+// renders segment-by-segment (segmentLines) — its own background block
 // for prose (assistantMessageStyle, a different shade from a user
 // message's, per the later addendum answering "it's hard to tell tool
 // output from the actual response"), a dim indented aside with no
@@ -1002,20 +1388,20 @@ func reconstructTranscript(messages []*message.Message) []transcriptEntry {
 // (ctrl+s skill body, "Cancelled.", etc.) keeps its "system" label, since
 // removing that one specifically wasn't asked for and it's the only cue
 // distinguishing it from a real assistant reply.
-func renderEntry(e transcriptEntry, width int) string {
+func entryLines(e transcriptEntry, width int) []renderedLine {
 	if e.system {
-		text := e.text
-		if width > 0 {
-			text = lipgloss.NewStyle().Width(width).Render(text)
+		lines := []renderedLine{{text: "system", style: systemLabelStyle}}
+		for _, l := range wrapAndPad(e.text, width) {
+			lines = append(lines, renderedLine{text: l, style: lipgloss.NewStyle()})
 		}
-		return systemLabelStyle.Render("system") + "\n" + text
+		return lines
 	}
 	if e.role == message.RoleUser {
-		style := userMessageStyle
-		if width > 0 {
-			style = style.Width(width)
+		var lines []renderedLine
+		for _, l := range wrapAndPad(e.text, width) {
+			lines = append(lines, renderedLine{text: l, style: userMessageStyle})
 		}
-		return style.Render(e.text)
+		return lines
 	}
 	segments := e.segments
 	if len(segments) == 0 && e.text != "" {
@@ -1025,98 +1411,106 @@ func renderEntry(e transcriptEntry, width int) string {
 		// silently rendering nothing.
 		segments = []textSegment{{kind: segmentProse, text: e.text}}
 	}
-	return renderSegments(segments, width)
-}
-
-// renderSegments renders an assistant reply's segments (see segmentKind)
-// one after another, each according to its own kind — prose and
-// tool-call/result/error never share a style, so the two are
-// distinguishable even interleaved within one reply. Segments are already
-// merged at append time (appendStreamingText folds consecutive text
-// fragments into one prose segment), so no further grouping happens here:
-// each segment, as recorded, becomes exactly one rendered block.
-func renderSegments(segments []textSegment, width int) string {
-	blocks := make([]string, len(segments))
-	for i, seg := range segments {
-		blocks[i] = renderSegmentBlock(seg, width)
+	var lines []renderedLine
+	for _, seg := range segments {
+		lines = append(lines, segmentLines(seg, width)...)
 	}
-	return strings.Join(blocks, "\n")
+	return lines
 }
 
-// renderSegmentBlock renders one segment: prose gets assistantMessageStyle's
-// full-width background block, same treatment renderEntry gives a user
-// message but a different shade; a tool call gets a "● " marker
-// (toolCallStyle), a tool result or error gets a "  ⎿ " marker
-// (toolResultStyle/toolErrorStyle) — Claude Code's own convention for a
-// de-emphasized aside, deliberately left with no background at all so it
-// reads as subordinate to the highlighted prose around it.
-func renderSegmentBlock(seg textSegment, width int) string {
+// wrapAndPad word-wraps text to width physical lines, each padded with
+// trailing spaces to exactly width columns (lipgloss's Width-based Render
+// does both in one pass) — width <= 0 skips wrapping/padding entirely.
+func wrapAndPad(text string, width int) []string {
+	if width <= 0 {
+		return strings.Split(text, "\n")
+	}
+	return strings.Split(lipgloss.NewStyle().Width(width).Render(text), "\n")
+}
+
+// segmentLines renders one segment into renderedLines: prose gets
+// assistantMessageStyle's full-width background block, same treatment
+// entryLines gives a user message but a different shade; a tool call gets
+// a "● " marker (toolCallStyle), a tool result or error gets a "  ⎿ "
+// marker (toolResultStyle/toolErrorStyle) — Claude Code's own convention
+// for a de-emphasized aside, deliberately left with no background at all
+// so it reads as subordinate to the highlighted prose around it.
+func segmentLines(seg textSegment, width int) []renderedLine {
 	switch seg.kind {
 	case segmentToolCall:
-		return renderIndentedLines("● ", seg.text, toolCallStyle, width)
+		return indentedLines("● ", seg.text, toolCallStyle, width)
 	case segmentToolResult:
-		return renderIndentedLines("  ⎿ ", seg.text, toolResultStyle, width)
+		return indentedLines("  ⎿ ", seg.text, toolResultStyle, width)
 	case segmentToolError:
-		return renderIndentedLines("  ⎿ ✗ ", seg.text, toolErrorStyle, width)
+		return indentedLines("  ⎿ ✗ ", seg.text, toolErrorStyle, width)
 	default: // segmentProse
-		style := assistantMessageStyle
-		if width > 0 {
-			style = style.Width(width)
+		var lines []renderedLine
+		for _, l := range wrapAndPad(seg.text, width) {
+			lines = append(lines, renderedLine{text: l, style: assistantMessageStyle})
 		}
-		return style.Render(seg.text)
+		return lines
 	}
 }
 
-// renderIndentedLines renders a tool call/result/error block line by line:
+// indentedLines renders a tool call/result/error block into renderedLines:
 // prefix marks only the very first physical row (after word-wrapping to
 // width minus the prefix's own width), and every continuation row —
 // whether from an embedded newline in text or from wrapping a long one —
 // gets blank indentation of the same width instead, so the block's text
 // stays visually aligned under its own marker rather than running back
-// out to the left margin.
-func renderIndentedLines(prefix, text string, style lipgloss.Style, width int) string {
+// out to the left margin. Each returned line is prefixWidth+contentWidth
+// runes — the same total width every other kind of line pads to — so
+// hitTest/selection never need to special-case a tool line's narrower
+// wrapped content.
+func indentedLines(prefix, text string, style lipgloss.Style, width int) []renderedLine {
 	prefixWidth := lipgloss.Width(prefix)
 	contentWidth := width - prefixWidth
 
-	var physicalLines []string
+	var physical []string
 	for _, line := range strings.Split(text, "\n") {
 		if contentWidth > 0 {
-			physicalLines = append(physicalLines, strings.Split(lipgloss.NewStyle().Width(contentWidth).Render(line), "\n")...)
+			physical = append(physical, strings.Split(lipgloss.NewStyle().Width(contentWidth).Render(line), "\n")...)
 		} else {
-			physicalLines = append(physicalLines, line)
+			physical = append(physical, line)
 		}
 	}
 
 	blank := strings.Repeat(" ", prefixWidth)
-	var b strings.Builder
-	for i, pl := range physicalLines {
-		if i > 0 {
-			b.WriteString("\n")
-		}
+	lines := make([]renderedLine, len(physical))
+	for i, pl := range physical {
 		marker := prefix
 		if i > 0 {
 			marker = blank
 		}
-		b.WriteString(style.Render(marker + pl))
+		lines[i] = renderedLine{text: marker + pl, style: style}
 	}
-	return b.String()
+	return lines
 }
 
 // View renders the chat screen: either an open overlay picker (ctrl+a/
 // ctrl+o, post-v0.1.0 addendum) or the transcript with either the composer
 // or the "thinking" spinner at the bottom, plus a status line for the last
-// stream error, if any — beside the sidebar (agent + model + todos), unless
-// ctrl+b has hidden it (post-v0.1.0 addendum: hiding it is what lets a
-// terminal's own line-based copy/paste selection grab a transcript line
-// cleanly, with no sidebar columns mixed into the same lines). Tool
-// approval no longer has a bottom-bar state of its own — it's auto-answered
-// without ever stopping the spinner (post-v0.1.0 addendum).
+// stream error (or, taking priority, a transient copy-toast — post-v0.1.0
+// addendum: mouse-driven text selection), if either — beside the sidebar
+// (agent + model + todos), unless ctrl+b has hidden it. Hiding the sidebar
+// is no longer required for clean copying the way it used to be (mouse
+// selection is scoped to the main content pane's own columns regardless —
+// see hitTest/mainColOffset), but it's kept as an option for anyone who
+// just wants the extra width. Tool approval no longer has a bottom-bar
+// state of its own — it's auto-answered without ever stopping the spinner
+// (post-v0.1.0 addendum).
 func (c *chatModel) View(width, height int) string {
+	if c.sidebarHidden {
+		c.mainColOffset = 0
+	}
+
 	if c.picker != nil {
 		if c.sidebarHidden {
 			return c.picker.View()
 		}
-		return lipgloss.JoinHorizontal(lipgloss.Top, c.renderSidebar(), c.picker.View())
+		sidebar := c.renderSidebar()
+		c.mainColOffset = lipgloss.Width(sidebar)
+		return lipgloss.JoinHorizontal(lipgloss.Top, sidebar, c.picker.View())
 	}
 
 	var bottom string
@@ -1132,14 +1526,31 @@ func (c *chatModel) View(width, height int) string {
 	}
 
 	main := lipgloss.JoinVertical(lipgloss.Left, c.viewport.View(), bottom)
-	if c.statusErr != nil {
+	switch {
+	case c.copyToast != "":
+		// Takes priority over statusErr (post-v0.1.0 addendum: mouse-driven
+		// copy) — the two share one borrowed row (viewportHeight) rather
+		// than needing two, and a copy acknowledgment is short-lived enough
+		// that losing statusErr's line for a couple of seconds is a fine
+		// trade against reserving a row for both every single frame.
+		main = lipgloss.JoinVertical(lipgloss.Left, main, copyToastStyle.Render(c.copyToast))
+	case c.statusErr != nil:
 		main = lipgloss.JoinVertical(lipgloss.Left, main, errorStyle.Render(c.renderStatusErrLine()))
 	}
 
 	if c.sidebarHidden {
 		return main
 	}
-	return lipgloss.JoinHorizontal(lipgloss.Top, c.renderSidebar(), main)
+	// mainColOffset is set here, not just measured once in resize, because
+	// hitTest (mouse-driven selection) needs the sidebar's own *actual*
+	// rendered width (border/padding included) to translate a raw mouse X
+	// coordinate into a column within the transcript — View is the one
+	// place that already measures it to lipgloss.JoinHorizontal the two
+	// panes together, so caching it here avoids re-rendering the sidebar
+	// just to remeasure it on every mouse event.
+	sidebar := c.renderSidebar()
+	c.mainColOffset = lipgloss.Width(sidebar)
+	return lipgloss.JoinHorizontal(lipgloss.Top, sidebar, main)
 }
 
 // renderSidebar renders the agent/model indicators (post-v0.1.0 §3.4/§4

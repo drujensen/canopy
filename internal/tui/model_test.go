@@ -1428,9 +1428,112 @@ func TestChatModel_ApplyUpdate_ToolError_AlwaysRendersRegardlessOfTool(t *testin
 	assert.Equal(t, segmentToolError, c.streaming[1].kind, "a failed call must produce a segmentToolError, regardless of which tool it was")
 	assert.Contains(t, c.streaming[1].text, "no such file or directory")
 
-	// The "✗" marker itself is added at render time (renderIndentedLines),
-	// not stored in the raw segment text — check it actually reaches the
+	// The "✗" marker itself is added at render time (indentedLines), not
+	// stored in the raw segment text — check it actually reaches the
 	// rendered transcript too, not just the right segment kind.
-	rendered := renderSegmentBlock(c.streaming[1], 80)
-	assert.Contains(t, rendered, "✗")
+	var rendered strings.Builder
+	for _, l := range segmentLines(c.streaming[1], 80) {
+		rendered.WriteString(l.style.Render(l.text))
+	}
+	assert.Contains(t, rendered.String(), "✗")
+}
+
+// TestChatModel_MouseDrag_SelectsAndCopiesText is this package's coverage
+// for mouse-driven text selection (post-v0.1.0 addendum): a left-button
+// press starts a selection, motion extends it, and release commits it and
+// copies the selected text via the injectable copyToClipboard hook —
+// exactly the OSC 52 + toast behavior Claude Code's own mouse-release
+// callout performs, verified here without touching a real terminal.
+func TestChatModel_MouseDrag_SelectsAndCopiesText(t *testing.T) {
+	c := newChatModel("chat-1", "assistant", nil, "m1", 40, 10)
+	c.sidebarHidden = true
+	for i := 0; i < 5; i++ {
+		c.transcript = append(c.transcript, transcriptEntry{role: message.RoleUser, text: fmt.Sprintf("line %d", i)})
+	}
+	c.refreshViewport()
+	c.View(40, 10) // measures mainColOffset (0, sidebar hidden)
+
+	var copied string
+	c.copyToClipboard = func(s string) { copied = s }
+
+	// buildContentLines interleaves a blank separator line after every
+	// transcript entry, and refreshViewport's GotoBottom has scrolled past
+	// the first entry/separator pair here — Y:1 is the first row that
+	// actually lands on text ("line 2") rather than a blank separator.
+	cmd := c.handleMouse(tea.MouseMsg{Action: tea.MouseActionPress, Button: tea.MouseButtonLeft, X: 0, Y: 1})
+	assert.Nil(t, cmd)
+	assert.True(t, c.selecting)
+	assert.False(t, c.hasSel, "a press alone selects nothing until it moves")
+
+	cmd = c.handleMouse(tea.MouseMsg{Action: tea.MouseActionMotion, X: 6, Y: 1})
+	assert.Nil(t, cmd)
+	assert.True(t, c.hasSel, "motion past the anchor must start a real selection")
+
+	cmd = c.handleMouse(tea.MouseMsg{Action: tea.MouseActionRelease})
+	// copySelectionCmd writes to the clipboard and sets copyToast
+	// synchronously, before returning the tea.Tick command that only
+	// clears the toast later — no need to run cmd itself (and its 2s
+	// delay) to observe either effect.
+	require.NotNil(t, cmd, "releasing a real drag must return the copy command")
+
+	assert.Equal(t, "line 2", copied)
+	assert.Equal(t, "Copied 1 line", c.copyToast)
+	assert.False(t, c.selecting)
+}
+
+// TestChatModel_MouseClick_NoDrag_DoesNotCopy covers the "plain click"
+// case handleMouse's release branch guards against: a press and release at
+// the same point must not copy anything or show a toast, since nothing was
+// ever selected.
+func TestChatModel_MouseClick_NoDrag_DoesNotCopy(t *testing.T) {
+	c := newChatModel("chat-1", "assistant", nil, "m1", 40, 10)
+	c.sidebarHidden = true
+	c.transcript = append(c.transcript, transcriptEntry{role: message.RoleUser, text: "hello"})
+	c.refreshViewport()
+	c.View(40, 10)
+
+	called := false
+	c.copyToClipboard = func(string) { called = true }
+
+	c.handleMouse(tea.MouseMsg{Action: tea.MouseActionPress, Button: tea.MouseButtonLeft, X: 2, Y: 0})
+	cmd := c.handleMouse(tea.MouseMsg{Action: tea.MouseActionRelease})
+
+	assert.Nil(t, cmd)
+	assert.False(t, called, "a click with no drag must not copy anything")
+	assert.Empty(t, c.copyToast)
+}
+
+// TestChatModel_MouseSelection_ExcludesSidebar covers the scoping the user
+// explicitly asked for: a selection must only ever cover the main
+// transcript pane, never the sidebar, regardless of whether it's shown —
+// a press over the sidebar's own columns must not start a selection at
+// all.
+func TestChatModel_MouseSelection_ExcludesSidebar(t *testing.T) {
+	c := newChatModel("chat-1", "assistant", nil, "m1", 60, 10)
+	c.transcript = append(c.transcript, transcriptEntry{role: message.RoleUser, text: "hello"})
+	c.refreshViewport()
+	c.View(60, 10) // sidebar visible: measures a non-zero mainColOffset
+
+	require.Greater(t, c.mainColOffset, 0, "the sidebar must occupy real columns for this test to be meaningful")
+
+	cmd := c.handleMouse(tea.MouseMsg{Action: tea.MouseActionPress, Button: tea.MouseButtonLeft, X: 0, Y: 0})
+	assert.Nil(t, cmd)
+	assert.False(t, c.selecting, "a press inside the sidebar's columns must not start a selection")
+}
+
+// TestChatModel_MouseWheel_NotRoutedToSelection documents that
+// handleMouse never sees wheel events at all: model.go's own Update routes
+// those straight to c.viewport.Update instead (so scrolling and selection
+// can coexist), but handleMouse itself only reacts to Press/Motion/Release
+// of the left button — any other action/button is a no-op here.
+func TestChatModel_MouseWheel_NotRoutedToSelection(t *testing.T) {
+	c := newChatModel("chat-1", "assistant", nil, "m1", 40, 10)
+	c.sidebarHidden = true
+	c.transcript = append(c.transcript, transcriptEntry{role: message.RoleUser, text: "hello"})
+	c.refreshViewport()
+	c.View(40, 10)
+
+	cmd := c.handleMouse(tea.MouseMsg{Action: tea.MouseActionPress, Button: tea.MouseButtonWheelUp})
+	assert.Nil(t, cmd)
+	assert.False(t, c.selecting, "a non-left button must never start a selection")
 }

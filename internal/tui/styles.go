@@ -31,8 +31,8 @@ var (
 	// part of the highlighted reply.
 	assistantMessageStyle = lipgloss.NewStyle().Background(lipgloss.AdaptiveColor{Light: "#eef2fb", Dark: "#1b2430"})
 
-	// toolCallStyle marks a "● toolname(...)" call line (renderIndentedLines)
-	// — dim but still clearly legible, distinct from both
+	// toolCallStyle marks a "● toolname(...)" call line (indentedLines) —
+	// dim but still clearly legible, distinct from both
 	// assistantMessageStyle's highlighted prose and plain unstyled text.
 	toolCallStyle = lipgloss.NewStyle().Foreground(lipgloss.AdaptiveColor{Light: "243", Dark: "246"})
 
@@ -53,6 +53,12 @@ var (
 	systemLabelStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("5"))
 
 	errorStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("1")).Bold(true)
+
+	// copyToastStyle renders the transient "Copied N lines" acknowledgment
+	// (post-v0.1.0 addendum: mouse-driven text selection, chatModel.
+	// copySelectionCmd) — green rather than errorStyle's red, since this is
+	// confirming success, not reporting a failure.
+	copyToastStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("2")).Bold(true)
 
 	// greetingStyle renders the empty-transcript placeholder (post-v0.1.0
 	// addendum: chatModel.refreshViewport's defaultGreeting) — dim/italic so
