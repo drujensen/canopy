@@ -574,7 +574,14 @@ func run() error {
 	// mode for this drag" convention, not Canopy's. Worth documenting
 	// wherever mouse support is mentioned to the user (README/help), since
 	// it's not obvious without knowing to look for it.
-	program := tea.NewProgram(tui.NewModel(ctx, svc, agents, startAgent, resumeChatID), tea.WithAltScreen(), tea.WithMouseCellMotion())
+	// tea.WithOutput(tui.Output()) routes Bubble Tea's own renderer through
+	// the same mutex-protected os.Stdout writer that writeOSC52ToStdout
+	// (chat.go) uses for its clipboard-copy escape sequences — without it,
+	// the renderer's own periodic frame flush (a separate ticker goroutine)
+	// races with a direct os.Stdout write from a mouse-copy, which can
+	// corrupt the OSC 52 sequence badly enough that some terminals silently
+	// fail to update the clipboard. See output.go's stdoutMu doc comment.
+	program := tea.NewProgram(tui.NewModel(ctx, svc, agents, startAgent, resumeChatID), tea.WithAltScreen(), tea.WithMouseCellMotion(), tea.WithOutput(tui.Output()))
 	if _, err := program.Run(); err != nil {
 		return fmt.Errorf("running the TUI: %w", err)
 	}

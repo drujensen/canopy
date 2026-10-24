@@ -309,20 +309,16 @@ func newChatModel(chatID, agentName string, todos []todo.Item, model string, wid
 // for tmux's own passthrough requirement when running inside one (tmux
 // swallows an unwrapped OSC 52 sequence from a pane unless
 // `set -g allow-passthrough on` is set — wrapping it removes that
-// dependency on the user's tmux config). Writing directly to os.Stdout
-// from here, concurrently with Bubble Tea's own renderer, is deliberate
-// and safe in practice: OSC 52 produces no visible output at all (nothing
-// for the two writers to visually race over), and a short escape sequence
-// is written in one os.File.Write syscall, which doesn't interleave bytes
-// with another same-sized write the way a naive buffered/chunked writer
-// could — the same technique tmux and Neovim's own clipboard integration
-// use.
+// dependency on the user's tmux config). Writes through syncStdout
+// (output.go), not raw os.Stdout directly — see stdoutMu's doc comment for
+// why a direct write here used to silently corrupt the clipboard on some
+// terminals.
 func writeOSC52ToStdout(text string) {
 	seq := osc52.New(text)
 	if os.Getenv("TMUX") != "" {
 		seq = seq.Tmux()
 	}
-	_, _ = seq.WriteTo(os.Stdout)
+	_, _ = seq.WriteTo(syncStdout{})
 }
 
 const (
