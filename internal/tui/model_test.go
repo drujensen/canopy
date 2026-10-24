@@ -1293,3 +1293,22 @@ func TestChatModel_View_NoRoleLabels(t *testing.T) {
 	assert.NotContains(t, content, "you", "the old 'you' role label must no longer render")
 	assert.NotContains(t, content, "assistant", "the old 'assistant' role label must no longer render")
 }
+
+// TestChatModel_View_FillsFullTerminalHeight is this package's coverage
+// for the post-v0.1.0 addendum removing the layout budget's unjustified
+// slack: View's total rendered height (sidebar and main column alike)
+// must equal exactly the requested terminal height, with no rows left
+// permanently blank at the bottom — whether or not a status error line is
+// currently being shown below the composer (viewportHeight borrows a row
+// for it dynamically rather than always reserving one).
+func TestChatModel_View_FillsFullTerminalHeight(t *testing.T) {
+	c := newChatModel("chat-1", "assistant", nil, "m1", 80, 24)
+
+	lines := strings.Split(c.View(80, 24), "\n")
+	assert.Len(t, lines, 24, "the idle view must use every row of the requested terminal height")
+
+	c.statusErr = fmt.Errorf("boom")
+	c.refreshViewport()
+	lines = strings.Split(c.View(80, 24), "\n")
+	assert.Len(t, lines, 24, "the view with a status error line showing must still use exactly the requested terminal height")
+}

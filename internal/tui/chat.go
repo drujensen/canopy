@@ -205,19 +205,33 @@ func (c *chatModel) mainWidth() int {
 	return w
 }
 
+// viewportHeight returns how many rows the transcript viewport itself
+// gets: the whole chat screen height minus the composer/spinner bar, minus
+// one more row while a status error line is currently being shown below it
+// (View appends that line dynamically, outside the viewport) — borrowed
+// only while it's actually displayed, rather than permanently reserved,
+// so the common case (no error) renders using the terminal's full height
+// instead of leaving rows permanently blank at the bottom.
+func (c *chatModel) viewportHeight() int {
+	h := c.height - composerLines
+	if c.statusErr != nil {
+		h--
+	}
+	if h < 1 {
+		h = 1
+	}
+	return h
+}
+
 // resize adjusts the viewport/composer to fit width x height, reserving
 // sidebarWidth columns for the todo sidebar (unless hidden, see
-// mainWidth/sidebarHidden) and composerLines-plus-a-couple rows for the
-// composer.
+// mainWidth/sidebarHidden) and composerLines rows for the composer — see
+// viewportHeight for the rest of the row budget.
 func (c *chatModel) resize(width, height int) {
 	c.width, c.height = width, height
 	mainWidth := c.mainWidth()
 	c.viewport.Width = mainWidth
-	viewportHeight := height - 3 - composerLines
-	if viewportHeight < 1 {
-		viewportHeight = 1
-	}
-	c.viewport.Height = viewportHeight
+	c.viewport.Height = c.viewportHeight()
 	c.composer.SetWidth(mainWidth - 2)
 	c.composer.SetHeight(composerLines)
 	c.refreshViewport()
@@ -600,6 +614,11 @@ func (c *chatModel) startTurnCmd(svc *services.AgentService, ctx context.Context
 	c.streamActive = true
 	c.streaming.Reset()
 	c.statusErr = nil
+	// Clearing statusErr frees up the row viewportHeight was borrowing for
+	// it (if any was showing) — refreshViewport picks that up immediately
+	// rather than leaving the viewport one row short until the turn's first
+	// chunk arrives and refreshes it anyway.
+	c.refreshViewport()
 	turnCtx, cancel := context.WithCancel(ctx)
 	c.streamCancel = cancel
 	ch, cmd := startTurn(turnCtx, svc, c.chatID, msgs)
@@ -713,6 +732,11 @@ func (c *chatModel) finishStreaming() {
 // either gets silently clipped by the terminal or scrolls off unreadably,
 // exactly the bug this addendum fixes.
 func (c *chatModel) refreshViewport() {
+	// Recomputed on every call, not just resize: viewportHeight depends on
+	// c.statusErr, which changes independently of any resize (startTurnCmd
+	// clearing it, handleStreamMsg's streamErrMsg case setting it) — see
+	// viewportHeight's own doc comment.
+	c.viewport.Height = c.viewportHeight()
 	width := c.viewport.Width
 	var b strings.Builder
 	for _, e := range c.transcript {
@@ -882,11 +906,16 @@ func (c *chatModel) renderSidebar() string {
 		}
 		fmt.Fprintf(&b, "  %s %s\n", mark, title)
 	}
-	return sidebarStyle.Width(sidebarWidth - 2).Height(height(c)).Render(b.String())
+	return sidebarStyle.Width(sidebarWidth - 2).Height(c.sidebarHeight()).Render(b.String())
 }
 
-func height(c *chatModel) int {
-	h := c.height - 2
+// sidebarHeight matches the sidebar's rendered height to the main column's
+// total (viewport + composer/spinner + optional status-error line, which
+// together always sum to exactly c.height — see viewportHeight), so there's
+// no height mismatch between the two JoinHorizontal'd blocks and no row
+// left blank at the bottom of the screen.
+func (c *chatModel) sidebarHeight() int {
+	h := c.height
 	if h < 1 {
 		h = 1
 	}
