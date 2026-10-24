@@ -130,7 +130,7 @@ func TestChatModel_MCPTool_ExecutesToolAndCompletes(t *testing.T) {
 	drainCmdWithTimeout(t, c, svc, ctx, c.startTurnCmd(svc, ctx, []*message.Message{message.NewText("please use the echo tool to say hi")}), 10*time.Second)
 
 	require.Len(t, c.transcript, 1)
-	require.Contains(t, c.transcript[0].text, "done")
+	require.Contains(t, segmentsText(c.transcript[0].segments), "done")
 }
 
 // TestChatModel_MCPTool_PlainMessage_NoHang isolates whether merely having
@@ -196,7 +196,7 @@ func TestChatModel_MCPTool_PlainMessage_NoHang(t *testing.T) {
 	drainCmdWithTimeout(t, c, svc, ctx, c.startTurnCmd(svc, ctx, []*message.Message{message.NewText("hi")}), 10*time.Second)
 
 	require.Len(t, c.transcript, 1)
-	require.Contains(t, c.transcript[0].text, "hello, no tools needed")
+	require.Contains(t, segmentsText(c.transcript[0].segments), "hello, no tools needed")
 }
 
 // TestRealProgram_MCPTool_AsyncRuntime drives the actual tea.Program runtime

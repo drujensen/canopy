@@ -20,6 +20,32 @@ var (
 	// in one.
 	userMessageStyle = lipgloss.NewStyle().Background(lipgloss.AdaptiveColor{Light: "254", Dark: "236"})
 
+	// assistantMessageStyle sets an assistant reply's own prose off with a
+	// background block too (post-v0.1.0 addendum, answering "it's hard to
+	// tell tool output from the actual response") — a different, subtly
+	// blue-tinted shade from userMessageStyle's neutral gray, so the two
+	// roles are distinguishable at a glance, not just by which side of the
+	// transcript they're on. Tool call/result/error segments
+	// (toolCallStyle/toolResultStyle/toolErrorStyle) deliberately get no
+	// background at all, so they read as a de-emphasized aside rather than
+	// part of the highlighted reply.
+	assistantMessageStyle = lipgloss.NewStyle().Background(lipgloss.AdaptiveColor{Light: "#eef2fb", Dark: "#1b2430"})
+
+	// toolCallStyle marks a "● toolname(...)" call line (renderIndentedLines)
+	// — dim but still clearly legible, distinct from both
+	// assistantMessageStyle's highlighted prose and plain unstyled text.
+	toolCallStyle = lipgloss.NewStyle().Foreground(lipgloss.AdaptiveColor{Light: "243", Dark: "246"})
+
+	// toolResultStyle marks a "  ⎿ ..." result line — fainter than
+	// toolCallStyle's own call line, the same visual subordination Claude
+	// Code gives a tool's output relative to the call that produced it.
+	toolResultStyle = lipgloss.NewStyle().Faint(true)
+
+	// toolErrorStyle marks a "  ⎿ ..." line reporting a failed tool call —
+	// reuses errorStyle's own red so a failure is never mistaken for a
+	// normal result, regardless of which tool it was.
+	toolErrorStyle = errorStyle
+
 	// systemLabelStyle labels a system-style informational transcript entry
 	// (post-v0.1.0 addendum: the ctrl+s skills-browser folding a skill's Body
 	// into the transcript — see chatModel.showSkill) distinctly from a real

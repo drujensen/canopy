@@ -48,15 +48,41 @@ const (
 )
 
 // transcriptEntry is one finished message rendered in the chat transcript —
-// either something the user sent, a completed assistant reply (built up
-// from streamed chunks, see chatModel.streaming), or a system-style
-// informational entry (post-v0.1.0 addendum: the ctrl+s skills browser
-// folding a skill's real Body into the transcript so a user can see it
-// without asking the model — see showSkill).
+// either something the user sent (text), a completed assistant reply
+// (segments — built up from streamed chunks, see chatModel.streaming), or
+// a system-style informational entry (text, system: true — post-v0.1.0
+// addendum: the ctrl+s skills browser folding a skill's real Body into the
+// transcript so a user can see it without asking the model — see
+// showSkill).
 type transcriptEntry struct {
-	role   message.Role
-	text   string
-	system bool
+	role     message.Role
+	text     string
+	segments []textSegment
+	system   bool
+}
+
+// segmentKind distinguishes how one piece of an assistant reply renders
+// (post-v0.1.0 addendum answering "it's hard to tell tool output from the
+// actual response"): the model's own prose gets a background-highlighted
+// block, same treatment as a user message but a different shade
+// (assistantMessageStyle); a tool call/result/error is a dim, indented,
+// no-background aside instead — Claude Code's own "● Bash(...)" / "⎿ ..."
+// convention — so the two never blend together even interleaved within
+// one reply.
+type segmentKind int
+
+const (
+	segmentProse segmentKind = iota
+	segmentToolCall
+	segmentToolResult
+	segmentToolError
+)
+
+// textSegment is one piece of an assistant reply tagged with how it
+// should render — see segmentKind.
+type textSegment struct {
+	kind segmentKind
+	text string
 }
 
 // chatModel is the chat screen (Design §5): a scrolling transcript fed by
@@ -68,10 +94,14 @@ type chatModel struct {
 
 	transcript []transcriptEntry
 
-	// streaming accumulates the in-flight assistant reply's text as
+	// streaming accumulates the in-flight assistant reply's segments
+	// (text/toolCall/toolResult/toolError — see segmentKind) as
 	// streamChunkMsg values arrive, before it's folded into transcript by
-	// finishStreaming once the turn's stream is done.
-	streaming    strings.Builder
+	// finishStreaming once the turn's stream is done. appendStreamingText
+	// merges consecutive text fragments into one prose segment rather than
+	// growing one segment per fragment (streamed text typically arrives a
+	// token at a time).
+	streaming    []textSegment
 	streamActive bool
 
 	// streamCh is the channel the turn currently in flight (if any) is
@@ -624,7 +654,7 @@ func (c *chatModel) startNewChatCmd(svc *services.AgentService, ctx context.Cont
 // running it.
 func (c *chatModel) startTurnCmd(svc *services.AgentService, ctx context.Context, msgs []*message.Message) tea.Cmd {
 	c.streamActive = true
-	c.streaming.Reset()
+	c.streaming = nil
 	c.statusErr = nil
 	// Clearing statusErr frees up the row viewportHeight was borrowing for
 	// it (if any was showing) — refreshViewport picks that up immediately
@@ -697,14 +727,17 @@ func (c *chatModel) handleStreamMsg(msg tea.Msg, svc *services.AgentService, ctx
 }
 
 // applyUpdate folds one *agent.ResponseUpdate's contents into the chat's
-// in-flight state: text is appended to the streaming buffer so it renders
-// incrementally (Requirements FR8); a tool call surfaces an
-// argument-aware "[toolname(headline)]" marker (toolCallHeadline) instead
-// of a bare "[calling toolname...]" repeated with no way to tell one shell
-// command or file write from another; and a tool result (post-v0.1.0
-// addendum) follows up with a short summary — an error if the call failed,
-// a line-diff stat for file_write, or a truncated output preview for
-// run_shell — once it actually completes.
+// in-flight state: text is merged into the streaming buffer's trailing
+// prose segment so it renders incrementally (Requirements FR8); a tool
+// call appends an argument-aware headline segment (toolCallHeadline, "●
+// toolname(headline)" once rendered) instead of a bare "[calling
+// toolname...]" repeated with no way to tell one shell command or file
+// write from another; and a tool result (post-v0.1.0 addendum) appends its
+// own follow-up segment — an error if the call failed, a line-diff stat
+// for file_write, or a truncated output preview for run_shell — once it
+// actually completes. Segments render distinctly from prose (renderEntry/
+// renderSegments) specifically so tool output and the model's actual
+// answer are never visually ambiguous.
 func (c *chatModel) applyUpdate(update *agent.ResponseUpdate) {
 	if update == nil {
 		return
@@ -712,19 +745,34 @@ func (c *chatModel) applyUpdate(update *agent.ResponseUpdate) {
 	for _, content := range update.Contents {
 		switch t := content.(type) {
 		case *message.TextContent:
-			c.streaming.WriteString(t.Text)
+			c.appendStreamingText(t.Text)
 		case *message.FunctionCallContent:
 			if t.Name != "" {
 				if c.pendingToolCalls == nil {
 					c.pendingToolCalls = make(map[string]string)
 				}
 				c.pendingToolCalls[t.CallID] = t.Name
-				c.streaming.WriteString(fmt.Sprintf("\n[%s]\n", toolCallHeadline(t.Name, t.Arguments)))
+				c.streaming = append(c.streaming, textSegment{kind: segmentToolCall, text: toolCallHeadline(t.Name, t.Arguments)})
 			}
 		case *message.FunctionResultContent:
-			c.streaming.WriteString(c.renderToolResult(t))
+			if seg := c.toolResultSegment(t); seg.text != "" {
+				c.streaming = append(c.streaming, seg)
+			}
 		}
 	}
+}
+
+// appendStreamingText merges text into the trailing segment if it's
+// already prose (streamed text typically arrives a token/fragment at a
+// time, so this keeps one prose segment per contiguous run instead of one
+// per fragment), or starts a new prose segment otherwise — the first text
+// of the reply, or text resuming after a tool call/result segment.
+func (c *chatModel) appendStreamingText(text string) {
+	if n := len(c.streaming); n > 0 && c.streaming[n-1].kind == segmentProse {
+		c.streaming[n-1].text += text
+		return
+	}
+	c.streaming = append(c.streaming, textSegment{kind: segmentProse, text: text})
 }
 
 // toolCallHeadline returns a short, human-readable summary of a tool
@@ -780,34 +828,35 @@ func toolCallHeadline(name, argumentsJSON string) string {
 	return name
 }
 
-// renderToolResult renders a short follow-up summary for frc once its tool
+// toolResultSegment builds the follow-up segment for frc once its tool
 // call actually completes, consuming (and removing) the matching entry
-// pendingToolCalls' doc comment describes. Returns "" for a tool this
-// function doesn't special-case and that didn't error — most tools
-// (file_read, web_search, MCP-provided ones, ...) stay as quiet as they
-// were before this addendum; only a genuine failure is always worth a line,
-// regardless of which tool it was.
-func (c *chatModel) renderToolResult(frc *message.FunctionResultContent) string {
+// pendingToolCalls' doc comment describes. Returns a zero-value (empty
+// text) segment for a tool this function doesn't special-case and that
+// didn't error — most tools (file_read, web_search, MCP-provided ones,
+// ...) stay as quiet as they were before this addendum; only a genuine
+// failure always gets a segment, regardless of which tool it was. The
+// caller (applyUpdate) only appends the result when text is non-empty.
+func (c *chatModel) toolResultSegment(frc *message.FunctionResultContent) textSegment {
 	name := c.pendingToolCalls[frc.CallID]
 	delete(c.pendingToolCalls, frc.CallID)
 
 	if frc.Error != nil {
-		return fmt.Sprintf("  ✗ %s\n", oneLinePreview(frc.Error.Error(), 200))
+		return textSegment{kind: segmentToolError, text: oneLinePreview(frc.Error.Error(), 200)}
 	}
 
 	switch name {
 	case "run_shell":
 		if out, ok := frc.Result.(string); ok {
 			if preview := truncatePreview(out, 400); preview != "" {
-				return "  " + preview + "\n"
+				return textSegment{kind: segmentToolResult, text: preview}
 			}
 		}
 	case "file_write":
 		if out, ok := frc.Result.(tools.FileWriteOutput); ok {
-			return fmt.Sprintf("  wrote %s (+%d -%d lines, %d bytes)\n", out.Path, out.LinesAdded, out.LinesRemoved, out.BytesWritten)
+			return textSegment{kind: segmentToolResult, text: fmt.Sprintf("wrote %s (+%d -%d lines, %d bytes)", out.Path, out.LinesAdded, out.LinesRemoved, out.BytesWritten)}
 		}
 	}
-	return ""
+	return textSegment{}
 }
 
 // oneLinePreview collapses embedded newlines in s to spaces (the same
@@ -839,10 +888,10 @@ func truncatePreview(s string, maxRunes int) string {
 // on why leaving that uncalled would leak a canceled-but-uncollected child
 // context.
 func (c *chatModel) finishStreaming() {
-	if c.streaming.Len() > 0 {
-		c.transcript = append(c.transcript, transcriptEntry{role: message.RoleAssistant, text: c.streaming.String()})
+	if len(c.streaming) > 0 {
+		c.transcript = append(c.transcript, transcriptEntry{role: message.RoleAssistant, segments: c.streaming})
 	}
-	c.streaming.Reset()
+	c.streaming = nil
 	c.streamActive = false
 	c.streamCh = nil
 	if c.streamCancel != nil {
@@ -871,8 +920,8 @@ func (c *chatModel) refreshViewport() {
 		b.WriteString(renderEntry(e, width))
 		b.WriteString("\n\n")
 	}
-	if c.streaming.Len() > 0 {
-		b.WriteString(renderEntry(transcriptEntry{role: message.RoleAssistant, text: c.streaming.String()}, width))
+	if len(c.streaming) > 0 {
+		b.WriteString(renderEntry(transcriptEntry{role: message.RoleAssistant, segments: c.streaming}, width))
 	}
 	if b.Len() == 0 {
 		// A brand-new (or freshly ctrl+n'd) chat has nothing in transcript
@@ -925,7 +974,11 @@ func reconstructTranscript(messages []*message.Message) []transcriptEntry {
 		if text == "" {
 			continue
 		}
-		entries = append(entries, transcriptEntry{role: m.Role, text: text})
+		entry := transcriptEntry{role: m.Role, text: text}
+		if m.Role == message.RoleAssistant {
+			entry.segments = []textSegment{{kind: segmentProse, text: text}}
+		}
+		entries = append(entries, entry)
 	}
 	return entries
 }
@@ -939,12 +992,16 @@ func reconstructTranscript(messages []*message.Message) []transcriptEntry {
 // entirely rather than passing a nonsensical width to lipgloss.
 //
 // No "you"/"assistant" label is rendered (post-v0.1.0 addendum) — a user
-// message is instead set off by a lighter background block (userMessageStyle)
-// spanning the full content width; an assistant reply renders as plain,
-// unstyled text, the same visual convention Claude Code itself uses. A
-// system-style entry (ctrl+s skill body, "Cancelled.", etc.) keeps its
-// "system" label, since removing that one specifically wasn't asked for and
-// it's the only cue distinguishing it from a real assistant reply.
+// message is instead set off by a lighter background block
+// (userMessageStyle) spanning the full content width; an assistant reply
+// renders segment-by-segment (renderSegments) — its own background block
+// for prose (assistantMessageStyle, a different shade from a user
+// message's, per the later addendum answering "it's hard to tell tool
+// output from the actual response"), a dim indented aside with no
+// background at all for a tool call/result/error. A system-style entry
+// (ctrl+s skill body, "Cancelled.", etc.) keeps its "system" label, since
+// removing that one specifically wasn't asked for and it's the only cue
+// distinguishing it from a real assistant reply.
 func renderEntry(e transcriptEntry, width int) string {
 	if e.system {
 		text := e.text
@@ -960,11 +1017,89 @@ func renderEntry(e transcriptEntry, width int) string {
 		}
 		return style.Render(e.text)
 	}
-	text := e.text
-	if width > 0 {
-		text = lipgloss.NewStyle().Width(width).Render(text)
+	segments := e.segments
+	if len(segments) == 0 && e.text != "" {
+		// Defensive fallback for an assistant entry built with only text set
+		// (e.g. a test constructing one directly, bypassing applyUpdate/
+		// finishStreaming) — treat it as a single prose segment rather than
+		// silently rendering nothing.
+		segments = []textSegment{{kind: segmentProse, text: e.text}}
 	}
-	return text
+	return renderSegments(segments, width)
+}
+
+// renderSegments renders an assistant reply's segments (see segmentKind)
+// one after another, each according to its own kind — prose and
+// tool-call/result/error never share a style, so the two are
+// distinguishable even interleaved within one reply. Segments are already
+// merged at append time (appendStreamingText folds consecutive text
+// fragments into one prose segment), so no further grouping happens here:
+// each segment, as recorded, becomes exactly one rendered block.
+func renderSegments(segments []textSegment, width int) string {
+	blocks := make([]string, len(segments))
+	for i, seg := range segments {
+		blocks[i] = renderSegmentBlock(seg, width)
+	}
+	return strings.Join(blocks, "\n")
+}
+
+// renderSegmentBlock renders one segment: prose gets assistantMessageStyle's
+// full-width background block, same treatment renderEntry gives a user
+// message but a different shade; a tool call gets a "● " marker
+// (toolCallStyle), a tool result or error gets a "  ⎿ " marker
+// (toolResultStyle/toolErrorStyle) — Claude Code's own convention for a
+// de-emphasized aside, deliberately left with no background at all so it
+// reads as subordinate to the highlighted prose around it.
+func renderSegmentBlock(seg textSegment, width int) string {
+	switch seg.kind {
+	case segmentToolCall:
+		return renderIndentedLines("● ", seg.text, toolCallStyle, width)
+	case segmentToolResult:
+		return renderIndentedLines("  ⎿ ", seg.text, toolResultStyle, width)
+	case segmentToolError:
+		return renderIndentedLines("  ⎿ ✗ ", seg.text, toolErrorStyle, width)
+	default: // segmentProse
+		style := assistantMessageStyle
+		if width > 0 {
+			style = style.Width(width)
+		}
+		return style.Render(seg.text)
+	}
+}
+
+// renderIndentedLines renders a tool call/result/error block line by line:
+// prefix marks only the very first physical row (after word-wrapping to
+// width minus the prefix's own width), and every continuation row —
+// whether from an embedded newline in text or from wrapping a long one —
+// gets blank indentation of the same width instead, so the block's text
+// stays visually aligned under its own marker rather than running back
+// out to the left margin.
+func renderIndentedLines(prefix, text string, style lipgloss.Style, width int) string {
+	prefixWidth := lipgloss.Width(prefix)
+	contentWidth := width - prefixWidth
+
+	var physicalLines []string
+	for _, line := range strings.Split(text, "\n") {
+		if contentWidth > 0 {
+			physicalLines = append(physicalLines, strings.Split(lipgloss.NewStyle().Width(contentWidth).Render(line), "\n")...)
+		} else {
+			physicalLines = append(physicalLines, line)
+		}
+	}
+
+	blank := strings.Repeat(" ", prefixWidth)
+	var b strings.Builder
+	for i, pl := range physicalLines {
+		if i > 0 {
+			b.WriteString("\n")
+		}
+		marker := prefix
+		if i > 0 {
+			marker = blank
+		}
+		b.WriteString(style.Render(marker + pl))
+	}
+	return b.String()
 }
 
 // View renders the chat screen: either an open overlay picker (ctrl+a/

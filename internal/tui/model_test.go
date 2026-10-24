@@ -45,7 +45,7 @@ func TestChatModel_StreamedContentAccumulates(t *testing.T) {
 	cmd := c.handleStreamMsg(streamChunkMsg{update: &agent.ResponseUpdate{
 		Contents: message.Contents{&message.TextContent{Text: "Hello"}},
 	}}, nil, nil)
-	assert.Equal(t, "Hello", c.streaming.String())
+	assert.Equal(t, "Hello", streamingText(c))
 	assert.Contains(t, c.View(80, 24), "Hello", "in-flight streamed text must be visible before the turn finishes")
 	// A real chunk re-arms waitForStreamEvent; here streamCh is nil (no real
 	// turn in flight), which is fine — the test never calls cmd().
@@ -54,7 +54,7 @@ func TestChatModel_StreamedContentAccumulates(t *testing.T) {
 	c.handleStreamMsg(streamChunkMsg{update: &agent.ResponseUpdate{
 		Contents: message.Contents{&message.TextContent{Text: ", world"}},
 	}}, nil, nil)
-	assert.Equal(t, "Hello, world", c.streaming.String())
+	assert.Equal(t, "Hello, world", streamingText(c))
 
 	require.Empty(t, c.transcript, "nothing should be folded into the transcript until the turn's stream is done")
 
@@ -66,9 +66,9 @@ func TestChatModel_StreamedContentAccumulates(t *testing.T) {
 	}}, nil, nil)
 
 	require.Len(t, c.transcript, 1)
-	assert.Equal(t, "Hello, world", c.transcript[0].text)
+	assert.Equal(t, "Hello, world", segmentsText(c.transcript[0].segments))
 	assert.Equal(t, message.RoleAssistant, c.transcript[0].role)
-	assert.Empty(t, c.streaming.String(), "the streaming buffer must be cleared once folded into the transcript")
+	assert.Empty(t, streamingText(c), "the streaming buffer must be cleared once folded into the transcript")
 	assert.False(t, c.streamActive)
 }
 
@@ -391,6 +391,23 @@ func chatCompletionResponse(text string) map[string]any {
 //
 // svc/ctx are threaded through to every handleStreamMsg call for signature
 // symmetry; handleStreamMsg itself doesn't use them.
+// segmentsText concatenates segments' raw texts, newline-joined — a
+// test-only convenience so assertions can check content without caring
+// about per-segment kind/styling (production rendering goes through
+// renderSegments, which does care).
+func segmentsText(segments []textSegment) string {
+	parts := make([]string, len(segments))
+	for i, seg := range segments {
+		parts[i] = seg.text
+	}
+	return strings.Join(parts, "\n")
+}
+
+// streamingText is segmentsText for c's in-flight streaming buffer.
+func streamingText(c *chatModel) string {
+	return segmentsText(c.streaming)
+}
+
 func drainCmd(t *testing.T, c *chatModel, svc *services.AgentService, ctx context.Context, cmd tea.Cmd) {
 	t.Helper()
 	for cmd != nil {
@@ -1360,14 +1377,14 @@ func TestChatModel_ApplyUpdate_RunShellCallAndResult_BothRender(t *testing.T) {
 	c.applyUpdate(&agent.ResponseUpdate{Contents: message.Contents{
 		&message.FunctionCallContent{CallID: "call-1", Name: "run_shell", Arguments: `{"command":"echo hi"}`},
 	}})
-	assert.Contains(t, c.streaming.String(), "run_shell(echo hi)")
+	assert.Contains(t, streamingText(c), "run_shell(echo hi)")
 	assert.Len(t, c.pendingToolCalls, 1, "the call must be recorded, awaiting its result")
 
 	c.applyUpdate(&agent.ResponseUpdate{Contents: message.Contents{
 		&message.FunctionResultContent{CallID: "call-1", Result: "hi\nexit_code: 0"},
 	}})
-	assert.Contains(t, c.streaming.String(), "hi")
-	assert.Contains(t, c.streaming.String(), "exit_code: 0")
+	assert.Contains(t, streamingText(c), "hi")
+	assert.Contains(t, streamingText(c), "exit_code: 0")
 	assert.Empty(t, c.pendingToolCalls, "the result must consume its pending entry")
 }
 
@@ -1388,7 +1405,7 @@ func TestChatModel_ApplyUpdate_FileWriteResult_ShowsLineDiffStat(t *testing.T) {
 		}},
 	}})
 
-	out := c.streaming.String()
+	out := streamingText(c)
 	assert.Contains(t, out, "README.md")
 	assert.Contains(t, out, "+8")
 	assert.Contains(t, out, "-3")
@@ -1407,7 +1424,13 @@ func TestChatModel_ApplyUpdate_ToolError_AlwaysRendersRegardlessOfTool(t *testin
 		&message.FunctionResultContent{CallID: "call-1", Error: fmt.Errorf("no such file or directory")},
 	}})
 
-	out := c.streaming.String()
-	assert.Contains(t, out, "✗")
-	assert.Contains(t, out, "no such file or directory")
+	require.Len(t, c.streaming, 2)
+	assert.Equal(t, segmentToolError, c.streaming[1].kind, "a failed call must produce a segmentToolError, regardless of which tool it was")
+	assert.Contains(t, c.streaming[1].text, "no such file or directory")
+
+	// The "✗" marker itself is added at render time (renderIndentedLines),
+	// not stored in the raw segment text — check it actually reaches the
+	// rendered transcript too, not just the right segment kind.
+	rendered := renderSegmentBlock(c.streaming[1], 80)
+	assert.Contains(t, rendered, "✗")
 }
