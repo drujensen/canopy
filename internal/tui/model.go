@@ -192,6 +192,21 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.KeyMsg:
 		return m.handleKey(msg)
 
+	case tea.MouseMsg:
+		// Mouse-wheel scrolling (post-v0.1.0 addendum, cmd/canopy's
+		// tea.WithMouseCellMotion — see that call's own doc comment for the
+		// click-drag-selection tradeoff and the Shift-drag workaround) —
+		// only meaningful on the chat screen, and only when no overlay
+		// picker (ctrl+a/ctrl+o/ctrl+s/ctrl+h) is showing instead of the
+		// transcript; bubbles/viewport.Model.Update itself ignores anything
+		// but a wheel event, so no further filtering is needed here.
+		if m.screen == screenChat && m.chat != nil && m.chat.picker == nil {
+			var cmd tea.Cmd
+			m.chat.viewport, cmd = m.chat.viewport.Update(msg)
+			return m, cmd
+		}
+		return m, nil
+
 	case chatStartedMsg:
 		if msg.err != nil {
 			m.fatalErr = msg.err

@@ -560,13 +560,21 @@ func run() error {
 		}
 	}
 
-	// Deliberately no mouse-mode option (tried and reverted, post-v0.1.0):
-	// any tea.WithMouse* option makes the terminal hand every mouse event to
-	// the program instead of handling click-drag text selection itself, so
-	// gaining wheel-scroll would cost the user the ability to select/copy
-	// transcript text with the mouse at all — a worse trade than it's worth
-	// given pgup/pgdown/ctrl+b (chat.go) already cover scrolling without it.
-	program := tea.NewProgram(tui.NewModel(ctx, svc, agents, startAgent, resumeChatID), tea.WithAltScreen())
+	// WithMouseCellMotion (post-v0.1.0 addendum, re-added after a trial
+	// revert): lets the mouse wheel scroll the chat transcript (tui.Model.
+	// Update forwards tea.MouseMsg to the active chat's viewport — see that
+	// case's own doc comment). The real cost, confirmed by trying this
+	// without it first: claiming any tea.WithMouse* mode makes the terminal
+	// hand every mouse event to the program, so a plain click-drag no longer
+	// does the terminal's own text selection. That's a per-terminal-emulator
+	// bypass, not something this program can configure away — most
+	// terminals (iTerm2, Kitty, Alacritty, GNOME Terminal, Windows Terminal,
+	// xterm) still do native click-drag selection for copy/paste if you hold
+	// Shift while dragging; it's the terminal's own "ignore the app's mouse
+	// mode for this drag" convention, not Canopy's. Worth documenting
+	// wherever mouse support is mentioned to the user (README/help), since
+	// it's not obvious without knowing to look for it.
+	program := tea.NewProgram(tui.NewModel(ctx, svc, agents, startAgent, resumeChatID), tea.WithAltScreen(), tea.WithMouseCellMotion())
 	if _, err := program.Run(); err != nil {
 		return fmt.Errorf("running the TUI: %w", err)
 	}
