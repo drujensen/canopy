@@ -25,6 +25,7 @@ import (
 	"github.com/microsoft/agent-framework-go/message"
 
 	"github.com/drujensen/canopy/internal/domain/services"
+	"github.com/drujensen/canopy/internal/impl/providers"
 	"github.com/drujensen/canopy/internal/impl/tools"
 )
 
@@ -154,6 +155,15 @@ type chatModel struct {
 	// forwarding events on — kept so handleStreamMsg can keep re-arming
 	// waitForStreamEvent after every non-terminal event.
 	streamCh chan tea.Msg
+
+	// retryNotice is the most recent streamRetryMsg received during the
+	// turn in flight (post-v0.1.0 addendum: notify the user when a provider
+	// request is being throttled instead of silently stalling — see
+	// stream.go's streamRetryMsg). Shown in place of the usual "Thinking..."
+	// line (View) while non-empty; cleared the moment real content starts
+	// arriving again (streamChunkMsg) or the turn ends (finishStreaming),
+	// since at that point whatever was being retried has already resolved.
+	retryNotice string
 
 	// streamCancel cancels the context the turn currently in flight (if any)
 	// was started with — set by startTurnCmd (a fresh context.WithCancel
@@ -877,6 +887,7 @@ func (c *chatModel) startTurnCmd(svc *services.AgentService, ctx context.Context
 	c.streamActive = true
 	c.streaming = nil
 	c.statusErr = nil
+	c.retryNotice = ""
 	// Clearing statusErr frees up the row viewportHeight was borrowing for
 	// it (if any was showing) — refreshViewport picks that up immediately
 	// rather than leaving the viewport one row short until the turn's first
@@ -1220,8 +1231,12 @@ func (c *chatModel) copySelectionCmd() tea.Cmd {
 func (c *chatModel) handleStreamMsg(msg tea.Msg, svc *services.AgentService, ctx context.Context) tea.Cmd {
 	switch msg := msg.(type) {
 	case streamChunkMsg:
+		c.retryNotice = ""
 		c.applyUpdate(msg.update)
 		c.refreshViewport()
+		return waitForStreamEvent(c.streamCh)
+	case streamRetryMsg:
+		c.retryNotice = formatRetryNotice(msg.notice)
 		return waitForStreamEvent(c.streamCh)
 	case streamDoneMsg:
 		c.finishStreaming()
@@ -1247,6 +1262,15 @@ func (c *chatModel) handleStreamMsg(msg tea.Msg, svc *services.AgentService, ctx
 		return nil
 	}
 	return nil
+}
+
+// formatRetryNotice renders a providers.RetryNotice (stream.go's
+// streamRetryMsg) as the single-line status text View shows in place of
+// "Thinking..." — e.g. "Throttled: rate limited (413, too many input
+// tokens per minute) — retrying 2/6 in ~1s...".
+func formatRetryNotice(n providers.RetryNotice) string {
+	delay := n.Delay.Round(100 * time.Millisecond)
+	return fmt.Sprintf("Throttled: %s — retrying %d/%d in ~%s...", n.Reason, n.Attempt+1, n.MaxAttempts, delay)
 }
 
 // applyUpdate folds one *agent.ResponseUpdate's contents into the chat's
@@ -1417,6 +1441,7 @@ func (c *chatModel) finishStreaming() {
 	c.streaming = nil
 	c.streamActive = false
 	c.streamCh = nil
+	c.retryNotice = ""
 	if c.streamCancel != nil {
 		c.streamCancel()
 		c.streamCancel = nil
@@ -1723,6 +1748,12 @@ func (c *chatModel) View(width, height int) string {
 
 	var bottom string
 	switch {
+	case c.streamActive && c.retryNotice != "":
+		// Takes priority over the plain "Thinking..." line below while a
+		// provider request is being throttled/retried (streamRetryMsg) —
+		// the user should see *why* nothing is happening yet, not just that
+		// something still is.
+		bottom = c.spinner.View() + " " + c.retryNotice + " (esc to cancel)"
 	case c.streamActive:
 		// A visual "still working" indicator (post-v0.1.0 addendum) in
 		// place of the composer, which doesn't accept input while

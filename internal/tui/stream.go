@@ -16,6 +16,7 @@ import (
 	"github.com/microsoft/agent-framework-go/message"
 
 	"github.com/drujensen/canopy/internal/domain/services"
+	"github.com/drujensen/canopy/internal/impl/providers"
 )
 
 // streamChunkMsg carries one incremental *agent.ResponseUpdate from a turn's
@@ -35,6 +36,16 @@ type streamDoneMsg struct {
 // streamErrMsg reports a turn's stream (or its finalize call) failed.
 type streamErrMsg struct {
 	err error
+}
+
+// streamRetryMsg reports that a provider request within the current turn
+// was throttled (rate-limited, or a transient server error) and is about to
+// be retried — see providers.RetryNotice. It's non-terminal, the same way
+// streamChunkMsg is: handleStreamMsg re-arms waitForStreamEvent after
+// handling it rather than ending the turn, since the retry it describes is
+// still in flight on startTurn's goroutine.
+type streamRetryMsg struct {
+	notice providers.RetryNotice
 }
 
 // modelChangedMsg reports a user-initiated model switch (AgentService.
@@ -202,7 +213,16 @@ func startTurn(ctx context.Context, svc *services.AgentService, chatID string, m
 	ch := make(chan tea.Msg)
 	go func() {
 		defer close(ch)
-		stream, finalize, err := svc.RunMessagesStream(ctx, chatID, msgs)
+		// WithRetryNotifier (providers package): reports a throttled/
+		// retried provider request back onto ch as a non-terminal
+		// streamRetryMsg, the same way a real response chunk arrives as
+		// streamChunkMsg — see that type's doc comment for why a blocking
+		// send here is safe (a waitForStreamEvent(ch) Cmd is always already
+		// pending while this goroutine runs).
+		notifyCtx := providers.WithRetryNotifier(ctx, func(notice providers.RetryNotice) {
+			ch <- streamRetryMsg{notice: notice}
+		})
+		stream, finalize, err := svc.RunMessagesStream(notifyCtx, chatID, msgs)
 		if err != nil {
 			ch <- streamErrMsg{err: err}
 			return
