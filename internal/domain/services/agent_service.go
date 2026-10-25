@@ -27,6 +27,7 @@ package services
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -408,6 +409,9 @@ func (s *AgentService) RunMessages(ctx context.Context, chatID string, msgs []*m
 
 	resp, err := a.Run(ctx, msgs, agent.WithSession(session)).Collect()
 	if err != nil {
+		if errors.Is(err, context.Canceled) {
+			s.persistCancelledUserMessages(chatID, msgs)
+		}
 		return nil, fmt.Errorf("agent service: running chat %q: %w", chatID, err)
 	}
 
@@ -517,6 +521,9 @@ func (s *AgentService) RunMessagesStream(ctx context.Context, chatID string, msg
 			if updateErr != nil {
 				state.err = fmt.Errorf("agent service: running chat %q: %w", chatID, updateErr)
 				state.done = true
+				if errors.Is(updateErr, context.Canceled) {
+					s.persistCancelledUserMessages(chatID, msgs)
+				}
 				yield(update, updateErr)
 				return
 			}
@@ -574,6 +581,57 @@ type streamRunState struct {
 	done   bool
 	result *RunResult
 	err    error
+}
+
+// persistCancelledUserMessages best-effort persists msgs — the new user
+// message(s) a turn was started with — directly onto chatID's stored
+// Messages, bypassing ChatHistoryProvider.Invoked entirely. Called only
+// from RunMessages/RunMessagesStream's error path, and only when that
+// error is (or wraps) context.Canceled.
+//
+// Why this exists: ChatHistoryProvider.Invoked is a deliberate no-op
+// whenever the run it's reporting on failed (invoked.Err != nil — see that
+// method's own doc comment), matching agent-framework-go's own default
+// history provider behavior for a genuine failure. A user-initiated
+// cancellation (tui's "esc" mid-turn, cancelTurn) surfaces through
+// a.Run(...) as exactly that same kind of failure — context.Canceled — so
+// without this, the user's own prompt for the cancelled turn was never
+// persisted at all: a real report was a chat resumed via --continue
+// ("--continue" itself worked, and did reattach the right chat) simply
+// missing the message the user had just sent before cancelling, as if it
+// had never been typed.
+//
+// Deliberately narrow in scope: this persists only the user's own new
+// message(s), not any partial assistant text or tool calls the turn had
+// already produced before cancellation. Persisting those safely would mean
+// reconstructing a consistent message sequence out of a deliberately
+// interrupted one — e.g. a function call with no matching function result,
+// which most provider APIs reject on the next turn — for comparatively
+// little benefit (resuming just re-reads whatever files it already read;
+// nothing is lost, only repeated). Preserving the question itself, so it
+// isn't silently dropped, is the actual bug being fixed here.
+func (s *AgentService) persistCancelledUserMessages(chatID string, msgs []*message.Message) {
+	if len(msgs) == 0 {
+		return
+	}
+	// context.Background(), not the turn's own ctx: that ctx is the one
+	// that just got cancelled, and this is cleanup bookkeeping after the
+	// turn has already ended, not part of the cancelled operation itself.
+	ctx := context.Background()
+	chat, err := s.repository.Get(ctx, chatID)
+	if err != nil {
+		if s.logger != nil {
+			s.logger.Warn("failed to load chat to persist a cancelled turn's message", "chatID", chatID, "error", err)
+		}
+		return
+	}
+	for _, m := range msgs {
+		chat.Messages = append(chat.Messages, m.Clone())
+	}
+	chat.UpdatedAt = time.Now().UTC()
+	if err := s.repository.Update(ctx, chat); err != nil && s.logger != nil {
+		s.logger.Warn("failed to persist a cancelled turn's message", "chatID", chatID, "error", err)
+	}
 }
 
 // persistSession serializes session and writes it onto the chat's
