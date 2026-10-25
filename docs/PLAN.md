@@ -1,178 +1,157 @@
 # Canopy — Implementation Plan
 
-Status: draft v0.3 (supersedes v0.2 — TUI+JSON only, narrowed tools, added a file-format
-compatibility phase, added a performance-benchmark step; see REQUIREMENTS.md §5)
+Status: v0.4 (2026-10-25; supersedes v0.3 — v0.3's Phase 0–8 are all **done** and shipped as
+`v0.1.0`, so this revision records that, adds Phase 9 to capture the post-v0.1.0 shipped body that
+v0.3 had no home for, and re-homes the deferred/candidate work v0.3 left dangling as loose
+"sequencing notes.")
 Depends on: REQUIREMENTS.md, DESIGN.md
 
-Phased, milestone-based (no calendar dates — add them once effort is estimated). Each phase lists
-exit criteria; don't start a phase until the previous one's exit criteria are met.
+Phased, milestone-based (no calendar dates). Each phase lists exit criteria. **Why** a decision was
+made (especially removed/superseded features) lives in DESIGN.md and REQUIREMENTS.md with full
+rationale — this plan states *what* shipped and *what's next*, and points at those docs rather than
+restating them.
 
-## Phase 0 — Bootstrap
+## Status as of v0.4
 
-- Initialize `github.com/drujensen/canopy` module, Go 1.25 toolchain.
-- Pin an exact `agent-framework-go` version; verify `go mod tidy` succeeds.
-- Port an `AGENTS.md`-style dev workflow doc from aiagent, adjusted for the new module/toolchain.
-- Spike: one hello-world agent using `openaiprovider`, `RunText`, printed to stdout, confirming
-  Azure/A2A/AG-UI/Copilot/workflow/mongo/echo/websocket are *not* pulled into the build (Design §1).
-- CI (build, vet, test) mirroring aiagent's QA workflow.
+| Phase | Status |
+|---|---|
+| 0–8 | **Done** — shipped as `v0.1.0`, tagged at commit `c731abd`. |
+| 9 (post-v0.1.0) | **Done** — 34 commits after the tag, latest `5742933`. |
+| 10 (deferred/candidate) | **Not started, not scheduled** — real, stated-but-unscoped work, carried forward. |
 
-**Exit criteria:** repo builds, hello-world agent streams a real response, CI green, `go.sum`
-confirmed free of the excluded dependency families.
+Build/test/lint commands and QA workflow: see `AGENTS.md`. Benchmark numbers: see
+`docs/BENCHMARKS.md`.
 
-## Phase 1 — Storage and provider config
+---
 
-- `Chat` entity + `ChatRepository` (JSON only — Design §6); include the `SessionState []byte`
-  field from the start, not as a later migration.
-- Flat JSON provider/model config (`~/.canopy/providers.json` / project-local override) — read/
-  write, no database (Design §4).
-- Port `impl/config` (env/flags) unchanged in spirit.
+## Phase 0–8 — shipped as `v0.1.0` (historical record)
 
-**Exit criteria:** a Chat round-trips through the JSON repository including a non-empty
-`SessionState` blob; provider config loads/saves correctly for at least one provider.
+All eight phases met their exit criteria and were tagged `v0.1.0` at `c731abd`. Per-phase detail is
+preserved here only at status granularity; the decision rationale is in DESIGN.md/REQUIREMENTS.md.
 
-## Phase 2 — Providers
+- **Phase 0 — Bootstrap.** Module `github.com/drujensen/canopy`, Go 1.25, `agent-framework-go`
+  pinned, hello-world spike confirming the excluded dependency families (`workflow*`,
+  `foundryprovider`, `a2aprovider`, `aguiprovider`, `copilotprovider`, Azure, Mongo, echo, websocket)
+  stay out of `go.sum`. CI (build/vet/test).
+- **Phase 1 — Storage & provider config.** `Chat` entity + JSON `ChatRepository` (with
+  `SessionState []byte` from the start); flat JSON provider/model config (`~/.canopy/providers.json`
+  / project-local override); `impl/config`.
+- **Phase 2 — Providers.** `impl/providers/factory.go`; native OpenAI/Anthropic/Gemini;
+  OpenAI-compatible adapter for DeepSeek/Ollama/Groq/Mistral/Together/xAI; table-driven mock-HTTP
+  tests.
+- **Phase 3 — Core tools.** bash/shell, file read/write/search, directory, web search/fetch — the
+  narrow FR4 set. **Approval-gating tried here and later removed entirely (Phase 5 addendum); do not
+  reintroduce — DESIGN.md §3.6.**
+- **Phase 3.5 — Claude Code file-format compat.** `agentsource` / `mcpsource` / `skillsource` /
+  `projectcontext` loaders + fixture tests against real example files.
+- **Phase 4 — Agentic loop core.** `impl/harness` on `agent/harness/loop` + `toolautocall`;
+  `HistoryProvider` over `ChatRepository`; dynamic subagent dispatch with session-isolation test;
+  `domain/services` orchestration; zap logging bridge.
+- **Phase 5 — Loop quality.** Compaction (FR10) and todo (FR11). **Approvals (FR5) and
+  `agentmode` (FR12) were both removed/superseded post-v0.1.0** — approvals never shipped a real
+  prompt (auto-approval + chat-corrupting bugs) and `agentmode` was replaced by the four SDLC-persona
+  agents; see DESIGN.md §3.6/§3.8 addenda.
+- **Phase 6 — TUI.** Bubble Tea chat screen, streaming render, agent picker from `agentsource`,
+  live todo panel; manual QA in a real terminal.
+- **Phase 6.5 — MCP tool construction** + two live bugfixes.
+- **Phase 7 — Security, observability, packaging.** zap bridge finished; `web_fetch` SSRF denylist
+  (the Phase-3 review's flagged open point, resolved); OTel tracing optional/off-by-default; single
+  static binary (`make build`), Docker secondary.
+- **Phase 8 — Beta hardening & benchmarking.** `-race` in CI; goroutine-leak proof around
+  `ResponseStream`; **benchmark vs. `claude` CLI done and reported in `docs/BENCHMARKS.md`** (~9.8x
+  smaller binary, ~17.5x faster cold-start, ~16.4x lower idle RSS, measured 2026-08-15); **`v0.1.0`
+  tagged.**
 
-- `impl/providers/factory.go` dispatching on provider type.
-- Native adapters: OpenAI, Anthropic, Gemini.
-- `impl/providers/openaicompat.go` for DeepSeek, Ollama, Groq, Mistral, Together, xAI.
-- Table-driven adapter tests against a local mock HTTP server.
+---
 
-**Exit criteria:** every provider in Requirements FR2 can be configured and complete a real (or
-mocked, in CI) chat turn.
+## Phase 9 — post-v0.1.0 (DONE, 2026-08-15 → 2026-10-25)
 
-## Phase 3 — Core tools
+Thirty-four commits after the `v0.1.0` tag, shipping the "usable as a real `claude` replacement"
+layer. v0.3 had no phase for this body of work — hence the addenda-in-code-comments drift this
+revision clears up. Grouped by area; every line is committed, tested, and reflected in the README.
 
-Port the narrow tool set from Design §3.2 — bash/shell, file read/write/search, directory, web
-search/fetch — each as its own PR-sized unit ending in a `tool.FuncTool` implementation plus a
-contract test. Do **not** port browser automation, image generation, vision, git PR, swagger, or
-memory in this phase (Requirements §5) — if one of those turns out to be genuinely needed, it
-should show up as an MCP server in Phase 3.5, not a built-in here.
+- **Zero-config first run (FR1/FR17/FR19 no-longer-hard-error cases).**
+  - Auto-create default agents (`general` + the four `research`/`design`/`plan`/`execute`
+    SDLC personas) to `~/.canopy/agents`; auto-create default `mcp-server-setup` skill to
+    `~/.canopy/skills` — both per-file idempotent, never overwriting user edits.
+  - models.dev auto-detection: free 24h-cached catalog, detect set API-key env vars, write matching
+    `ProviderConfig` as `api_key_env` (never the literal), paired with the newest
+    tool-call-capable model; additive re-sync + per-model cost refresh on startup;
+    `--refresh-providers` forces a live re-fetch.
+  - **Any** unrecognized provider `type` with a `base_url` now routes through the OpenAI-compatible
+    adapter — "support any provider," not just the original 9.
 
-**Exit criteria:** the seven core tools exist, pass contract tests, and are callable end-to-end by
-a test agent; approval-gating verified for bash and file-write. **Removed (post-v0.1.0):**
-approval-gating was tried and then removed entirely — see Phase 5's addendum below and
-DESIGN.md §3.6 for why. Bash and file-write execute directly like every other tool now.
+- **Mid-session switching (FR1 addendum).** `ctrl+a` agent picker + `ctrl+o` model picker, both
+  switching the active chat live; `ModelOverride` persisted per-chat so a switch survives a restart;
+  last-selected agent/model remembered across sessions (`last_agent.json`/`last_model.json`).
 
-## Phase 3.5 — Claude Code file-format compatibility layer
+- **Skills made real (FR19 addendum).** The `Skill` tool implements progressive disclosure end to
+  end (name/desc always in context → body on demand → supporting file on demand, confined to the
+  skill's own directory); `ctrl+s` read-only skills browser; `ctrl+n` new-chat-without-picker.
 
-New phase in this revision (Design §3.11) — this is what makes "drop-in" a real claim, so it's
-sequenced before the agentic loop is wired up, not after.
+- **Chat-history & session UX.** `ctrl+h` history browser with chat delete; `--continue` resume;
+  auto-resume last agent; greeting placeholder for an empty transcript; **a cancelled turn's own
+  message now persists instead of being lost**; **resumed chats show their tool calls/results**.
 
-- `impl/agentsource`: load `.claude/agents/*.md` (project + personal, recursive), parse
-  frontmatter + body, produce `AgentDefinition`s.
-- `impl/mcpsource`: load `.mcp.json`, construct `tool/mcptool` clients per configured server.
-- `impl/skillsource`: load `.claude/skills/*/SKILL.md`, implement progressive disclosure (name+
-  description always available, full body via a `Skill` tool, supporting files read on demand).
-- `impl/projectcontext`: load `CLAUDE.md`/`AGENTS.md` into system instructions.
-- Fixture-based tests for all four against real example files, including malformed/partial
-  frontmatter (Design §7).
+- **TUI polish & cross-platform.** Mouse text selection + real clipboard (system tool / `clip.exe`,
+  not just OSC 52); scrolling incl. `ctrl+up`/`ctrl+down` no-fn-key binding; hideable sidebar;
+  multi-line input; full terminal height; visually separated tool-call output from prose; live
+  spinner + one-turn error display.
 
-**Exit criteria:** pointed at a real, existing Claude Code project directory, Canopy's loaders
-correctly enumerate its agents, MCP servers, and skills, and load its project instructions —
-verified against that actual directory, not just synthetic fixtures.
+- **Provider reliability.** Additive retry/backoff: `429`, plus Groq's ITPM rate-limit that arrives
+  as `413` (not `429`); 5xx; Gemini/Ollama/DeepSeek adapter bugfixes; **a user-visible notice when a
+  request is throttled** rather than a silent retry.
 
-## Phase 4 — Agentic loop core
+- **Usage & cost visibility (latest committed work).** Per-chat, per-model token + USD cost
+  persisted on `Chat.Usage` (survives resume); a context-propagated `usageCollector` + a locally
+  re-implemented usage-tracking subagent tool (the stock `tool/agenttool` discards
+  `resp.Usage()`) so subagent dispatch is billed at its own model's rate; sidebar shows running cost
+  and `N tools, M skills`; **`ctrl+t` tools browser and `ctrl+u` usage/cost overlay.**
 
-- `impl/harness` wiring `agent/harness/loop` and `toolautocall`.
-- `HistoryProvider` backed by `ChatRepository`.
-- Dynamic subagent dispatch: any agent loaded by `agentsource` can be wrapped via
-  `tool/agenttool` and added to another agent's `Config.Tools` (FR9); test that inspects the
-  parent's history after a subagent call to verify session isolation (Design §3.4).
-- `domain/services` agent-run orchestration on top of `agent.New` + harness wiring.
-- Structured logging (`Config.Logger`) bridged to zap.
+**Exit criteria (met):** all of the above committed and green under `go build`/`go vet`/
+`go test ./... -race`; README updated to describe zero-config first run, provider config, the
+switchers, the Skill tool, and the no-approval-gating posture.
 
-**Exit criteria:** a configured Agent + Model holds a multi-turn conversation with tool calls and
-persisted history; a parent agent dispatches to a child agent as a tool call; both driven purely
-through MAF-Go's loop.
+---
 
-## Phase 5 — Loop quality: compaction, approvals, todo, mode
+## Phase 10 — deferred & candidate work (NOT started, not scheduled)
 
-Give this real time — it's the phase that actually earns "as good as Claude Code."
+Real, stated-but-unscoped items carried forward so they aren't lost in code-comment addenda again.
+Each needs its own requirements/design pass and a phase added **before** building (see the
+governance note). Nothing here is assumed to be next.
 
-- **Compaction (FR10):** `TokensExceed(N)`-triggered `PipelineStrategy` per agent; regression test
-  against a long-conversation fixture for task continuity.
-- **Approvals (FR5):** wire `agent/harness/toolapproval`; persist `Rule` state via the
-  `Chat.SessionState` blob (Phase 1) so "always allow" survives a restart. **Removed
-  (post-v0.1.0): approval-gating is gone, not superseded by anything.** It added no real safety
-  value — the prompt itself had already been replaced by silent auto-approval of every request, so
-  no human was ever actually asked anything — while the approve-then-continue round trip was a
-  confirmed source of chat-corrupting bugs (orphaned tool-call content that some providers, e.g.
-  DeepSeek, rejected outright on a later turn, permanently breaking the chat). `toolapproval` is no
-  longer imported; `tool.ApprovalRequiredFunc` is not used anywhere. **Current policy: no tool call
-  is ever blocked on a human decision — do not reintroduce approval-gating.** See DESIGN.md §3.6's
-  addendum for the full rationale.
-- **Todo (FR11):** wire `agent/harness/todo`.
-- **Mode (FR12):** wire `agent/harness/agentmode` (default plan/execute); decide and implement how
-  plan mode restricts mutating tools (Design §3.8's flagged open point). **Superseded
-  (post-v0.1.0):** `agentmode` was removed and replaced by four SDLC-persona agents switched via
-  the ordinary agent picker — see DESIGN.md §3.8's addendum.
+- **Data migration from aiagent** (`~/.aiagent` JSON/Mongo → Canopy's schema) — REQUIREMENTS §8
+  "no decision yet."
+- **Web UI** — deferred, not cut (REQUIREMENTS §5); would reuse `domain/services` + `ChatRepository`
+  as an additive path, not a rewrite.
+- **MongoDB storage** — deferred, not cut (REQUIREMENTS §5); same repository-interface additive
+  path; `--storage=file` flag already kept for forward compatibility (FR15).
+- **MAF-Go re-evaluation** — it's public preview; re-check the pinned version and the
+  `agent/compaction`, `agent/harness/*` surfaces before a routine bump (REQUIREMENTS §8, DESIGN.md §1).
+- **Project-wide cost view** — a natural follow-on to Phase 9's per-chat `Chat.Usage`: sum the field
+  across every chat in the repository. Currently unscoped.
 
-**Exit criteria:** all four work end-to-end against a real provider: a session compacts under
-load, an approval rule persists across a process restart, a todo list updates as the agent works,
-a mode switch (agent- and user-initiated) changes tool availability. (Post-v0.1.0: the approval
-leg of this criterion no longer applies — see the Approvals bullet's addendum above.)
+(Deferred items are *candidates awaiting scope*, not a committed roadmap — picking one up means
+writing its requirements/exit criteria into a new numbered phase first, not just starting.)
 
-## Phase 6 — TUI
+---
 
-- Chat view consuming `ResponseStream` for incremental rendering.
-- Approval-prompt component, live todo panel, mode indicator/switcher (Design §5). **Removed
-  (post-v0.1.0):** the approval-prompt component never actually shipped as a blocking prompt — see
-  Phase 5's addendum; approval-gating itself was later removed entirely.
-- Agent picker sourced from `agentsource`, not a database list.
-- Manual QA pass in a real terminal: multi-turn chat that triggers compaction, a tool call, a
-  todo-tracked task, a mode switch, and at least one dynamic subagent dispatch.
+## Governance note — why v0.4 exists, and how to keep it that way
 
-**Exit criteria:** a full session — chat, todo, mode, subagent dispatch — works end-to-end in the
-TUI against a real provider. (Post-v0.1.0: "approvals" dropped from this list — see Phase 5's
-addendum.)
+The v0.3 → v0.4 gap happened because post-v0.1.0 work was tracked only as `post-v0.1.0 addendum`
+code comments, not in this plan — so the plan described a product that no longer existed. To keep
+the plan and the code from diverging again:
 
-## Phase 7 — Observability, security, packaging
-
-- `Config.Logger` → zap bridge finished; `provider/otelprovider` wired as optional (not required
-  for v1 usage).
-- Security pass: no secrets in logs by default, bash/file input validation re-verified. (Post-v0.1.0:
-  the approval-gating re-verification this bullet originally described no longer applies —
-  approval-gating was removed entirely; see Phase 5's addendum. Bash/file/MCP tools execute
-  directly on the model's request, same as every other tool — input validation is the real
-  control, not a confirmation step.) Specifically
-  revisit `internal/impl/tools/web_fetch.go`: it currently allows fetching any http(s) URL,
-  including internal/link-local addresses (e.g. cloud metadata endpoints, localhost) — decide
-  whether to add an IP-range denylist before this ships, flagged during Phase 3 review.
-- Single static binary build/release process (replaces aiagent's Docker-first packaging — a
-  standalone binary is the point of the "lighter" goal); Docker remains optional, not primary.
-- Canopy's own `README.md`/`AGENTS.md`.
-
-**Exit criteria:** a released binary runs standalone with no runtime dependency beyond the OS; a
-security review pass finds no regressions against aiagent's posture, with specific attention to
-the file-format loaders (Phase 3.5) not executing anything from a loaded file beyond what's
-documented (e.g. an MCP server's `command` runs as configured, not with any implicit escalation).
-
-## Phase 8 — Beta hardening and benchmarking
-
-- Fill test-coverage gaps from Phases 1–7; add `-race` to CI.
-- Load/streaming check: long chat forcing multiple compaction cycles, confirm no goroutine leaks
-  around `ResponseStream` iteration.
-- **Benchmark against `claude` CLI (Requirements §4.9, §8):** cold-start time and idle memory
-  footprint, measured, reported as-is — not adjusted to hit a target. If Canopy isn't actually
-  faster/lighter, that's a real finding to act on (profile and fix, or revise the claim), not to
-  skip measuring.
-- Cut `v0.1.0`.
-
-**Exit criteria:** `go test ./... -race` clean; benchmark numbers recorded; v0.1.0 tagged.
-
-## Sequencing notes
-
-- Phase 1 and Phase 2 can run in parallel once Phase 0 is done.
-- Phase 3 (core tools) can start as soon as Phase 1's `Chat`/config shapes exist; doesn't need
-  Phase 2 finished.
-- Phase 3.5 (file-format loaders) has no dependency on Phases 1–3 beyond Phase 0's module setup —
-  it's pure file parsing — and could in principle run in parallel with Phases 1–3. It's listed
-  after Phase 3 here because agent construction (Phase 4) needs both the tool set and the loaders
-  to exist, and doing tools first keeps the loader's `AgentDefinition → *agent.Agent` wiring
-  simpler to test (real tools to attach, not stubs).
-- Phase 4 needs Phases 1–3.5 done.
-- Phase 5 needs Phase 4.
-- Phase 6 needs Phase 5.
-- Web UI and MongoDB support (deferred per Requirements §5) are candidate future phases, picked up
-  as additive work against the same `domain/services`/`ChatRepository` interface, not a rewrite.
-  Data-migration tooling from aiagent's `~/.aiagent` storage remains a candidate, unplanned item.
+1. **Add a phase here before building a feature, not after.** A phase's exit criteria exist when the
+   work starts, so the plan always describes the *intended* shape, not a changelog of surprises.
+2. **Rationale stays in DESIGN.md/REQUIREMENTS.md.** This file states what shipped and what's next;
+   the *why* (esp. removed/superseded features like approvals/`agentmode`) lives in the design doc,
+   and this file links to it instead of duplicating it.
+3. **The commit log is the changelog, not the plan.** v0.4's Phase 9 is a one-time reconciliation of
+   the 34 post-v0.1.0 commits; going forward, per-feature history belongs in `git log`, and this
+   file keeps only phase-level status.
+4. **Cross-reference integrity.** A dangling pointer into this file (e.g. "Plan Phase N") is a bug in
+   whichever doc owns it. v0.4's rewrite changed this file's phase numbering, so every call-site in
+   the other docs was checked against it and fixed in the same pass (the `REQUIREMENTS.md §4.9/§7`
+   and `DESIGN.md §4/§8` "Plan Phase N" refs now each name the phase the v0.3/v0.4 plan they point
+   into actually means).

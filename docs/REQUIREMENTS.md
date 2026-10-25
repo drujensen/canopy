@@ -92,8 +92,8 @@ because it's what makes existing Claude Code projects portable to Canopy (§6, F
 8. **Dynamic subagent dispatch**, not a graph engine (unchanged, §6 FR9).
 9. **Faster and lighter than Claude Code** at the things that are directly comparable: process
    startup time, idle memory footprint, and binary distribution (a single static binary, no
-   Node/npm runtime). This is a goal to validate with real measurements (Plan, Phase 9), not a
-   number promised up front.
+   Node/npm runtime). This is a goal to validate with real measurements, not a number promised up front — validated in
+   PLAN.md Phase 8 (v0.1.0); the measured figures are in `docs/BENCHMARKS.md`.
 
 ## 5. Non-goals (v1) — what changed from the previous draft, and why
 
@@ -226,8 +226,8 @@ directly. See DESIGN.md §3.4's addendum.
 - **Portability.** Single static Go binary; no Node/npm runtime dependency (this is part of the
   "lighter" claim in §4.9, not just a footnote).
 - **Performance.** Startup time and idle memory footprint should be measured against the `claude`
-  CLI and against aiagent as a baseline once Canopy is functional (Plan, Phase 9) — this is a goal
-  to validate, not a number to promise before measuring.
+  CLI and against aiagent as a baseline once Canopy is functional (PLAN.md Phase 8, done — measured in
+  `docs/BENCHMARKS.md`, not promised up front).
 - **Toolchain.** Go 1.25+ (MAF-Go requires `go 1.25.0`).
 - **Testability.** Unit test coverage with `testify`; dedicated tests for compaction and the three
   file-format loaders (FR17–FR19), since those are Canopy's own code (not MAF-Go's) and the most
@@ -254,9 +254,9 @@ directly. See DESIGN.md §3.4's addendum.
   `.mcp.json` schema are documented but not formally versioned. Canopy should implement against
   the current documented format, expect occasional drift, and treat "reads Claude Code's config"
   as a compatibility target to maintain, not a one-time port.
-- **"Faster and lighter" is unverified until measured.** Go's static-binary startup advantage over
-  a Node CLI is a reasonable expectation, not a guarantee — MAF-Go's own dependency graph and tool
-  execution overhead could offset it. Flagged explicitly so Phase 9 benchmarking isn't skipped.
+- **"Faster and lighter" measured, not assumed — the number is in.** Go's static-binary
+  startup advantage over a Node CLI was a reasonable expectation; PLAN.md Phase 8 (v0.1.0) measured
+  it and `docs/BENCHMARKS.md` records the real figures rather than the expectation.
 - **No decision yet on data-migration tooling** from aiagent's `~/.aiagent` storage.
 - **Web UI and MongoDB are deferred, not designed away** — when either is picked back up, revisit
   whether the JSON-only/TUI-only decisions made here (e.g., flat-file provider config, `Chat`

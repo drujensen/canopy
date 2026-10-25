@@ -300,7 +300,7 @@ a live panel. No aiagent todo tool is ported — this replaces it outright.
 ### 3.8 Mode switching (FR12) — superseded (post-v0.1.0)
 
 **Superseded by the 4-persona SDLC agent workflow.** Everything below this line describes the
-original plan/execute mode design as it shipped through Plan Phase 8; it has been removed from the
+original plan/execute mode design as it shipped in v0.1.0 (the plan's Phases 5–6); post-v0.1.0 it was removed from the
 codebase (`agent/harness/agentmode` is no longer imported anywhere in Canopy) and replaced outright
 by four ordinary agent definitions — `research`, `design`, `plan`, `execute` — switched via the
 same `ctrl+a` agent picker every other agent already uses (§3.4/§5), not a separate mode
@@ -383,8 +383,8 @@ more than once per outer `a.Run` call, but the dedup is cheap and correct regard
 
 - `ProviderConfig.Format`/`Unmarshal` for typed responses where needed.
 - `Config.Logger` (a `*slog.Logger`) feeds run/middleware/provider diagnostics; bridged to zap via
-  a `slog.Handler` adapter. `provider/otelprovider` for optional OTel tracing, deferred to Plan
-  Phase 8 (not core to v1 loop functionality).
+  a `slog.Handler` adapter. `provider/otelprovider` for optional OTel tracing — wired in the plan's Phase 7, optional
+  and off by default (internal/impl/tracing; see §3.10), not core to v1 loop functionality.
 
 ### 3.11 Claude Code file-format compatibility layer (FR17–FR20)
 
@@ -420,8 +420,8 @@ proportional to what's actually used, matching the spec's intent rather than aia
 if both exist — concatenated, `CLAUDE.md` first) and prepends the content to the agent's system
 instructions via `Config.RunOptions`/`agent.WithInstructions`.
 
-All four loaders run once at startup (or on a file-watch/refresh trigger — TBD in Plan Phase 3.5,
-not required for v1) and their output feeds `domain/services`' agent-construction path. None of
+All four loaders run once at startup (no file-watch/refresh trigger was built — a file-watch
+  trigger was considered in the plan's Phase 3.5 and not required for v1, so it didn't ship) and their output feeds `domain/services`' agent-construction path. None of
 them touch `ChatRepository` — they're read-only against the project directory, matching how Claude
 Code itself treats these files as source-controlled project config, not application state.
 
@@ -1049,5 +1049,7 @@ dispatched subagent has no `Chat` of its own to read one from in the first place
   Claude Code's subagent/`.mcp.json` formats aren't formally versioned, so the loaders should be
   built to fail loud and specific (clear error on a file it can't parse) rather than silently
   ignoring a definition it doesn't understand.
-- The "faster and lighter" goal (Requirements §4.9) is unverified until Plan Phase 9's
-  benchmarking; nothing in this design should assume it's already true.
+- The "faster and lighter" goal (Requirements §4.9) is now verified, not assumed — the plan's
+  Phase 8 (v0.1.0) measured it, and `docs/BENCHMARKS.md` records the real figures;
+  re-measure before re-asserting the claim if a future dependency upgrade changes Canopy's
+  startup path or dependency graph.
