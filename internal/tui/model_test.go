@@ -11,6 +11,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/charmbracelet/bubbles/list"
 	tea "github.com/charmbracelet/bubbletea"
@@ -23,6 +24,7 @@ import (
 	"github.com/drujensen/canopy/internal/domain/entities"
 	"github.com/drujensen/canopy/internal/domain/services"
 	"github.com/drujensen/canopy/internal/impl/agentsource"
+	"github.com/drujensen/canopy/internal/impl/providers"
 	jsonrepo "github.com/drujensen/canopy/internal/impl/repositories/json"
 	"github.com/drujensen/canopy/internal/impl/skillsource"
 	"github.com/drujensen/canopy/internal/impl/tools"
@@ -70,6 +72,39 @@ func TestChatModel_StreamedContentAccumulates(t *testing.T) {
 	assert.Equal(t, message.RoleAssistant, c.transcript[0].role)
 	assert.Empty(t, streamingText(c), "the streaming buffer must be cleared once folded into the transcript")
 	assert.False(t, c.streamActive)
+}
+
+// TestChatModel_RetryNotice_ShowsThenClearsOnRealContent drives
+// handleStreamMsg with a synthetic streamRetryMsg (stream.go) the way a
+// real 413/429 throttle from providers.openaiRetryableStatusOption would
+// arrive mid-turn, and asserts: the bottom status line shows it in place of
+// "Thinking..." while streamActive, and it's cleared the moment real
+// content starts flowing (streamChunkMsg) — the throttle has resolved by
+// then, so it shouldn't linger.
+func TestChatModel_RetryNotice_ShowsThenClearsOnRealContent(t *testing.T) {
+	c := newChatModel("chat-1", "assistant", nil, "m1", 80, 24)
+	c.streamActive = true // set by startTurnCmd in real use; handleStreamMsg doesn't touch it
+
+	c.handleStreamMsg(streamRetryMsg{notice: providers.RetryNotice{
+		StatusCode:  http.StatusRequestEntityTooLarge,
+		Reason:      "rate limited (413, too many input tokens per minute)",
+		Attempt:     1,
+		MaxAttempts: 6,
+		Delay:       2 * time.Second,
+	}}, nil, nil)
+
+	assert.NotEmpty(t, c.retryNotice)
+	view := c.View(80, 24)
+	assert.Contains(t, view, "Throttled")
+	assert.Contains(t, view, "rate limited (413")
+	assert.NotContains(t, view, "Thinking...", "the retry notice must replace, not join, the plain Thinking line")
+
+	c.handleStreamMsg(streamChunkMsg{update: &agent.ResponseUpdate{
+		Contents: message.Contents{&message.TextContent{Text: "hello after retry"}},
+	}}, nil, nil)
+
+	assert.Empty(t, c.retryNotice, "a real chunk means the throttle resolved; the notice must not linger")
+	assert.Contains(t, c.View(80, 24), "Thinking...")
 }
 
 // TestChatModel_TodoPanelReflectsRunResult proves the live todo panel
@@ -313,21 +348,62 @@ func TestReconstructTranscript_IncludesUserAndAssistantText(t *testing.T) {
 	assert.Equal(t, message.RoleUser, entries[0].role)
 	assert.Equal(t, "hi", entries[0].text)
 	assert.Equal(t, message.RoleAssistant, entries[1].role)
-	assert.Equal(t, "hello there", entries[1].text)
+	assert.Equal(t, "hello there", segmentsText(entries[1].segments), "an assistant turn renders from segments, the same as a live turn (finishStreaming), not entry.text")
 }
 
-func TestReconstructTranscript_SkipsToolMessagesAndEmptyText(t *testing.T) {
+// TestReconstructTranscript_IncludesToolCallsAndResults is the regression
+// test for the behavior change answering "why can't I see the tool calls
+// after resuming a chat": a FunctionCallContent (assistant-role) and its
+// matching FunctionResultContent (its own tool-role message — exactly the
+// shape a real turn persists, confirmed against AgentService's actual
+// output, not a guess) must now render as toolCall/toolResult segments
+// within the surrounding assistant turn, the same as they would have
+// rendered live via applyUpdate. nil messages are still skipped (a resumed
+// chat's slice is never expected to contain one, but reconstructTranscript
+// has always tolerated it defensively).
+func TestReconstructTranscript_IncludesToolCallsAndResults(t *testing.T) {
 	msgs := []*message.Message{
 		{Role: message.RoleUser, Contents: message.Contents{&message.TextContent{Text: "read the file"}}},
-		{Role: message.RoleAssistant, Contents: message.Contents{&message.FunctionCallContent{Name: "file_read"}}}, // no text
-		{Role: message.RoleTool, Contents: message.Contents{&message.TextContent{Text: "file contents"}}},
+		{Role: message.RoleAssistant, Contents: message.Contents{&message.FunctionCallContent{CallID: "call-1", Name: "file_read", Arguments: `{"path":"a.txt"}`}}},
+		{Role: message.RoleTool, Contents: message.Contents{&message.FunctionResultContent{CallID: "call-1", Result: "file contents"}}},
 		nil,
 		{Role: message.RoleAssistant, Contents: message.Contents{&message.TextContent{Text: "here's the summary"}}},
 	}
 	entries := reconstructTranscript(msgs)
-	require.Len(t, entries, 2, "only the two text-bearing user/assistant messages must survive")
+	require.Len(t, entries, 2)
+	assert.Equal(t, message.RoleUser, entries[0].role)
 	assert.Equal(t, "read the file", entries[0].text)
-	assert.Equal(t, "here's the summary", entries[1].text)
+
+	require.Equal(t, message.RoleAssistant, entries[1].role)
+	require.Len(t, entries[1].segments, 2, "the tool call headline and the final text must both be present (file_read has no special-cased result preview, so only the call itself and the reply show)")
+	assert.Equal(t, segmentToolCall, entries[1].segments[0].kind)
+	assert.Contains(t, entries[1].segments[0].text, "file_read")
+	assert.Contains(t, entries[1].segments[0].text, "a.txt")
+	assert.Equal(t, segmentProse, entries[1].segments[1].kind)
+	assert.Equal(t, "here's the summary", entries[1].segments[1].text)
+}
+
+// TestReconstructTranscript_ToolResultSurvivesJSONRoundTrip proves
+// decodeFunctionResult actually does its job: FunctionResultContent.Result
+// is declared `any` with no concrete type preserved across persistence
+// (message.FunctionResultContent's own (de)serialization, confirmed
+// directly against a real persisted chat — see decodeFunctionResult's doc
+// comment), so a resumed chat's Result for a file_write call arrives as a
+// generic map[string]any, not the original tools.FileWriteOutput — exactly
+// what's built here instead of using the struct literal, to exercise the
+// real post-resume shape rather than the live in-process one.
+func TestReconstructTranscript_ToolResultSurvivesJSONRoundTrip(t *testing.T) {
+	genericResult := map[string]any{"path": "a.txt", "lines_added": float64(3), "lines_removed": float64(1), "bytes_written": float64(42)}
+	msgs := []*message.Message{
+		{Role: message.RoleUser, Contents: message.Contents{&message.TextContent{Text: "update the file"}}},
+		{Role: message.RoleAssistant, Contents: message.Contents{&message.FunctionCallContent{CallID: "call-1", Name: "file_write", Arguments: `{"path":"a.txt"}`}}},
+		{Role: message.RoleTool, Contents: message.Contents{&message.FunctionResultContent{CallID: "call-1", Result: genericResult}}},
+	}
+	entries := reconstructTranscript(msgs)
+	require.Len(t, entries, 2)
+	require.Len(t, entries[1].segments, 2)
+	assert.Equal(t, segmentToolResult, entries[1].segments[1].kind)
+	assert.Equal(t, "wrote a.txt (+3 -1 lines, 42 bytes)", entries[1].segments[1].text)
 }
 
 func TestReconstructTranscript_Empty(t *testing.T) {
@@ -503,6 +579,42 @@ func TestChatModel_ToolExecutesWithoutApproval(t *testing.T) {
 	drainCmd(t, c, svc, ctx, c.startTurnCmd(svc, ctx, []*message.Message{message.NewText("please run it again")}))
 	_, statErr = os.Stat(marker)
 	assert.NoError(t, statErr, "the tool must have executed again automatically on a second request")
+}
+
+// TestChatModel_ResumedChat_ShowsToolCallsAndResults is the real
+// end-to-end regression test behind reconstructTranscript's behavior
+// change: run an actual tool-using turn through the real
+// AgentService/JSON-backed-repository path, then resume that exact chat
+// the way --continue/ctrl+h do (resumeChatCmd), and confirm the resumed
+// transcript actually shows the tool call — not just the user/assistant
+// text either side of it, which is all a resumed chat used to show.
+func TestChatModel_ResumedChat_ShowsToolCallsAndResults(t *testing.T) {
+	svc, marker := newBashToolTestService(t)
+	ctx := context.Background()
+	_, err := svc.StartChat(ctx, "chat-1", "assistant")
+	require.NoError(t, err)
+
+	c := newChatModel("chat-1", "assistant", nil, "m1", 80, 24)
+	drainCmd(t, c, svc, ctx, c.startTurnCmd(svc, ctx, []*message.Message{message.NewText("please run the marker command")}))
+	_, statErr := os.Stat(marker)
+	require.NoError(t, statErr, "the tool must have actually executed for this test to mean anything")
+
+	resumeMsg := resumeChatCmd(svc, ctx, "chat-1")()
+	started, ok := resumeMsg.(chatStartedMsg)
+	require.True(t, ok)
+	require.NoError(t, started.err)
+	require.NotEmpty(t, started.messages)
+
+	transcript := reconstructTranscript(started.messages)
+	var sawToolCall bool
+	for _, e := range transcript {
+		for _, seg := range e.segments {
+			if seg.kind == segmentToolCall && strings.Contains(seg.text, "run_shell") {
+				sawToolCall = true
+			}
+		}
+	}
+	assert.True(t, sawToolCall, "resuming the chat must show the tool call that ran during the live session, not just the final text")
 }
 
 // --- ctrl+a (switch agent) / ctrl+o (switch model) overlay tests

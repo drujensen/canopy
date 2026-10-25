@@ -1377,33 +1377,71 @@ func toolCallHeadline(name, argumentsJSON string) string {
 
 // toolResultSegment builds the follow-up segment for frc once its tool
 // call actually completes, consuming (and removing) the matching entry
-// pendingToolCalls' doc comment describes. Returns a zero-value (empty
-// text) segment for a tool this function doesn't special-case and that
-// didn't error — most tools (file_read, web_search, MCP-provided ones,
-// ...) stay as quiet as they were before this addendum; only a genuine
-// failure always gets a segment, regardless of which tool it was. The
-// caller (applyUpdate) only appends the result when text is non-empty.
+// pendingToolCalls' doc comment describes.
 func (c *chatModel) toolResultSegment(frc *message.FunctionResultContent) textSegment {
 	name := c.pendingToolCalls[frc.CallID]
 	delete(c.pendingToolCalls, frc.CallID)
+	return toolResultSegmentFor(name, frc)
+}
 
+// toolResultSegmentFor is toolResultSegment's underlying logic, taking the
+// call's tool name directly instead of looking it up from a live
+// chatModel's pendingToolCalls — reconstructTranscript needs the identical
+// formatting for a resumed chat's persisted messages, where there's no live
+// chatModel (or in-flight tool call) to track that map against. Returns a
+// zero-value (empty text) segment for a tool this function doesn't
+// special-case and that didn't error — most tools (file_read, web_search,
+// MCP-provided ones, ...) stay as quiet as they were before this addendum;
+// only a genuine failure always gets a segment, regardless of which tool it
+// was. The caller only appends the result when text is non-empty.
+func toolResultSegmentFor(name string, frc *message.FunctionResultContent) textSegment {
 	if frc.Error != nil {
 		return textSegment{kind: segmentToolError, text: oneLinePreview(frc.Error.Error(), 200)}
 	}
 
 	switch name {
 	case "run_shell":
-		if out, ok := frc.Result.(string); ok {
+		if out, ok := decodeFunctionResult[string](frc.Result); ok {
 			if preview := truncatePreview(out, 400); preview != "" {
 				return textSegment{kind: segmentToolResult, text: preview}
 			}
 		}
 	case "file_write":
-		if out, ok := frc.Result.(tools.FileWriteOutput); ok {
+		if out, ok := decodeFunctionResult[tools.FileWriteOutput](frc.Result); ok {
 			return textSegment{kind: segmentToolResult, text: fmt.Sprintf("wrote %s (+%d -%d lines, %d bytes)", out.Path, out.LinesAdded, out.LinesRemoved, out.BytesWritten)}
 		}
 	}
 	return textSegment{}
+}
+
+// decodeFunctionResult coerces a FunctionResultContent.Result (declared
+// `any`, since it's whatever a tool call returned) into T, handling both
+// shapes it can arrive in: the real Go value a live tool call just
+// produced (e.g. tools.FileWriteOutput, matched directly by the type
+// assertion below), and the shape the *same* value has after a round trip
+// through persisted JSON — reconstructTranscript's whole reason for
+// existing — where message.FunctionResultContent's own (de)serialization
+// (agent-framework-go's content.go) keeps Result as a bare `any` with no
+// concrete type recorded, so json.Unmarshal necessarily decodes it as a
+// generic map[string]any/[]any instead of the original struct. Re-marshaling
+// that generic value and decoding it into T recovers the original shape
+// (FileWriteOutput's fields all carry json tags, so this round-trips
+// losslessly) — this is what makes resumed-chat tool-result rendering match
+// the live rendering for the same call, not just the call's headline.
+func decodeFunctionResult[T any](result any) (T, bool) {
+	if v, ok := result.(T); ok {
+		return v, true
+	}
+	var zero T
+	data, err := json.Marshal(result)
+	if err != nil {
+		return zero, false
+	}
+	var out T
+	if err := json.Unmarshal(data, &out); err != nil {
+		return zero, false
+	}
+	return out, true
 }
 
 // oneLinePreview collapses embedded newlines in s to spaces (the same
@@ -1567,37 +1605,73 @@ const defaultGreeting = "How can I help you today?"
 // chatStartedMsg case can seed a resumed *chatModel's transcript the same
 // way a live session builds it up turn by turn.
 //
-// Only user/assistant messages with non-empty rendered text are included —
-// deliberately mirroring what a *live* session's transcript ever contains
-// in the first place: applyUpdate only ever appends TextContent to
-// c.streaming (folded into a transcriptEntry by finishStreaming), never a
-// raw tool-result or empty tool-call-only message. A Tool-role result
-// message, or a message whose only content is a function call with no
-// accompanying text, is skipped rather than rendered as a confusing empty
-// entry. This is a known, deliberate simplification: full historical
-// tool-call/approval-prompt formatting isn't reconstructed on resume, only
-// the conversational text — resuming a chat mid-tool-call is not a
-// supported scenario (the pending approval itself doesn't survive a
-// restart either, per Design §3.9's session-state contract).
+// Post-v0.1.0 addendum ("why can't I see the tool calls after resuming,
+// Claude Code shows them"): this used to skip every tool-call/tool-result
+// message entirely, keeping only user/assistant text — a deliberate
+// simplification at the time, but one that reads as data loss once you
+// know the calls *are* persisted (see persistCancelledUserMessages' own
+// history for the adjacent "is anything actually being saved" question).
+// Now it rebuilds the same interleaved prose/toolCall/toolResult/toolError
+// segment sequence applyUpdate/finishStreaming build live, from the flat
+// persisted message list: a user message starts a new transcriptEntry; a
+// FunctionCallContent (assistant-role) or FunctionResultContent
+// (tool-role — toolautocall's createResponseMessage puts results in their
+// own message.RoleTool message, never bundled into the assistant one)
+// extends the current assistant turn's segments instead of a new entry,
+// exactly mirroring applyUpdate's per-content-type switch. pendingCalls
+// (CallID -> tool name) plays the same role here that a live chatModel's
+// own pendingToolCalls field does, just scoped to one reconstruction call
+// instead of one chatModel's lifetime.
 func reconstructTranscript(messages []*message.Message) []transcriptEntry {
 	entries := make([]transcriptEntry, 0, len(messages))
+	pendingCalls := make(map[string]string)
+	var segments []textSegment
+
+	flushAssistantTurn := func() {
+		if len(segments) > 0 {
+			entries = append(entries, transcriptEntry{role: message.RoleAssistant, segments: segments})
+			segments = nil
+		}
+	}
+
 	for _, m := range messages {
 		if m == nil {
 			continue
 		}
-		if m.Role != message.RoleUser && m.Role != message.RoleAssistant {
-			continue
+		switch m.Role {
+		case message.RoleUser:
+			flushAssistantTurn()
+			if text := strings.TrimSpace(m.String()); text != "" {
+				entries = append(entries, transcriptEntry{role: message.RoleUser, text: text})
+			}
+		case message.RoleAssistant, message.RoleTool:
+			for _, content := range m.Contents {
+				switch t := content.(type) {
+				case *message.TextContent:
+					if t.Text == "" {
+						continue
+					}
+					if n := len(segments); n > 0 && segments[n-1].kind == segmentProse {
+						segments[n-1].text += t.Text
+					} else {
+						segments = append(segments, textSegment{kind: segmentProse, text: t.Text})
+					}
+				case *message.FunctionCallContent:
+					if t.Name != "" {
+						pendingCalls[t.CallID] = t.Name
+						segments = append(segments, textSegment{kind: segmentToolCall, text: toolCallHeadline(t.Name, t.Arguments)})
+					}
+				case *message.FunctionResultContent:
+					name := pendingCalls[t.CallID]
+					delete(pendingCalls, t.CallID)
+					if seg := toolResultSegmentFor(name, t); seg.text != "" {
+						segments = append(segments, seg)
+					}
+				}
+			}
 		}
-		text := strings.TrimSpace(m.String())
-		if text == "" {
-			continue
-		}
-		entry := transcriptEntry{role: m.Role, text: text}
-		if m.Role == message.RoleAssistant {
-			entry.segments = []textSegment{{kind: segmentProse, text: text}}
-		}
-		entries = append(entries, entry)
 	}
+	flushAssistantTurn()
 	return entries
 }
 
