@@ -314,14 +314,15 @@ func newChatModel(chatID, agentName string, todos []todo.Item, model string, wid
 // clipboard despite the escape sequence reaching them intact, since
 // honoring a clipboard-*write* request is each terminal's own choice to
 // implement (or not) and there's no way to detect support short of
-// trying it and seeing). Shelling out to wl-copy/xclip/xsel/pbcopy talks
-// to the display server's clipboard directly, bypassing the terminal
-// entirely. OSC 52 is kept only as the fallback for a session with no
-// local display to shell a clipboard command against in the first
-// place — chiefly SSH, where the terminal emulator (running on the
-// user's actual local machine) can still forward the escape sequence
-// back to a real local clipboard even though there's no $DISPLAY/
-// $WAYLAND_DISPLAY to speak of on the remote end running Canopy.
+// trying it and seeing). Shelling out to pbcopy/clip.exe/wl-copy/xclip/
+// xsel talks to the OS/display server's clipboard directly, bypassing the
+// terminal entirely. OSC 52 is kept only as the fallback for a session
+// with no local clipboard tool to shell out to — chiefly SSH on Linux/
+// macOS, where there's no local Wayland/X11 display (or, on Windows,
+// no clip.exe) to run a clipboard command against on the *remote* end
+// running Canopy, but the terminal emulator on the user's actual local
+// machine can still forward the escape sequence back to a real local
+// clipboard.
 func defaultCopyToClipboard(text string) {
 	if copyViaSystemTool(text) {
 		return
@@ -340,6 +341,13 @@ func copyViaSystemTool(text string) bool {
 	switch {
 	case runtime.GOOS == "darwin":
 		name = "pbcopy"
+	case runtime.GOOS == "windows":
+		// clip.exe ships with Windows itself (no install needed, unlike
+		// wl-copy/xclip/xsel) and writes straight to the Windows
+		// clipboard — more reliable than hoping the terminal (classic
+		// conhost vs. modern Windows Terminal) parses OSC 52 for a
+		// PowerShell/cmd session.
+		name = "clip"
 	case os.Getenv("WAYLAND_DISPLAY") != "":
 		name = "wl-copy"
 	case os.Getenv("DISPLAY") != "":
