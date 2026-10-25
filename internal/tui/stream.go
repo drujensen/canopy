@@ -15,6 +15,7 @@ import (
 	"github.com/microsoft/agent-framework-go/agent/harness/todo"
 	"github.com/microsoft/agent-framework-go/message"
 
+	"github.com/drujensen/canopy/internal/domain/entities"
 	"github.com/drujensen/canopy/internal/domain/services"
 	"github.com/drujensen/canopy/internal/impl/providers"
 )
@@ -63,6 +64,12 @@ type modelChangedMsg struct {
 // subsequent turns.
 type agentChangedMsg struct {
 	agentName string
+
+	// capabilities is the newly-active agent's services.AgentCapabilities
+	// (post-v0.1.0 addendum: sidebar "N tools, M skills" line) — refreshed
+	// here because switching agents can change both counts (a different
+	// tools: allowlist, or whether Skill is even in it).
+	capabilities services.AgentCapabilities
 }
 
 // chatStartedMsg reports the outcome of picking an agent in the picker
@@ -85,6 +92,20 @@ type chatStartedMsg struct {
 	// present, so a resumed chat shows its prior conversation instead of
 	// starting blank.
 	messages []*message.Message
+
+	// capabilities is agentName's services.AgentCapabilities (post-v0.1.0
+	// addendum: sidebar "N tools, M skills" line), resolved by every
+	// producer of this message (startChatCmd, startNewChatCmd,
+	// resumeChatCmd) since it's needed the moment the chat screen first
+	// renders, not just after agentChangedMsg's later ctrl+a refresh.
+	capabilities services.AgentCapabilities
+
+	// usage is the chat's persisted entities.Chat.Usage — nil for a
+	// genuinely new chat (startChatCmd/startNewChatCmd), populated from
+	// GetChat for a resumed one (resumeChatCmd) the same way messages is,
+	// so --continue/ctrl+h shows the chat's running cost immediately
+	// rather than resetting it to zero until the next turn completes.
+	usage map[string]entities.ModelUsage
 }
 
 // resumeChatCmd loads chatID's full state (post-v0.1.0 addendum: ctrl+h
@@ -117,12 +138,18 @@ func resumeChatCmd(svc *services.AgentService, ctx context.Context, chatID strin
 		if err != nil {
 			return chatStartedMsg{err: fmt.Errorf("loading model: %w", err)}
 		}
+		capabilities, err := svc.AgentCapabilities(ctx, chat.AgentName)
+		if err != nil {
+			return chatStartedMsg{err: fmt.Errorf("loading agent capabilities: %w", err)}
+		}
 		return chatStartedMsg{
-			chatID:    chatID,
-			agentName: chat.AgentName,
-			todos:     todos,
-			model:     model,
-			messages:  chat.Messages,
+			chatID:       chatID,
+			agentName:    chat.AgentName,
+			todos:        todos,
+			model:        model,
+			messages:     chat.Messages,
+			capabilities: capabilities,
+			usage:        chat.Usage,
 		}
 	}
 }

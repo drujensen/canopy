@@ -65,4 +65,28 @@ type Chat struct {
 	// back to a formatted date in either case (services.ChatSummary/
 	// tui.historyPickerItem), never a blank/placeholder title.
 	Title string `json:"title,omitempty"`
+
+	// Usage accumulates token counts and USD cost per model
+	// (ModelConfig.Name) across this chat's entire lifetime (post-v0.1.0
+	// addendum: the TUI sidebar's usage/cost display) — every top-level
+	// turn, plus every subagent dispatch that turn made, however many
+	// different models either ever resolved to across the chat's history
+	// (a ctrl+o switch, or a subagent whose own "model" frontmatter names
+	// something else). Persisted (not just kept in memory) specifically so
+	// --continue/resume shows the same running total, and so a later
+	// project-wide cost view can sum this field across every chat in the
+	// repository rather than recomputing anything from raw token logs.
+	// nil/empty means no turn has completed yet, or every completed turn's
+	// model has since been removed from providers.json (mergeUsage, domain/
+	// services/usage.go, still accumulates tokens in that case — only the
+	// cost contribution is lost, not the field itself).
+	Usage map[string]ModelUsage `json:"usage,omitempty"`
+}
+
+// ModelUsage accumulates token counts and USD cost for one model
+// (ModelConfig.Name) — see Chat.Usage.
+type ModelUsage struct {
+	InputTokens  int64   `json:"input_tokens"`
+	OutputTokens int64   `json:"output_tokens"`
+	CostUSD      float64 `json:"cost_usd"`
 }

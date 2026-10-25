@@ -36,6 +36,26 @@ func (i skillPickerItem) Title() string       { return i.name }
 func (i skillPickerItem) Description() string { return i.description }
 func (i skillPickerItem) FilterValue() string { return i.name }
 
+// toolPickerItem adapts a services.ToolSummary's Name/Description/Source to
+// bubbles/list's Item interfaces for chatModel's ctrl+t tools-browser
+// overlay. Source is folded into Description() as a "(Built-in)"/"(MCP)"
+// prefix rather than getting its own field in the Item interface — there's
+// no third slot to put it in, and prefixing keeps it visible even in the
+// list's compact (non-selected) row rendering, same as skillPickerItem's
+// single-purpose Description().
+type toolPickerItem struct{ name, description, source string }
+
+func (i toolPickerItem) Title() string { return i.name }
+
+func (i toolPickerItem) Description() string {
+	if i.description == "" {
+		return fmt.Sprintf("(%s)", i.source)
+	}
+	return fmt.Sprintf("(%s) %s", i.source, i.description)
+}
+
+func (i toolPickerItem) FilterValue() string { return i.name }
+
 // modelPickerItem adapts a services.ModelSummary (name plus per-million-token
 // request/response cost) to bubbles/list's Item interfaces for the ctrl+o
 // model-switch overlay (post-v0.1.0 addendum) — the model-picker analogue of

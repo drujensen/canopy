@@ -251,6 +251,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		m.chat = newChatModel(msg.chatID, msg.agentName, msg.todos, msg.model, m.width, m.height)
+		m.chat.toolCount = msg.capabilities.ToolCount
+		m.chat.skillCount = msg.capabilities.SkillCount
+		m.chat.usage = msg.usage
 		if len(msg.messages) > 0 {
 			// A resume (ctrl+h/--continue, resumeChatCmd), not a genuinely
 			// new chat — seed the transcript from prior history instead of
@@ -353,6 +356,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case agentChangedMsg:
 		if m.chat != nil {
 			m.chat.agentName = msg.agentName
+			m.chat.toolCount = msg.capabilities.ToolCount
+			m.chat.skillCount = msg.capabilities.SkillCount
 		}
 		return m, nil
 
@@ -536,7 +541,11 @@ func (m Model) startChatCmd(agentName string) tea.Cmd {
 		if err != nil {
 			return chatStartedMsg{err: fmt.Errorf("loading model: %w", err)}
 		}
-		return chatStartedMsg{chatID: chatID, agentName: agentName, todos: todos, model: model}
+		capabilities, err := svc.AgentCapabilities(ctx, agentName)
+		if err != nil {
+			return chatStartedMsg{err: fmt.Errorf("loading agent capabilities: %w", err)}
+		}
+		return chatStartedMsg{chatID: chatID, agentName: agentName, todos: todos, model: model, capabilities: capabilities}
 	}
 }
 

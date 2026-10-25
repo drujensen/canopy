@@ -617,6 +617,57 @@ func TestChatModel_ResumedChat_ShowsToolCallsAndResults(t *testing.T) {
 	assert.True(t, sawToolCall, "resuming the chat must show the tool call that ran during the live session, not just the final text")
 }
 
+// TestChatModel_ResumedChat_ShowsRealUsageCost reproduces a reported bug:
+// switching to a chat via ctrl+h's history browser showed the sidebar's
+// Cost line as "(none yet)" even though the chat's real conversation (and
+// its real token spend) was plainly visible in the resumed transcript.
+// Drives a real turn against a provider that reports actual token usage,
+// confirms the live chat's own c.usage reflects it, then resumes that exact
+// chat the way ctrl+h does (resumeChatCmd) and asserts the resumed
+// chatStartedMsg carries the identical usage — not an empty map.
+func TestChatModel_ResumedChat_ShowsRealUsageCost(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"id": "chatcmpl-test", "object": "chat.completion", "created": 1700000000, "model": "test-model",
+			"choices": []map[string]any{
+				{"index": 0, "message": map[string]any{"role": "assistant", "content": "ok"}, "finish_reason": "stop"},
+			},
+			"usage": map[string]any{"prompt_tokens": 100, "completion_tokens": 50, "total_tokens": 150},
+		})
+	}))
+	t.Cleanup(server.Close)
+
+	provider := entities.ProviderConfig{Name: "p", Type: entities.ProviderTypeOpenAI, APIKey: "sk-test", BaseURL: server.URL + "/v1"}
+	model := entities.ModelConfig{Name: "m1", Provider: "p", ModelName: "gpt-test", InputCostPerMillionTokens: 2, OutputCostPerMillionTokens: 10}
+	repo, err := jsonrepo.NewChatRepository(t.TempDir())
+	require.NoError(t, err)
+	svc := services.NewAgentService(services.AgentServiceConfig{
+		Definitions:  services.Definitions{Agents: map[string]agentsource.AgentDefinition{"assistant": {Name: "assistant"}}},
+		Providers:    []entities.ProviderConfig{provider},
+		Models:       []entities.ModelConfig{model},
+		DefaultModel: "m1",
+		Repository:   repo,
+		Tools:        services.ToolsConfig{WorkingRoot: t.TempDir()},
+	})
+
+	ctx := context.Background()
+	_, err = svc.StartChat(ctx, "chat-1", "assistant")
+	require.NoError(t, err)
+
+	c := newChatModel("chat-1", "assistant", nil, "m1", 80, 24)
+	drainCmd(t, c, svc, ctx, c.startTurnCmd(svc, ctx, []*message.Message{message.NewText("hi")}))
+	require.NotEmpty(t, c.usage, "the live chat's own usage must reflect the turn that just ran")
+
+	resumeMsg := resumeChatCmd(svc, ctx, "chat-1")()
+	started, ok := resumeMsg.(chatStartedMsg)
+	require.True(t, ok)
+	require.NoError(t, started.err)
+
+	assert.Equal(t, c.usage, started.usage, "resuming the same chat via ctrl+h must carry the real recorded usage, not an empty map")
+	assert.NotEqual(t, "(none yet)", usageCostLine(started.usage))
+}
+
 // --- ctrl+a (switch agent) / ctrl+o (switch model) overlay tests
 // (post-v0.1.0 addendum, Design §3.4/§4/§5) ---
 //
@@ -970,6 +1021,114 @@ func TestChatModel_CtrlS_NoopDuringActiveStream(t *testing.T) {
 	cmd := c.handleKey(tea.KeyMsg{Type: tea.KeyCtrlS}, svc, ctx)
 	assert.Nil(t, cmd)
 	assert.Nil(t, c.picker, "ctrl+s must not open the skills browser while a stream is active")
+}
+
+// TestChatModel_CtrlT_OpensToolsBrowser_SelectingShowsDetail drives the real
+// ctrl+t keybinding path end to end: opens the overlay (pickerTool),
+// selects the alphabetically-first built-in tool ("Bash" — ListTools sorts
+// by name, and newSwitchTestService's "assistant" agent sets no tools:
+// allowlist, so every built-in tool is available), and asserts the tool's
+// name and source land in the transcript as a system-style entry.
+func TestChatModel_CtrlT_OpensToolsBrowser_SelectingShowsDetail(t *testing.T) {
+	svc := newSwitchTestService(t) // no MCP tools configured
+	ctx := context.Background()
+	_, err := svc.StartChat(ctx, "chat-1", "assistant")
+	require.NoError(t, err)
+
+	c := newChatModel("chat-1", "assistant", nil, "m1", 80, 24)
+
+	cmd := c.handleKey(tea.KeyMsg{Type: tea.KeyCtrlT}, svc, ctx)
+	assert.Nil(t, cmd, "opening the tools browser is a synchronous, in-memory ListTools() read — no Cmd needed")
+	require.NotNil(t, c.picker, "ctrl+t must open the in-chat tools-browser overlay")
+	assert.Equal(t, pickerTool, c.pickerKind)
+
+	selectCmd := c.handleKey(tea.KeyMsg{Type: tea.KeyEnter}, svc, ctx)
+	assert.Nil(t, selectCmd, "selecting a tool is also synchronous — no AgentService mutator involved")
+	assert.Nil(t, c.picker, "selecting an entry must close the overlay")
+
+	require.Len(t, c.transcript, 1, "the selected tool's detail must be folded into the transcript")
+	assert.True(t, c.transcript[0].system, "the tool-detail entry must be marked system, not a real user/assistant message")
+	assert.Contains(t, c.transcript[0].text, "Tool: Bash (Built-in)")
+
+	view := c.View(80, 24)
+	assert.Contains(t, view, "Bash", "the shown tool content must actually be visible in the rendered view")
+}
+
+// TestChatModel_CtrlT_EscCancelsWithNoChange proves "esc" closes the tools
+// overlay without adding anything to the transcript, mirroring ctrl+s's own
+// cancel behavior.
+func TestChatModel_CtrlT_EscCancelsWithNoChange(t *testing.T) {
+	svc := newSwitchTestService(t)
+	ctx := context.Background()
+	_, err := svc.StartChat(ctx, "chat-1", "assistant")
+	require.NoError(t, err)
+
+	c := newChatModel("chat-1", "assistant", nil, "m1", 80, 24)
+	c.handleKey(tea.KeyMsg{Type: tea.KeyCtrlT}, svc, ctx)
+	require.NotNil(t, c.picker)
+
+	cmd := c.handleKey(tea.KeyMsg{Type: tea.KeyEsc}, svc, ctx)
+	assert.Nil(t, cmd)
+	assert.Nil(t, c.picker, "esc must close the tools overlay")
+	assert.Equal(t, pickerNone, c.pickerKind)
+	assert.Empty(t, c.transcript, "cancelling the tools browser must not add anything to the transcript")
+}
+
+// TestChatModel_CtrlT_NoopDuringActiveStream asserts ctrl+t does not open
+// the tools browser mid-turn, the same guard ctrl+a/ctrl+o/ctrl+s apply.
+func TestChatModel_CtrlT_NoopDuringActiveStream(t *testing.T) {
+	svc := newSwitchTestService(t)
+	ctx := context.Background()
+	_, err := svc.StartChat(ctx, "chat-1", "assistant")
+	require.NoError(t, err)
+
+	c := newChatModel("chat-1", "assistant", nil, "m1", 80, 24)
+	c.streamActive = true
+
+	cmd := c.handleKey(tea.KeyMsg{Type: tea.KeyCtrlT}, svc, ctx)
+	assert.Nil(t, cmd)
+	assert.Nil(t, c.picker, "ctrl+t must not open the tools browser while a stream is active")
+}
+
+// TestChatModel_CtrlU_ShowsFullUsageBreakdown drives the real ctrl+u
+// keybinding path: it folds renderUsageLines' full per-model breakdown
+// into the transcript, the detail the sidebar's own compact "Cost: ..."
+// line (usageCostLine) deliberately leaves out.
+func TestChatModel_CtrlU_ShowsFullUsageBreakdown(t *testing.T) {
+	svc := newSwitchTestService(t)
+	ctx := context.Background()
+	_, err := svc.StartChat(ctx, "chat-1", "assistant")
+	require.NoError(t, err)
+
+	c := newChatModel("chat-1", "assistant", nil, "m1", 80, 24)
+	c.usage = map[string]entities.ModelUsage{
+		"m1":     {InputTokens: 1000, OutputTokens: 200, CostUSD: 0.0123},
+		"sub-m1": {InputTokens: 50, OutputTokens: 25, CostUSD: 0.0004},
+	}
+
+	cmd := c.handleKey(tea.KeyMsg{Type: tea.KeyCtrlU}, svc, ctx)
+	assert.Nil(t, cmd, "showUsage is a synchronous, in-memory read of c.usage — no Cmd needed")
+
+	require.Len(t, c.transcript, 1)
+	assert.True(t, c.transcript[0].system)
+	assert.Contains(t, c.transcript[0].text, "sub-m1")
+	assert.Contains(t, c.transcript[0].text, "total")
+}
+
+// TestChatModel_CtrlU_NoopDuringActiveStream asserts ctrl+u does not show
+// the usage breakdown mid-turn, the same guard the other overlays apply.
+func TestChatModel_CtrlU_NoopDuringActiveStream(t *testing.T) {
+	svc := newSwitchTestService(t)
+	ctx := context.Background()
+	_, err := svc.StartChat(ctx, "chat-1", "assistant")
+	require.NoError(t, err)
+
+	c := newChatModel("chat-1", "assistant", nil, "m1", 80, 24)
+	c.streamActive = true
+
+	cmd := c.handleKey(tea.KeyMsg{Type: tea.KeyCtrlU}, svc, ctx)
+	assert.Nil(t, cmd)
+	assert.Empty(t, c.transcript, "ctrl+u must not show the usage breakdown while a stream is active")
 }
 
 // ---------------------------------------------------------------------

@@ -39,7 +39,6 @@ import (
 	"github.com/microsoft/agent-framework-go/agent/harness/todo"
 	"github.com/microsoft/agent-framework-go/message"
 	"github.com/microsoft/agent-framework-go/tool"
-	"github.com/microsoft/agent-framework-go/tool/agenttool"
 
 	"github.com/drujensen/canopy/internal/domain/entities"
 	"github.com/drujensen/canopy/internal/domain/interfaces"
@@ -346,6 +345,14 @@ type RunResult struct {
 	// activeModelName), the same value GetModel returns for this chat
 	// immediately after the turn.
 	Model string
+
+	// Usage is the chat's resulting entities.Chat.Usage (post-v0.1.0
+	// addendum: the TUI sidebar's usage/cost display) immediately after
+	// this turn's persistSession call — every model this chat's history
+	// has ever used (including subagent dispatches), not just Model
+	// above, accumulated across the chat's whole lifetime, not just this
+	// one turn.
+	Usage map[string]entities.ModelUsage
 }
 
 // RunText loads the chat with the given ID, builds the *agent.Agent its
@@ -397,10 +404,18 @@ func (s *AgentService) RunMessages(ctx context.Context, chatID string, msgs []*m
 		return nil, fmt.Errorf("agent service: loading chat %q: %w", chatID, err)
 	}
 
+	modelName, err := s.activeModelName(chat)
+	if err != nil {
+		return nil, err
+	}
+
 	session, err := harness.LoadSession(chat)
 	if err != nil {
 		return nil, fmt.Errorf("agent service: loading session state for chat %q: %w", chatID, err)
 	}
+
+	collector := &usageCollector{}
+	ctx = withUsageCollector(ctx, collector)
 
 	a, err := s.buildTopLevelAgent(ctx, chat)
 	if err != nil {
@@ -414,12 +429,9 @@ func (s *AgentService) RunMessages(ctx context.Context, chatID string, msgs []*m
 		}
 		return nil, fmt.Errorf("agent service: running chat %q: %w", chatID, err)
 	}
+	collector.record(modelName, resp.Usage())
 
-	if err := s.persistSession(ctx, chatID, session); err != nil {
-		return nil, err
-	}
-
-	modelName, err := s.activeModelName(chat)
+	usage, err := s.persistSession(ctx, chatID, session, collector)
 	if err != nil {
 		return nil, err
 	}
@@ -428,6 +440,7 @@ func (s *AgentService) RunMessages(ctx context.Context, chatID string, msgs []*m
 		Response: resp,
 		Todos:    s.todoProvider.GetAllItems(agent.WithSession(session)),
 		Model:    modelName,
+		Usage:    usage,
 	}, nil
 }
 
@@ -502,10 +515,18 @@ func (s *AgentService) RunMessagesStream(ctx context.Context, chatID string, msg
 		return nil, nil, fmt.Errorf("agent service: loading chat %q: %w", chatID, err)
 	}
 
+	modelName, err := s.activeModelName(chat)
+	if err != nil {
+		return nil, nil, err
+	}
+
 	session, err := harness.LoadSession(chat)
 	if err != nil {
 		return nil, nil, fmt.Errorf("agent service: loading session state for chat %q: %w", chatID, err)
 	}
+
+	collector := &usageCollector{}
+	ctx = withUsageCollector(ctx, collector)
 
 	a, err := s.buildTopLevelAgent(ctx, chat)
 	if err != nil {
@@ -536,16 +557,11 @@ func (s *AgentService) RunMessagesStream(ctx context.Context, chatID string, msg
 			}
 		}
 		resp.Coalesce()
+		collector.record(modelName, resp.Usage())
 
-		if persistErr := s.persistSession(ctx, chatID, session); persistErr != nil {
+		usage, persistErr := s.persistSession(ctx, chatID, session, collector)
+		if persistErr != nil {
 			state.err = persistErr
-			state.done = true
-			return
-		}
-
-		modelName, modelErr := s.activeModelName(chat)
-		if modelErr != nil {
-			state.err = modelErr
 			state.done = true
 			return
 		}
@@ -554,6 +570,7 @@ func (s *AgentService) RunMessagesStream(ctx context.Context, chatID string, msg
 			Response: &resp,
 			Todos:    s.todoProvider.GetAllItems(agent.WithSession(session)),
 			Model:    modelName,
+			Usage:    usage,
 		}
 		state.done = true
 	})
@@ -638,22 +655,33 @@ func (s *AgentService) persistCancelledUserMessages(chatID string, msgs []*messa
 // SessionState field, reloading the chat first so this write doesn't
 // clobber a concurrent Messages update (see RunMessages' doc comment for
 // why this is a deliberate second write, not merged into
-// ChatHistoryProvider.Invoked's own Update call).
-func (s *AgentService) persistSession(ctx context.Context, chatID string, session *agent.Session) error {
+// ChatHistoryProvider.Invoked's own Update call). It also merges collector's
+// accumulated token usage (the top-level call this turn made, plus every
+// subagent dispatch — see usageTrackingSubagentTool) into the same reload-
+// and-write cycle, onto chat.Usage, rather than a separate Update call —
+// one combined write per turn for everything this turn needs to persist
+// beyond Messages (which ChatHistoryProvider.Invoked already handles on
+// its own schedule).
+//
+// Returns the chat's resulting Usage map (post-merge) so callers can hand
+// it straight to the caller in RunResult without a second repository read
+// — this function already has the authoritative post-write value in hand.
+func (s *AgentService) persistSession(ctx context.Context, chatID string, session *agent.Session, collector *usageCollector) (map[string]entities.ModelUsage, error) {
 	data, err := harness.SerializeSession(session)
 	if err != nil {
-		return fmt.Errorf("agent service: serializing session state for chat %q: %w", chatID, err)
+		return nil, fmt.Errorf("agent service: serializing session state for chat %q: %w", chatID, err)
 	}
 	chat, err := s.repository.Get(ctx, chatID)
 	if err != nil {
-		return fmt.Errorf("agent service: reloading chat %q to persist session state: %w", chatID, err)
+		return nil, fmt.Errorf("agent service: reloading chat %q to persist session state: %w", chatID, err)
 	}
 	chat.SessionState = data
+	mergeUsage(chat, collector.snapshot(), s.models)
 	chat.UpdatedAt = time.Now().UTC()
 	if err := s.repository.Update(ctx, chat); err != nil {
-		return fmt.Errorf("agent service: persisting session state for chat %q: %w", chatID, err)
+		return nil, fmt.Errorf("agent service: persisting session state for chat %q: %w", chatID, err)
 	}
-	return nil
+	return chat.Usage, nil
 }
 
 // GetTodos returns chat's current todo list (Design §3.7, Requirements
@@ -1064,8 +1092,9 @@ func (s *AgentService) loadChatSession(ctx context.Context, chatID string) (*age
 
 // buildTopLevelAgent constructs the *agent.Agent for chat.AgentName, bound
 // to chat's persisted history via impl/harness, with every other loaded
-// agent definition wrapped via tool/agenttool.New and added to its tool
-// list as a dynamically-dispatchable subagent (FR9, Design §3.4). Subagents
+// agent definition wrapped via newUsageTrackingSubagentTool and added to
+// its tool list as a dynamically-dispatchable subagent (FR9, Design §3.4).
+// Subagents
 // are themselves built via buildSubagentAgent, which does NOT recursively
 // grant them further subagent-dispatch tools — this both matches Claude
 // Code's own Task-tool behavior (a dispatched subagent doesn't itself
@@ -1108,7 +1137,8 @@ func (s *AgentService) buildTopLevelAgent(ctx context.Context, chat *entities.Ch
 
 // buildTopLevelTools assembles def's own core tool list (see buildTools)
 // plus, for every *other* loaded agent definition, a
-// tool/agenttool-wrapped subagent tool (FR9, Design §3.4) — split out from
+// newUsageTrackingSubagentTool-wrapped subagent tool (FR9, Design §3.4) —
+// split out from
 // buildTopLevelAgent so the assembly logic itself (which agents get
 // wrapped, and that def is never wrapped as its own subagent) is directly
 // testable without needing to inspect a constructed *agent.Agent's
@@ -1134,12 +1164,27 @@ func (s *AgentService) buildTopLevelTools(ctx context.Context, def agentsource.A
 	if err != nil {
 		return nil, err
 	}
+	return append(toolList, s.buildSubagentDispatchTools(ctx, def)...), nil
+}
 
+// buildSubagentDispatchTools returns the subagent-dispatch tool (FR9,
+// Design §3.4) for every other loaded agent definition that builds
+// successfully — split out of buildTopLevelTools (post-v0.1.0 addendum:
+// ListTools/ctrl+t tools browser) so both it and ListTools derive the
+// identical set of subagent tools from one place, rather than two copies
+// that could silently drift apart and make the ctrl+t browser's tool count
+// disagree with the sidebar's own Tools: N (AgentCapabilities.ToolCount),
+// which is exactly buildTopLevelTools' own len(toolList). See
+// buildTopLevelTools' doc comment for why a failure building one of the
+// *other* agents here is non-fatal (logged and skipped) rather than
+// propagated.
+func (s *AgentService) buildSubagentDispatchTools(ctx context.Context, def agentsource.AgentDefinition) []tool.Tool {
+	var result []tool.Tool
 	for name, subDef := range s.defs.Agents {
 		if name == def.Name {
 			continue
 		}
-		subAgent, err := s.buildSubagentAgent(ctx, subDef)
+		subAgent, subModelName, err := s.buildSubagentAgent(ctx, subDef)
 		if err != nil {
 			if s.logger != nil {
 				s.logger.Warn("skipping subagent-dispatch tool for a misconfigured agent",
@@ -1147,15 +1192,16 @@ func (s *AgentService) buildTopLevelTools(ctx context.Context, def agentsource.A
 			}
 			continue
 		}
-		toolList = append(toolList, agenttool.New(subAgent, agenttool.Config{}))
+		result = append(result, newUsageTrackingSubagentTool(subAgent, subModelName))
 	}
-	return toolList, nil
+	return result
 }
 
 // buildSubagentAgent constructs a *agent.Agent for def with the core tool
 // set but no ChatHistoryProvider and no further subagent-dispatch tools, so
 // it runs with the framework's default in-memory history provider — which,
-// since tool/agenttool invokes it without a WithSession option, starts a
+// since newUsageTrackingSubagentTool invokes it without a WithSession
+// option (same as tool/agenttool, the stock wrapper it replaces), starts a
 // brand-new session on every dispatch (Design §3.4's "context isolation is
 // automatic" claim). This is what makes subagent dispatch genuinely
 // isolated from the parent's conversation rather than sharing its Chat.
@@ -1174,14 +1220,20 @@ func (s *AgentService) buildTopLevelTools(ctx context.Context, def agentsource.A
 // Chat of its own, see above), and a parent chat's model switch is exactly
 // the kind of chat-scoped state that isolation says shouldn't leak into a
 // dispatched subagent's own construction.
-func (s *AgentService) buildSubagentAgent(ctx context.Context, def agentsource.AgentDefinition) (*agent.Agent, error) {
+// The returned model name is def's resolved entities.ModelConfig.Name
+// (post-v0.1.0 addendum: usageTrackingSubagentTool tags every dispatch's
+// token usage with it, since a subagent can resolve to a different model
+// than its parent, or than another subagent — this is the only place that
+// resolution happens, so callers that need it (buildTopLevelTools) get it
+// for free rather than resolving it a second time).
+func (s *AgentService) buildSubagentAgent(ctx context.Context, def agentsource.AgentDefinition) (*agent.Agent, string, error) {
 	provider, model, err := s.resolveProviderModel(def, "")
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	toolList, err := s.buildTools(def)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	cfg := agent.Config{
 		Name:        def.Name,
@@ -1191,7 +1243,11 @@ func (s *AgentService) buildSubagentAgent(ctx context.Context, def agentsource.A
 		Logger:      s.logger,
 		Middlewares: s.middlewares,
 	}
-	return providers.New(ctx, provider, model, cfg)
+	a, err := providers.New(ctx, provider, model, cfg)
+	if err != nil {
+		return nil, "", err
+	}
+	return a, model.Name, nil
 }
 
 // resolveModelName applies the shared "which model" precedence (Design §4,
@@ -1295,6 +1351,107 @@ func (s *AgentService) skillsCatalog() string {
 	return strings.TrimRight(b.String(), "\n")
 }
 
+// AgentCapabilities summarizes what's available to one loaded agent
+// definition (post-v0.1.0 addendum: the TUI sidebar's "N tools, M skills"
+// line). ToolCount mirrors exactly what a real turn wires in
+// (buildTopLevelTools: core tools filtered by the agent's own tools:
+// allowlist if it set one, plus MCP tools, plus one subagent-dispatch tool
+// per other loaded agent that builds successfully — a misconfigured
+// subagent candidate is skipped there and so is skipped here too, for the
+// same reason). SkillCount is zero unless ToolCount's list actually
+// includes the Skill tool: skillsCatalog's system-prompt appendix is
+// unconditional, but the skills it lists are only reachable — and this
+// count should only be non-zero — when the model can actually call the
+// tool that acts on them.
+type AgentCapabilities struct {
+	ToolCount  int
+	SkillCount int
+}
+
+// AgentCapabilities resolves agentName's AgentCapabilities. Returns an
+// error for an unknown agent name or a failure building its own (not a
+// subagent candidate's — see ToolCount's doc comment) tool list, the same
+// failure modes buildTopLevelTools itself can hit.
+func (s *AgentService) AgentCapabilities(ctx context.Context, agentName string) (AgentCapabilities, error) {
+	def, ok := s.defs.Agents[agentName]
+	if !ok {
+		return AgentCapabilities{}, fmt.Errorf("agent service: unknown agent %q", agentName)
+	}
+	toolList, err := s.buildTopLevelTools(ctx, def)
+	if err != nil {
+		return AgentCapabilities{}, err
+	}
+	caps := AgentCapabilities{ToolCount: len(toolList)}
+	for _, t := range toolList {
+		if t.Name() == "Skill" {
+			caps.SkillCount = len(s.defs.Skills)
+			break
+		}
+	}
+	return caps, nil
+}
+
+// ToolSummary is one entry in ListTools' result: a tool's Name/Description
+// plus Source, which is "Built-in" for one of Canopy's own tools
+// (coreToolNames), "MCP" for one exposed by a connected MCP server, or
+// "Subagent" for a dispatch-to-another-agent tool (buildSubagentDispatchTools)
+// — used by the TUI's ctrl+t tools-browser overlay (post-v0.1.0 addendum)
+// to show a user what's actually available without asking the model.
+type ToolSummary struct {
+	Name        string
+	Description string
+	Source      string
+}
+
+// ListTools returns agentName's complete effective tool set — built-in,
+// MCP, and subagent-dispatch — sorted by name and labeled by
+// ToolSummary.Source. This is deliberately the exact same set
+// buildTopLevelTools assembles for a real turn (built-in/MCP via
+// buildTools/resolveToolNames, subagent-dispatch tools via
+// buildSubagentDispatchTools), so len(ListTools(...)) always equals
+// AgentCapabilities.ToolCount for the same agentName — a ctrl+t browser
+// that listed fewer tools than the sidebar's own "Tools: N" would be
+// actively confusing, telling a user something is available that the
+// browser then can't show them.
+func (s *AgentService) ListTools(ctx context.Context, agentName string) ([]ToolSummary, error) {
+	def, ok := s.defs.Agents[agentName]
+	if !ok {
+		return nil, fmt.Errorf("agent service: unknown agent %q", agentName)
+	}
+
+	available, err := s.coreTools()
+	if err != nil {
+		return nil, err
+	}
+	for name, t := range s.mcpTools {
+		available[name] = t
+	}
+
+	names, err := s.resolveToolNames(def, available)
+	if err != nil {
+		return nil, err
+	}
+
+	mcpSet := make(map[string]bool, len(s.mcpToolNames))
+	for _, name := range s.mcpToolNames {
+		mcpSet[name] = true
+	}
+
+	result := make([]ToolSummary, 0, len(names)+len(s.defs.Agents))
+	for _, name := range names {
+		source := "Built-in"
+		if mcpSet[name] {
+			source = "MCP"
+		}
+		result = append(result, ToolSummary{Name: name, Description: available[name].Description(), Source: source})
+	}
+	for _, t := range s.buildSubagentDispatchTools(ctx, def) {
+		result = append(result, ToolSummary{Name: t.Name(), Description: t.Description(), Source: "Subagent"})
+	}
+	sort.Slice(result, func(i, j int) bool { return result[i].Name < result[j].Name })
+	return result, nil
+}
+
 // SkillSummary is one entry in ListSkills' result: a loaded skill's
 // Name/Description (level 1 of Design §3.11/FR19's progressive disclosure —
 // the same two fields skillsCatalog renders into the system prompt), used by
@@ -1359,30 +1516,50 @@ func (s *AgentService) buildTools(def agentsource.AgentDefinition) ([]tool.Tool,
 		available[name] = t
 	}
 
-	if len(def.Tools) == 0 {
-		result := make([]tool.Tool, 0, len(coreToolNames)+len(s.mcpToolNames))
-		for _, name := range coreToolNames {
-			if t, ok := available[name]; ok {
-				result = append(result, t)
-			}
-		}
-		for _, name := range s.mcpToolNames {
-			if t, ok := available[name]; ok {
-				result = append(result, t)
-			}
-		}
-		return result, nil
+	names, err := s.resolveToolNames(def, available)
+	if err != nil {
+		return nil, err
 	}
-
-	result := make([]tool.Tool, 0, len(def.Tools))
-	for _, name := range def.Tools {
-		t, ok := available[name]
-		if !ok {
-			return nil, fmt.Errorf("agent service: agent %q references unknown or unavailable tool %q", def.Name, name)
-		}
-		result = append(result, t)
+	result := make([]tool.Tool, 0, len(names))
+	for _, name := range names {
+		result = append(result, available[name])
 	}
 	return result, nil
+}
+
+// resolveToolNames returns def's ordered tool name keys into available (a
+// coreTools()-plus-s.mcpTools map, built identically by both of this
+// method's callers, buildTools and ListTools) — every core tool name
+// (coreToolNames order) actually present in available, then every MCP
+// tool name (s.mcpToolNames order), when def.Tools is empty ("tools"
+// frontmatter omitted means inherit everything); or exactly def.Tools
+// itself otherwise, erroring on the first name that isn't in available.
+// Split out of buildTools (post-v0.1.0 addendum, ListTools/ctrl+t tools
+// browser) so both it and ListTools resolve the identical name set from
+// one place rather than two copies silently drifting apart — buildTools
+// then resolves each name to its actual tool.Tool, and ListTools keeps the
+// name itself (the config-facing key a "tools:" allowlist entry and
+// Design's own docs use, e.g. "Bash" — not every core tool's
+// provider-facing tool.Tool.Name(), e.g. "run_shell" for Bash's underlying
+// shelltool.Local, which a user browsing ctrl+t wouldn't recognize).
+func (s *AgentService) resolveToolNames(def agentsource.AgentDefinition, available map[string]tool.Tool) ([]string, error) {
+	if len(def.Tools) == 0 {
+		names := make([]string, 0, len(coreToolNames)+len(s.mcpToolNames))
+		for _, name := range coreToolNames {
+			if _, ok := available[name]; ok {
+				names = append(names, name)
+			}
+		}
+		names = append(names, s.mcpToolNames...)
+		return names, nil
+	}
+
+	for _, name := range def.Tools {
+		if _, ok := available[name]; !ok {
+			return nil, fmt.Errorf("agent service: agent %q references unknown or unavailable tool %q", def.Name, name)
+		}
+	}
+	return def.Tools, nil
 }
 
 // coreTools constructs one instance of each configured built-in tool

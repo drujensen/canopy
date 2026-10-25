@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"runtime"
+	"sort"
 	"strings"
 	"time"
 
@@ -24,6 +25,7 @@ import (
 	"github.com/microsoft/agent-framework-go/agent/harness/todo"
 	"github.com/microsoft/agent-framework-go/message"
 
+	"github.com/drujensen/canopy/internal/domain/entities"
 	"github.com/drujensen/canopy/internal/domain/services"
 	"github.com/drujensen/canopy/internal/impl/providers"
 	"github.com/drujensen/canopy/internal/impl/tools"
@@ -43,6 +45,11 @@ const (
 	// an entry never calls an AgentService mutator; it shows the skill's real
 	// Body in the transcript instead (see chatModel.showSkill).
 	pickerSkill
+	// pickerTool identifies the ctrl+t read-only tools browser: like
+	// pickerSkill, selecting an entry never calls an AgentService mutator —
+	// it shows the tool's full name/description/source in the transcript
+	// instead (see chatModel.showTool).
+	pickerTool
 	// pickerHistory identifies the ctrl+h chat-history browser (post-v0.1.0
 	// addendum, Design §5's addendum) — unlike every other picker here,
 	// selecting an entry doesn't mutate *this* chat at all; it resumes a
@@ -222,6 +229,28 @@ type chatModel struct {
 	// (RunResult.Model, via handleStreamMsg's streamDoneMsg case) and
 	// immediately after a ctrl+o switch (modelChangedMsg, see model.go).
 	model string
+
+	// toolCount/skillCount summarize what's available to this chat's
+	// current agent (post-v0.1.0 addendum: sidebar "N tools, M skills"
+	// line) — see services.AgentCapabilities. Set from chatStartedMsg when
+	// the chat starts or resumes, and refreshed from agentChangedMsg on
+	// every ctrl+a agent switch (Model.Update, model.go), since switching
+	// agents can change both counts.
+	toolCount  int
+	skillCount int
+
+	// usage is this chat's persisted entities.Chat.Usage (post-v0.1.0
+	// addendum: sidebar usage/cost display), keyed by ModelConfig.Name
+	// since a chat's lifetime usage can span more than one model — a
+	// ctrl+o switch, or a subagent dispatch that resolved to a different
+	// model (see services.usageTrackingSubagentTool). Seeded from
+	// chatStartedMsg (nil for a genuinely new chat, chat.Usage for a
+	// resumed one) and refreshed after every completed turn
+	// (RunResult.Usage, via handleStreamMsg's streamDoneMsg case) — never
+	// updated locally/incrementally, since AgentService is the only thing
+	// that knows the real per-model cost rates and persists the
+	// authoritative total.
+	usage map[string]entities.ModelUsage
 
 	// picker, when non-nil, is the in-chat overlay currently shown — the
 	// ctrl+a agent-switch, ctrl+o model-switch, or ctrl+s skills-browser
@@ -562,6 +591,24 @@ func (c *chatModel) handleKey(msg tea.KeyMsg, svc *services.AgentService, ctx co
 		}
 		c.openSkillPicker(svc)
 		return nil
+	case "ctrl+t":
+		// Same guard as ctrl+a/ctrl+o/ctrl+s: don't open the tools browser
+		// mid-turn.
+		if c.streamActive {
+			return nil
+		}
+		c.openToolPicker(svc, ctx)
+		return nil
+	case "ctrl+u":
+		// Same guard as ctrl+a/ctrl+o/ctrl+s/ctrl+t: don't fold the usage
+		// detail into the transcript mid-turn — c.usage itself is still
+		// updating while streamActive, so the snapshot would be stale the
+		// instant it's shown.
+		if c.streamActive {
+			return nil
+		}
+		c.showUsage()
+		return nil
 	case "ctrl+h":
 		// Same guard as the other overlays, post-v0.1.0 addendum. Unlike
 		// them, this can't populate c.picker synchronously (loadHistoryCmd's
@@ -669,6 +716,48 @@ func (c *chatModel) openSkillPicker(svc *services.AgentService) {
 	c.pickerKind = pickerSkill
 }
 
+// openToolPicker builds and shows the read-only ctrl+t tools-browser
+// overlay, sourced from AgentService.ListTools(ctx, c.agentName) — lists
+// exactly what's available to the current agent and counted in the
+// sidebar's own "Tools: N" (ListTools' own doc comment on why those two
+// numbers must always agree): built-in tools, any connected MCP server's
+// tools, and one subagent-dispatch tool per other loaded agent. Unlike
+// openSkillPicker's pure in-memory ListSkills call, this constructs a
+// provider client per other loaded agent (buildSubagentDispatchTools, the
+// same construction AgentCapabilities does for the sidebar count) — real
+// work, but no actual network I/O (providers.New's own doc comment), so
+// it still runs synchronously inside handleKey using the ctx already
+// threaded through it, rather than round-tripping through a tea.Cmd.
+//
+// An unknown agent name (ListTools' error case) shouldn't be reachable in
+// practice — c.agentName always names a loaded agent — but is handled the
+// same defensive way openSkillPicker handles "no skills configured": a
+// system-style transcript entry, no overlay.
+func (c *chatModel) openToolPicker(svc *services.AgentService, ctx context.Context) {
+	tools, err := svc.ListTools(ctx, c.agentName)
+	if err != nil {
+		c.transcript = append(c.transcript, transcriptEntry{system: true, text: fmt.Sprintf("error: %v", err)})
+		c.refreshViewport()
+		return
+	}
+	if len(tools) == 0 {
+		c.transcript = append(c.transcript, transcriptEntry{system: true, text: "No tools configured."})
+		c.refreshViewport()
+		return
+	}
+
+	items := make([]list.Item, 0, len(tools))
+	for _, t := range tools {
+		items = append(items, toolPickerItem{name: t.Name, description: t.Description, source: t.Source})
+	}
+	l := list.New(items, list.NewDefaultDelegate(), c.mainWidth(), c.height-4)
+	l.Title = "Tools"
+	l.SetShowStatusBar(false)
+	l.SetFilteringEnabled(true)
+	c.picker = &l
+	c.pickerKind = pickerTool
+}
+
 // handlePickerKey routes a key press to whichever in-chat overlay picker is
 // currently open (see openPicker/openSkillPicker): "enter" selects the
 // highlighted item — dispatching to SetAgent/SetModel for the ctrl+a/ctrl+o
@@ -691,6 +780,16 @@ func (c *chatModel) handlePickerKey(msg tea.KeyMsg, svc *services.AgentService, 
 					return nil
 				}
 				c.showSkill(svc, item.name)
+				return nil
+			}
+			if kind == pickerTool {
+				item, ok := c.picker.SelectedItem().(toolPickerItem)
+				c.picker = nil
+				c.pickerKind = pickerNone
+				if !ok {
+					return nil
+				}
+				c.showTool(item.name, item.description, item.source)
 				return nil
 			}
 			if kind == pickerModel {
@@ -769,6 +868,32 @@ func (c *chatModel) showSkill(svc *services.AgentService, skillName string) {
 	c.refreshViewport()
 }
 
+// showTool folds one selected ctrl+t tools-browser entry's full
+// name/source/description into the transcript as a system-style
+// informational entry — the picker list's own row can truncate a longer
+// tool description (the built-in Bash tool's, for one, runs several
+// sentences), so "enter" surfaces it in full the same way showSkill does
+// for a skill's body.
+func (c *chatModel) showTool(name, description, source string) {
+	text := fmt.Sprintf("Tool: %s (%s)", name, source)
+	if description != "" {
+		text += "\n\n" + description
+	}
+	c.transcript = append(c.transcript, transcriptEntry{system: true, text: text})
+	c.refreshViewport()
+}
+
+// showUsage folds the full per-model usage/cost breakdown (renderUsageLines)
+// into the transcript as a system-style informational entry (ctrl+u) — the
+// sidebar itself only shows usageCostLine's compact running total, since
+// the full breakdown can wrap/overflow the sidebar's narrow width once more
+// than one model has contributed.
+func (c *chatModel) showUsage() {
+	text := "Usage:\n" + strings.Join(renderUsageLines(c.usage), "\n")
+	c.transcript = append(c.transcript, transcriptEntry{system: true, text: text})
+	c.refreshViewport()
+}
+
 // setModelCmd calls AgentService.SetModel for chosen (a ModelConfig.Name
 // from the ctrl+o picker's list, post-v0.1.0 addendum) and returns a
 // modelChangedMsg Model.Update applies to refresh the sidebar.
@@ -795,7 +920,11 @@ func (c *chatModel) setAgentCmd(svc *services.AgentService, ctx context.Context,
 		if err := svc.SetAgent(ctx, chatID, chosen); err != nil {
 			return streamErrMsg{err: fmt.Errorf("switching agent: %w", err)}
 		}
-		return agentChangedMsg{agentName: chosen}
+		capabilities, err := svc.AgentCapabilities(ctx, chosen)
+		if err != nil {
+			return streamErrMsg{err: fmt.Errorf("loading agent capabilities: %w", err)}
+		}
+		return agentChangedMsg{agentName: chosen, capabilities: capabilities}
 	}
 }
 
@@ -846,7 +975,11 @@ func (c *chatModel) startNewChatCmd(svc *services.AgentService, ctx context.Cont
 		if err != nil {
 			return chatStartedMsg{err: fmt.Errorf("loading model: %w", err)}
 		}
-		return chatStartedMsg{chatID: chatID, agentName: agentName, todos: todos, model: model}
+		capabilities, err := svc.AgentCapabilities(ctx, agentName)
+		if err != nil {
+			return chatStartedMsg{err: fmt.Errorf("loading agent capabilities: %w", err)}
+		}
+		return chatStartedMsg{chatID: chatID, agentName: agentName, todos: todos, model: model, capabilities: capabilities}
 	}
 }
 
@@ -1243,6 +1376,7 @@ func (c *chatModel) handleStreamMsg(msg tea.Msg, svc *services.AgentService, ctx
 		if msg.result != nil {
 			c.todos = msg.result.Todos
 			c.model = msg.result.Model
+			c.usage = msg.result.Usage
 		}
 		c.refreshViewport()
 		return nil
@@ -1867,17 +2001,27 @@ func (c *chatModel) View(width, height int) string {
 }
 
 // renderSidebar renders the agent/model indicators (post-v0.1.0 §3.4/§4
-// addendum) and the live todo panel (Design §3.7).
+// addendum), what's available to the current agent (ToolCount/SkillCount,
+// post-v0.1.0 addendum: services.AgentCapabilities), this chat's running
+// cost as a single compact line (post-v0.1.0 addendum: entities.Chat.Usage
+// — see usageCostLine's own doc comment on why the sidebar shows only the
+// total, not renderUsageLines' full per-model breakdown, which belongs to
+// ctrl+u/showUsage instead), and the live todo panel (Design §3.7) last.
 func (c *chatModel) renderSidebar() string {
 	var b strings.Builder
 	b.WriteString(modeStyle.Render("Agent: " + c.agentName))
-	b.WriteString("\n(ctrl+a to switch)\n")
+	b.WriteString("\n[ctrl+a]\n")
 	b.WriteString(modeStyle.Render("Model: " + c.model))
-	b.WriteString("\n(ctrl+o to switch)\n")
-	b.WriteString("(ctrl+s to view skills)\n")
-	b.WriteString("(ctrl+h for history)\n")
-	b.WriteString("(ctrl+n for new chat)\n")
-	b.WriteString("(ctrl+b to hide this)\n")
+	b.WriteString("\n[ctrl+o]\n")
+	b.WriteString(modeStyle.Render(fmt.Sprintf("Tools: %d", c.toolCount)))
+	b.WriteString("\n[ctrl+t]\n")
+	b.WriteString(modeStyle.Render(fmt.Sprintf("Skills: %d", c.skillCount)))
+	b.WriteString("\n[ctrl+s]\n")
+	b.WriteString(modeStyle.Render("Cost: " + usageCostLine(c.usage)))
+	b.WriteString("\n[ctrl+u]\n")
+	b.WriteString("History  [ctrl+h]\n")
+	b.WriteString("New chat [ctrl+n]\n")
+	b.WriteString("Hide     [ctrl+b]\n")
 	b.WriteString("Todos:\n")
 	if len(c.todos) == 0 {
 		b.WriteString("  (none yet)\n")
@@ -1892,6 +2036,80 @@ func (c *chatModel) renderSidebar() string {
 		fmt.Fprintf(&b, "  %s %s\n", mark, title)
 	}
 	return sidebarStyle.Width(sidebarWidth - 2).Height(c.sidebarHeight()).Render(b.String())
+}
+
+// usageCostLine renders the sidebar's compact "Cost: ..." value: just the
+// running total cost summed across every model that's contributed so far
+// (post-v0.1.0 addendum). The sidebar shows only this one line rather than
+// renderUsageLines' full per-model breakdown — that breakdown is two lines
+// per model plus a "total" pair, which can overflow/wrap the sidebar's
+// narrow fixed width once more than one model has contributed (e.g. a
+// ctrl+o model switch mid-chat, or a subagent dispatch that resolved to a
+// different model than the parent) — the full breakdown is still
+// available on demand via ctrl+u (showUsage). Returns "(none yet)" for a
+// genuinely new chat with no usage recorded at all, matching Todos' own
+// empty-state wording.
+//
+// Always a dollar amount, even "$0.0000" for a chat run entirely against a
+// free/self-hosted model with no published per-million-token rate (see
+// mergeUsage's own doc comment: real tokens still accumulate, cost just
+// can't be computed) — by design, per explicit user feedback: this line is
+// a cost readout, not a token counter, so it stays in money even when that
+// money is genuinely zero.
+func usageCostLine(usage map[string]entities.ModelUsage) string {
+	if len(usage) == 0 {
+		return "(none yet)"
+	}
+	var totalCost float64
+	for _, mu := range usage {
+		totalCost += mu.CostUSD
+	}
+	return fmt.Sprintf("$%.4f", totalCost)
+}
+
+// renderUsageLines formats usage (c.usage — this chat's persisted
+// entities.Chat.Usage) as ctrl+u's full-detail "Usage:" lines (showUsage) —
+// the sidebar itself only shows usageCostLine's compact running total, see
+// that function's own doc comment for why. One line per model that has
+// actually recorded nonzero tokens, sorted by name for
+// deterministic output, plus a combined "total" line when more than one
+// model contributed — a chat's lifetime usage can span a ctrl+o model
+// switch or a subagent dispatch that resolved to a different model (see
+// services.usageTrackingSubagentTool's own doc comment on why that
+// doesn't get silently merged into one number no matter which model
+// actually ran). An empty/nil map (a genuinely new chat, or one that's
+// never reported any tokens) renders a single "(none yet)" line rather
+// than an empty section.
+func renderUsageLines(usage map[string]entities.ModelUsage) []string {
+	if len(usage) == 0 {
+		return []string{"  (none yet)"}
+	}
+	names := make([]string, 0, len(usage))
+	for name := range usage {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+
+	// Model name and its numbers render as two lines, not one — a model
+	// name alone (e.g. a real Groq model slug like
+	// "groq/qwen/qwen3.8-27b") can already approach the sidebar's usable
+	// width (sidebarWidth - 2), so keeping the token/cost numbers on their
+	// own line keeps them from wrapping mid-number the way jamming
+	// everything onto one line would.
+	lines := make([]string, 0, (len(names)+1)*2)
+	var totalIn, totalOut int64
+	var totalCost float64
+	for _, name := range names {
+		mu := usage[name]
+		totalIn += mu.InputTokens
+		totalOut += mu.OutputTokens
+		totalCost += mu.CostUSD
+		lines = append(lines, "  "+name, fmt.Sprintf("    %d in / %d out, $%.4f", mu.InputTokens, mu.OutputTokens, mu.CostUSD))
+	}
+	if len(names) > 1 {
+		lines = append(lines, "  total", fmt.Sprintf("    %d in / %d out, $%.4f", totalIn, totalOut, totalCost))
+	}
+	return lines
 }
 
 // sidebarHeight matches the sidebar's rendered height to the main column's
