@@ -87,7 +87,7 @@ func New(ctx context.Context, cfg entities.ProviderConfig, model entities.ModelC
 // OpenAI-compatible adapter below). cfg.BaseURL is honored when set (e.g.
 // pointing at Azure OpenAI or a test server) but is not required.
 func newOpenAINative(cfg entities.ProviderConfig, model entities.ModelConfig, agentCfg agent.Config) *agent.Agent {
-	opts := []openaioption.RequestOption{openaioption.WithAPIKey(cfg.APIKey), openaiRetryOption()}
+	opts := []openaioption.RequestOption{openaioption.WithAPIKey(cfg.APIKey), openaiRetryOption(), openaiRetryableStatusOption()}
 	if cfg.BaseURL != "" {
 		opts = append(opts, openaioption.WithBaseURL(cfg.BaseURL))
 	}

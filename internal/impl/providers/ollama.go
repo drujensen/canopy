@@ -58,6 +58,7 @@ func newOllama(cfg entities.ProviderConfig, model entities.ModelConfig, agentCfg
 		option.WithAPIKey(cfg.APIKey),
 		option.WithHTTPClient(httpClient),
 		openaiRetryOption(),
+		openaiRetryableStatusOption(),
 	}
 	opts = append(opts, openaiTimeoutOptions(cfg)...)
 	client := openai.NewClient(opts...)
