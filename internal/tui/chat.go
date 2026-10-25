@@ -1773,8 +1773,6 @@ func (c *chatModel) renderSidebar() string {
 	b.WriteString("(ctrl+h for history)\n")
 	b.WriteString("(ctrl+n for new chat)\n")
 	b.WriteString("(ctrl+b to hide this)\n")
-	b.WriteString("(scroll: pgup/pgdn)\n")
-	b.WriteString("(or ctrl+up/down)\n\n")
 	b.WriteString("Todos:\n")
 	if len(c.todos) == 0 {
 		b.WriteString("  (none yet)\n")
