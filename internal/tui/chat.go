@@ -240,9 +240,9 @@ type chatModel struct {
 	// selCurrent is the drag's current (or final, once released) point.
 	// hasSel is true once a drag has actually moved to a second point (a
 	// plain click with no drag never becomes a selection to render or
-	// copy) and stays true after release so the highlight persists until a
-	// new press clears it, the same "stays highlighted until you click
-	// elsewhere" convention every text editor uses.
+	// copy) — copySelectionCmd clears it again as soon as the copy
+	// completes, so the highlight doesn't linger once the text is already
+	// on the clipboard.
 	selecting             bool
 	selAnchor, selCurrent selPoint
 	hasSel                bool
@@ -1164,6 +1164,12 @@ func (c *chatModel) copySelectionCmd() tea.Cmd {
 		label = "lines"
 	}
 	c.copyToast = fmt.Sprintf("Copied %d %s", lines, label)
+	// Clears the highlight the moment the copy completes, rather than
+	// leaving it until the next press — the toast itself is already this
+	// action's "yes, that happened" acknowledgment, so a lingering
+	// highlight on top of it just reads as stale state once the text is
+	// already on the clipboard.
+	c.hasSel = false
 	// Not refreshViewport: that also calls GotoBottom, which would yank
 	// the scroll position out from under a selection the user just made
 	// by deliberately scrolling to a spot that likely isn't the bottom.

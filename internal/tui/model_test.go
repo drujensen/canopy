@@ -1479,6 +1479,7 @@ func TestChatModel_MouseDrag_SelectsAndCopiesText(t *testing.T) {
 	assert.Equal(t, "line 2", copied)
 	assert.Equal(t, "Copied 1 line", c.copyToast)
 	assert.False(t, c.selecting)
+	assert.False(t, c.hasSel, "the highlight must clear as soon as the copy completes, not linger until the next press")
 }
 
 // TestChatModel_MouseClick_NoDrag_DoesNotCopy covers the "plain click"
