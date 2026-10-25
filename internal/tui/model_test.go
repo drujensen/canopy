@@ -1537,3 +1537,101 @@ func TestChatModel_MouseWheel_NotRoutedToSelection(t *testing.T) {
 	assert.Nil(t, cmd)
 	assert.False(t, c.selecting, "a non-left button must never start a selection")
 }
+
+// TestChatModel_EdgeDirection covers edgeDirection's pure boundary logic
+// in isolation (post-v0.1.0 addendum: Feature 2's edge-triggered
+// auto-scroll) — the top/bottom rows themselves are the trigger, not some
+// inset deadzone band.
+func TestChatModel_EdgeDirection(t *testing.T) {
+	c := newChatModel("chat-1", "assistant", nil, "m1", 40, 10)
+	c.viewport.Height = 10
+
+	assert.Equal(t, -1, c.edgeDirection(0), "the top row itself must trigger upward auto-scroll")
+	assert.Equal(t, -1, c.edgeDirection(-3), "above the viewport entirely must still trigger upward auto-scroll")
+	assert.Equal(t, 0, c.edgeDirection(5), "the middle of the viewport must never auto-scroll")
+	assert.Equal(t, 1, c.edgeDirection(9), "the bottom row itself must trigger downward auto-scroll")
+	assert.Equal(t, 1, c.edgeDirection(20), "below the viewport entirely must still trigger downward auto-scroll")
+}
+
+// TestChatModel_MouseDrag_BottomEdge_AutoScrollsAndExtendsSelection is this
+// package's coverage for Feature 2: holding a selection drag at the
+// viewport's bottom row must scroll the transcript downward and keep
+// extending the selection to the newly revealed line — repeatedly, via
+// handleAutoScrollTick's self-rescheduling chain, since a mouse stationary
+// at the edge generates no further MouseActionMotion events on its own.
+func TestChatModel_MouseDrag_BottomEdge_AutoScrollsAndExtendsSelection(t *testing.T) {
+	c := newChatModel("chat-1", "assistant", nil, "m1", 40, 10)
+	c.sidebarHidden = true
+	for i := 0; i < 30; i++ {
+		c.transcript = append(c.transcript, transcriptEntry{role: message.RoleUser, text: fmt.Sprintf("line %d", i)})
+	}
+	c.refreshViewport()
+	c.View(40, 10)
+	c.viewport.GotoTop()
+	startOffset := c.viewport.YOffset
+
+	cmd := c.handleMouse(tea.MouseMsg{Action: tea.MouseActionPress, Button: tea.MouseButtonLeft, X: 0, Y: 1})
+	require.Nil(t, cmd)
+	require.True(t, c.selecting)
+
+	// Y: c.viewport.Height-1 is the bottom row itself — edgeDirection's own
+	// trigger condition, not a coordinate beyond the viewport.
+	cmd = c.handleMouse(tea.MouseMsg{Action: tea.MouseActionMotion, X: 0, Y: c.viewport.Height - 1})
+	require.NotNil(t, cmd, "reaching the bottom edge must start the auto-scroll tick chain")
+	assert.Equal(t, 1, c.autoScrollDir)
+	assert.True(t, c.autoScrollActive)
+	assert.Greater(t, c.viewport.YOffset, startOffset, "the first edge motion must scroll immediately, not wait for a tick")
+	assert.True(t, c.hasSel)
+
+	offsetAfterFirstStep := c.viewport.YOffset
+	lineAfterFirstStep := c.selCurrent.line
+
+	// Simulate the tick chain firing a few times without actually waiting
+	// on the real tea.Tick delay (model_test.go's established convention:
+	// call the handler directly instead of running the returned tea.Cmd).
+	for i := 0; i < 3; i++ {
+		cmd = c.handleAutoScrollTick()
+		require.NotNil(t, cmd, "the chain must keep rescheduling itself while autoScrollDir is still set")
+	}
+	assert.Greater(t, c.viewport.YOffset, offsetAfterFirstStep, "repeated ticks must keep scrolling downward")
+	assert.Greater(t, c.selCurrent.line, lineAfterFirstStep, "repeated ticks must keep extending the selection")
+
+	// Moving back into the viewport's middle must stop the scrolling
+	// immediately (autoScrollDir reset), even though autoScrollActive
+	// doesn't clear until the chain's next tick notices.
+	cmd = c.handleMouse(tea.MouseMsg{Action: tea.MouseActionMotion, X: 0, Y: 5})
+	assert.Nil(t, cmd)
+	assert.Equal(t, 0, c.autoScrollDir)
+
+	offsetAfterStop := c.viewport.YOffset
+	cmd = c.handleAutoScrollTick()
+	assert.Nil(t, cmd, "the chain must not reschedule itself once autoScrollDir is back to 0")
+	assert.False(t, c.autoScrollActive)
+	assert.Equal(t, offsetAfterStop, c.viewport.YOffset, "a tick after stopping must not scroll any further")
+}
+
+// TestChatModel_MouseRelease_StopsAutoScroll covers the other way an
+// auto-scrolling drag ends: releasing the mouse button, not just moving
+// back into the viewport's middle.
+func TestChatModel_MouseRelease_StopsAutoScroll(t *testing.T) {
+	c := newChatModel("chat-1", "assistant", nil, "m1", 40, 10)
+	c.sidebarHidden = true
+	for i := 0; i < 30; i++ {
+		c.transcript = append(c.transcript, transcriptEntry{role: message.RoleUser, text: fmt.Sprintf("line %d", i)})
+	}
+	c.refreshViewport()
+	c.View(40, 10)
+	c.viewport.GotoTop()
+
+	c.handleMouse(tea.MouseMsg{Action: tea.MouseActionPress, Button: tea.MouseButtonLeft, X: 0, Y: 1})
+	c.handleMouse(tea.MouseMsg{Action: tea.MouseActionMotion, X: 0, Y: c.viewport.Height - 1})
+	require.Equal(t, 1, c.autoScrollDir)
+
+	cmd := c.handleMouse(tea.MouseMsg{Action: tea.MouseActionRelease})
+	require.NotNil(t, cmd, "releasing a real drag must still return the copy command")
+	assert.Equal(t, 0, c.autoScrollDir, "release must stop auto-scroll immediately, not wait for the next tick")
+
+	cmd = c.handleAutoScrollTick()
+	assert.Nil(t, cmd)
+	assert.False(t, c.autoScrollActive)
+}

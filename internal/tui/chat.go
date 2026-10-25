@@ -117,6 +117,20 @@ type selPoint struct {
 // "acknowledge, then fade" convention Claude Code's own copy callout uses.
 type clearCopyToastMsg struct{}
 
+// autoScrollTickMsg drives chatModel.handleAutoScrollTick's
+// self-rescheduling chain (post-v0.1.0 addendum: edge-triggered
+// auto-scroll during a selection drag, Feature 2) — see
+// chatModel.autoScrollDir's own doc comment for why the chain has to keep
+// ticking under its own power rather than waiting for more mouse events.
+type autoScrollTickMsg struct{}
+
+// autoScrollInterval is how often a drag held at the viewport's top/
+// bottom edge scrolls one more line while extending the selection to
+// match — fast enough to feel responsive, slow enough that a short hold
+// at the edge doesn't blow past the spot the user actually meant to stop
+// at.
+const autoScrollInterval = 60 * time.Millisecond
+
 // chatModel is the chat screen (Design §5): a scrolling transcript fed by
 // AgentService's streaming entry points, a composer, and a sidebar showing
 // the live todo panel (Design §3.7).
@@ -232,6 +246,24 @@ type chatModel struct {
 	selecting             bool
 	selAnchor, selCurrent selPoint
 	hasSel                bool
+
+	// autoScrollDir/autoScrollActive/autoScrollX implement edge-triggered
+	// auto-scroll during a selection drag (post-v0.1.0 addendum: Feature 2,
+	// following Feature 1's mouse-driven selection) — holding a drag at
+	// the viewport's top/bottom row scrolls the transcript to reach
+	// content beyond a single screen without the drag itself ever having
+	// to leave the viewport's rows. autoScrollDir is -1/0/+1 (up/none/
+	// down); autoScrollActive is true for as long as the self-rescheduling
+	// autoScrollTickMsg chain (beginAutoScroll/handleAutoScrollTick) is
+	// still alive, which outlives any single tick — a mouse stationary at
+	// the edge generates no further MouseActionMotion events to re-trigger
+	// scrolling on its own, so the chain has to keep going under its own
+	// power until autoScrollDir goes back to 0. autoScrollX is the drag's
+	// last known column, reused by every tick's selection-extend step since
+	// a stationary mouse means no fresh X to read either.
+	autoScrollDir    int
+	autoScrollActive bool
+	autoScrollX      int
 
 	// mainColOffset is the screen column the main content pane (transcript/
 	// composer) starts at — 0 when the sidebar is hidden, otherwise the
@@ -857,12 +889,10 @@ func (c *chatModel) cancelTurn() {
 // MouseMsg here — wheel events go to c.viewport.Update instead, handling
 // scroll the way they always have.
 //
-// Edge-autoscroll — continuing to scroll and extend the selection once the
-// drag reaches the viewport's top/bottom edge — is a deliberately separate
-// follow-up, not handled here: a drag that leaves the viewport's rows
-// simply stops extending until it comes back, the same way clampToContent
-// already clamps a drag that leaves the *columns* (into the sidebar, or
-// past the right edge) rather than losing track of it entirely.
+// Motion at the viewport's very top/bottom row hands off to
+// beginAutoScroll (Feature 2) instead of extending the selection directly
+// — see autoScrollDir's own doc comment for why that needs its own
+// self-rescheduling tick chain rather than being handled inline here.
 func (c *chatModel) handleMouse(msg tea.MouseMsg) tea.Cmd {
 	switch msg.Action {
 	case tea.MouseActionPress:
@@ -875,6 +905,7 @@ func (c *chatModel) handleMouse(msg tea.MouseMsg) tea.Cmd {
 		}
 		c.selecting = true
 		c.hasSel = false
+		c.autoScrollDir = 0
 		c.selAnchor = selPoint{line: line, col: col}
 		c.selCurrent = c.selAnchor
 		c.rerenderContent()
@@ -884,6 +915,11 @@ func (c *chatModel) handleMouse(msg tea.MouseMsg) tea.Cmd {
 		if !c.selecting {
 			return nil
 		}
+		c.autoScrollX = msg.X
+		if dir := c.edgeDirection(msg.Y); dir != 0 {
+			return c.beginAutoScroll(dir)
+		}
+		c.autoScrollDir = 0
 		line, col, ok := c.hitTest(msg.X, msg.Y)
 		if !ok {
 			line, col = c.clampToContent(msg.X, msg.Y)
@@ -904,12 +940,89 @@ func (c *chatModel) handleMouse(msg tea.MouseMsg) tea.Cmd {
 			return nil
 		}
 		c.selecting = false
+		c.autoScrollDir = 0
 		if !c.hasSel {
 			return nil
 		}
 		return c.copySelectionCmd()
 	}
 	return nil
+}
+
+// edgeDirection reports which way a selection drag at viewport row y
+// should auto-scroll: -1 at or above the top row, +1 at or below the
+// bottom row, 0 anywhere in between. Deliberately the exact edge rows
+// themselves, not some inset deadzone band — reaching either boundary row
+// is itself the trigger, the same "touch the edge to keep scrolling"
+// convention most scrollable selection UIs use.
+func (c *chatModel) edgeDirection(y int) int {
+	switch {
+	case y <= 0:
+		return -1
+	case y >= c.viewport.Height-1:
+		return 1
+	default:
+		return 0
+	}
+}
+
+// beginAutoScroll starts (or redirects) the edge-triggered auto-scroll
+// chain: always updates autoScrollDir so an already-running chain picks
+// up a direction reversal on its very next tick, but only performs the
+// first scroll step and schedules the self-rescheduling tick chain
+// (handleAutoScrollTick) when one isn't already running — a second
+// chain would double the scroll speed instead of just changing direction.
+func (c *chatModel) beginAutoScroll(dir int) tea.Cmd {
+	c.autoScrollDir = dir
+	if c.autoScrollActive {
+		return nil
+	}
+	c.autoScrollActive = true
+	c.scrollSelectionStep()
+	return tea.Tick(autoScrollInterval, func(time.Time) tea.Msg { return autoScrollTickMsg{} })
+}
+
+// handleAutoScrollTick applies one tick of the auto-scroll chain
+// beginAutoScroll started: advances the scroll/selection by one more
+// line and reschedules itself, unless autoScrollDir has gone back to 0
+// (the drag moved away from the edge, or was released) — model.go routes
+// every autoScrollTickMsg here.
+func (c *chatModel) handleAutoScrollTick() tea.Cmd {
+	if c.autoScrollDir == 0 {
+		c.autoScrollActive = false
+		return nil
+	}
+	c.scrollSelectionStep()
+	return tea.Tick(autoScrollInterval, func(time.Time) tea.Msg { return autoScrollTickMsg{} })
+}
+
+// scrollSelectionStep scrolls the viewport one line in autoScrollDir's
+// direction and extends the selection to the newly revealed boundary
+// line at autoScrollX's column — called both immediately when a drag
+// first reaches the edge and repeatedly by the tick chain for as long as
+// it's held there, since a stationary mouse generates no further
+// MouseActionMotion events on its own to re-extend the selection or
+// notice the scroll actually happened.
+func (c *chatModel) scrollSelectionStep() {
+	switch c.autoScrollDir {
+	case -1:
+		c.viewport.ScrollUp(1)
+	case 1:
+		c.viewport.ScrollDown(1)
+	default:
+		return
+	}
+	edgeY := 0
+	if c.autoScrollDir > 0 {
+		edgeY = c.viewport.Height - 1
+	}
+	line, col, ok := c.hitTest(c.autoScrollX, edgeY)
+	if !ok {
+		line, col = c.clampToContent(c.autoScrollX, edgeY)
+	}
+	c.selCurrent = selPoint{line: line, col: col}
+	c.hasSel = true
+	c.rerenderContent()
 }
 
 // hitTest maps a screen coordinate to a (line, col) position in

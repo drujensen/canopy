@@ -214,6 +214,16 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, m.chat.handleMouse(msg)
 		}
 
+	case autoScrollTickMsg:
+		// Drives chatModel.handleAutoScrollTick's self-rescheduling chain
+		// (post-v0.1.0 addendum: edge-triggered auto-scroll during a
+		// selection drag, Feature 2) — see autoScrollDir's own doc comment
+		// for why the chain can't just wait for more mouse events.
+		if m.chat == nil {
+			return m, nil
+		}
+		return m, m.chat.handleAutoScrollTick()
+
 	case clearCopyToastMsg:
 		// Fades chatModel.copySelectionCmd's "Copied N lines" callout a
 		// couple of seconds after it was shown (post-v0.1.0 addendum).
