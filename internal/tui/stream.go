@@ -141,6 +141,29 @@ func loadHistoryCmd(svc *services.AgentService, ctx context.Context) tea.Cmd {
 	}
 }
 
+// chatDeletedMsg reports the outcome of deleting a chat (post-v0.1.0
+// addendum: "d" in ctrl+h's history browser) — chatID is always set, even
+// on error, so Model.Update knows which list item to remove on success or
+// which one to report as failed. Routed to whichever list the deleted
+// item came from — the top-level screenHistory screen or chatModel's
+// in-chat overlay — the same dual-dispatch historyLoadedMsg's own doc
+// comment explains for the same reason (ctrl+h is reachable from both).
+type chatDeletedMsg struct {
+	chatID string
+	err    error
+}
+
+// deleteChatCmd calls AgentService.DeleteChat asynchronously — real disk
+// I/O (removing the chat's JSON file), the same reasoning loadHistoryCmd's
+// own doc comment gives for not doing this synchronously inline in
+// handleKey/handlePickerKey.
+func deleteChatCmd(svc *services.AgentService, ctx context.Context, chatID string) tea.Cmd {
+	return func() tea.Msg {
+		err := svc.DeleteChat(ctx, chatID)
+		return chatDeletedMsg{chatID: chatID, err: err}
+	}
+}
+
 // generateTitleCmd calls AgentService.GenerateChatTitle (post-v0.1.0
 // addendum) for chatID and returns nil — fire-and-forget, on the same
 // "a nil tea.Msg is a no-op" contract waitForStreamEvent's own doc comment

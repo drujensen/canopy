@@ -121,6 +121,20 @@ type historyPickerItem struct {
 // common and would otherwise be indistinguishable in the picker.
 const historyDateFormat = "Jan 2, 2006 3:04 PM"
 
+// historyListTitle is both history list.Model's normal header (the
+// top-level screenHistory screen and chatModel's in-chat overlay both set
+// it at construction) and what confirmDelete restores it to once a "press
+// d again" prompt (historyDeleteConfirmTitle) is resolved one way or the
+// other.
+const historyListTitle = "History"
+
+// historyDeleteConfirmTitle replaces historyListTitle as confirmDelete's
+// "are you sure" prompt (post-v0.1.0 addendum: "d" to delete) — the
+// list's own header, not a transient list.Model.NewStatusMessage, since
+// both history lists are built with SetShowStatusBar(false) and a status
+// message would never actually render.
+const historyDeleteConfirmTitle = "Press d again to permanently delete this chat"
+
 // Title returns the generated title, or — the explicitly requested
 // fallback (post-v0.1.0 addendum) — a formatted date when none exists yet
 // (the chat's first turn hasn't completed) or generation failed
@@ -142,3 +156,51 @@ func (i historyPickerItem) Description() string {
 }
 
 func (i historyPickerItem) FilterValue() string { return i.title + " " + i.agentName }
+
+// removeHistoryItem removes chatID's own historyPickerItem from l, if
+// present (post-v0.1.0 addendum: "d" to delete in ctrl+h's history
+// browser) — a no-op if it isn't found, which can only happen if the item
+// was already removed by a near-simultaneous second delete or the list
+// was rebuilt out from under it while deleteChatCmd was still in flight.
+func removeHistoryItem(l *list.Model, chatID string) {
+	for i, it := range l.Items() {
+		if hp, ok := it.(historyPickerItem); ok && hp.chatID == chatID {
+			l.RemoveItem(i)
+			return
+		}
+	}
+}
+
+// confirmDelete implements ctrl+h's "press d again to confirm" flow
+// (post-v0.1.0 addendum) shared by both the top-level screenHistory
+// screen and chatModel's in-chat overlay: the first "d" on a given chatID
+// only arms it — *pending is set and l's header becomes
+// historyDeleteConfirmTitle — and returns false; a second "d" on that
+// same chatID (still armed, nothing else pressed in between) resets both
+// and returns true, telling the caller to actually delete it now.
+// Pressing "d" on a *different* item than the one currently armed starts
+// its own fresh confirmation rather than instantly deleting whatever was
+// last armed — one accidental second keypress can't skip the prompt.
+func confirmDelete(l *list.Model, pending *string, chatID string) bool {
+	if *pending == chatID {
+		*pending = ""
+		l.Title = historyListTitle
+		return true
+	}
+	*pending = chatID
+	l.Title = historyDeleteConfirmTitle
+	return false
+}
+
+// cancelPendingDelete clears an armed confirmDelete prompt, if any —
+// called for every key press on the history list other than a repeated
+// "d", so moving to a different item (or doing anything else at all)
+// silently drops the prompt instead of leaving it visible for a
+// now-unrelated keypress to confirm.
+func cancelPendingDelete(l *list.Model, pending *string) {
+	if *pending == "" {
+		return
+	}
+	*pending = ""
+	l.Title = historyListTitle
+}

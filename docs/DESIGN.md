@@ -883,6 +883,40 @@ its full prior transcript, not just started fresh.
   priority over `startAgent` in `Init` — an explicit, one-shot `--continue` is a stronger signal than
   the passive last-used-agent default.
 
+Addendum (post-v0.1.0, deleting a chat — "d" in ctrl+h): a chat's persisted history can now be
+removed from either ctrl+h entry point, not just read.
+
+- **`AgentService.DeleteChat`** is a thin wrapper over `interfaces.ChatRepository.Delete` (already
+  existed, previously unused by `AgentService`'s exported surface, same as `List` was before
+  `ListChatSummaries`). `tui.deleteChatCmd`/`chatDeletedMsg` (stream.go) call it asynchronously —
+  real disk I/O, the same reasoning `loadHistoryCmd` already gives for not doing this synchronously
+  inline in `handleKey`/`handlePickerKey`.
+- **Two-step confirmation, not immediate delete.** `picker.go`'s `confirmDelete(l, pending, chatID)`
+  is shared by both ctrl+h entry points: the first `"d"` on an item only arms it — `*pending` is set
+  to its `chatID` and `l.Title` switches to `historyDeleteConfirmTitle` — and returns `false`; a
+  second `"d"` on that *same* item, nothing else pressed in between, resets both and returns `true`,
+  telling the caller to actually call `deleteChatCmd` now. `"d"` on a *different* item restarts the
+  confirmation for the new one rather than instantly deleting whatever was last armed.
+  `cancelPendingDelete(l, pending)` drops an armed prompt on any other key (navigation, filtering,
+  `esc`) — `model.go`'s `screenHistory` case and `chat.go`'s `handlePickerKey` each route their
+  `default:` branch to it. The header, not `list.Model.NewStatusMessage`, carries the prompt: both
+  history lists are built with `SetShowStatusBar(false)`, which would make a status message never
+  actually render.
+- **Removing just the one item.** A confirmed delete doesn't trigger a full `loadHistoryCmd` reload
+  (which would also lose the list's current scroll/filter position for no benefit) — `Model.Update`'s
+  `chatDeletedMsg` case calls `removeHistoryItem(l, chatID)` (`list.Model.RemoveItem` by index,
+  found by matching `chatID`) against whichever list the delete came from, the same dual-dispatch
+  `historyLoadedMsg` already uses to decide between the top-level `screenHistory` screen and
+  `chatModel`'s in-chat overlay.
+- **The in-chat overlay excludes its own chat.** `historyLoadedMsg`'s `chatItems` filter
+  (model.go) drops whatever `chatID` the overlay was opened from before the list is even built —
+  deleting the chat you're currently typing into out from under its own session would leave the next
+  turn's `persistSession` with no record to update, so it's simplest to never offer it as a
+  candidate at all rather than add a runtime guard plus a way to surface that error while the
+  overlay (which renders only `c.picker.View()` while open, nothing else) is still showing. The
+  top-level `screenHistory` screen has no such chat to exclude — it's only reachable before one has
+  been started.
+
 Addendum (post-v0.1.0, empty-chat greeting): a brand-new (or freshly `ctrl+n`'d) chat's viewport no
 longer starts as dead space. `chatModel.refreshViewport` renders a purely cosmetic
 `defaultGreeting` ("How can I help you today?") whenever there's nothing else to show — no

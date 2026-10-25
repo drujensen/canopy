@@ -810,6 +810,20 @@ func (s *AgentService) GetChat(ctx context.Context, chatID string) (*entities.Ch
 	return chat, nil
 }
 
+// DeleteChat permanently removes chatID's persisted history (post-v0.1.0
+// addendum: "d" in ctrl+h's history browser). It returns an error if
+// chatID doesn't exist. The caller is responsible for not deleting a chat
+// that's still active (tui.chatModel's own pickerHistory handling guards
+// against that) — there's nothing at this layer that's still running a
+// turn against chatID to interrupt, so this is a plain, unconditional
+// repository delete.
+func (s *AgentService) DeleteChat(ctx context.Context, chatID string) error {
+	if err := s.repository.Delete(ctx, chatID); err != nil {
+		return fmt.Errorf("agent service: deleting chat %q: %w", chatID, err)
+	}
+	return nil
+}
+
 // titleGenerationTextLimit caps how much of each message's text is fed into
 // the title-generation prompt (buildTitlePrompt), so an unusually long
 // first exchange doesn't balloon token usage for what's meant to be a

@@ -79,6 +79,13 @@ type Model struct {
 	// rather than fatalErr's whole-screen takeover, since failing to list
 	// past sessions shouldn't block starting a new one.
 	historyErr error
+
+	// historyPendingDeleteID is screenHistory's half of confirmDelete's
+	// "press d again to confirm" state (post-v0.1.0 addendum) — empty
+	// when nothing is armed. chatModel's own pendingDeleteChatID field is
+	// the in-chat overlay's equivalent; the two are separate because the
+	// two lists (m.historyList vs. chatModel.picker) are too.
+	historyPendingDeleteID string
 }
 
 // newChatID generates a chat ID for a brand-new chat bound to agentName —
@@ -277,19 +284,65 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			items = append(items, historyPickerItem{chatID: s.ID, title: s.Title, agentName: s.AgentName, updatedAt: s.UpdatedAt})
 		}
 		if m.screen == screenChat && m.chat != nil {
-			l := list.New(items, list.NewDefaultDelegate(), m.chat.width-sidebarWidth, m.chat.height-4)
-			l.Title = "History"
+			// The in-chat overlay excludes the chat it was opened from
+			// (post-v0.1.0 addendum: "d" to delete — chat.go's
+			// handlePickerKey) — deleting the chat you're currently typing
+			// into out from under its own session would leave the next
+			// turn's persistSession with no record to update. The
+			// top-level screenHistory browser below has no such chat to
+			// exclude: it's only reachable before one has been started.
+			chatItems := make([]list.Item, 0, len(items))
+			for _, it := range items {
+				if it.(historyPickerItem).chatID == m.chat.chatID {
+					continue
+				}
+				chatItems = append(chatItems, it)
+			}
+			l := list.New(chatItems, list.NewDefaultDelegate(), m.chat.width-sidebarWidth, m.chat.height-4)
+			l.Title = historyListTitle
 			l.SetShowStatusBar(false)
 			l.SetFilteringEnabled(true)
 			m.chat.picker = &l
 			m.chat.pickerKind = pickerHistory
+			m.chat.pendingDeleteChatID = ""
 			return m, nil
 		}
 		m.historyErr = nil
+		m.historyPendingDeleteID = ""
 		cmd := m.historyList.SetItems(items)
 		m.historyList.SetSize(m.width, m.height)
 		m.screen = screenHistory
 		return m, cmd
+
+	case chatDeletedMsg:
+		// Same dual-dispatch as historyLoadedMsg above, and for the same
+		// reason: "d" (post-v0.1.0 addendum) is reachable from both the
+		// top-level screenHistory screen and chatModel's in-chat overlay.
+		// A successful delete removes just that one item from whichever
+		// list it came from — not a full loadHistoryCmd reload, which
+		// would also lose the list's current scroll/filter state for no
+		// benefit.
+		if m.chat != nil && m.chat.picker != nil && m.chat.pickerKind == pickerHistory {
+			if msg.err != nil {
+				// The overlay's own View shows only c.picker.View() while
+				// it's open (chatModel.View), so this becomes visible as
+				// soon as the user backs out of it (esc) rather than
+				// immediately — an acceptable delay for what should be a
+				// rare disk-I/O failure, and simpler than teaching the
+				// overlay to show its own error inline.
+				m.chat.statusErr = fmt.Errorf("deleting chat: %w", msg.err)
+				m.chat.refreshViewport()
+				return m, nil
+			}
+			removeHistoryItem(m.chat.picker, msg.chatID)
+			return m, nil
+		}
+		if msg.err != nil {
+			m.historyErr = msg.err
+			return m, nil
+		}
+		removeHistoryItem(&m.historyList, msg.chatID)
+		return m, nil
 
 	case modelChangedMsg:
 		if m.chat != nil {
@@ -427,9 +480,24 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 					return m, nil
 				}
 				return m, resumeChatCmd(m.svc, m.ctx, item.chatID)
+			case "d":
+				// Post-v0.1.0 addendum: permanently deletes the selected
+				// chat, but only on the second "d" in a row for the same
+				// item — see confirmDelete's own doc comment.
+				item, ok := m.historyList.SelectedItem().(historyPickerItem)
+				if !ok {
+					return m, nil
+				}
+				if confirmDelete(&m.historyList, &m.historyPendingDeleteID, item.chatID) {
+					return m, deleteChatCmd(m.svc, m.ctx, item.chatID)
+				}
+				return m, nil
 			case "esc", "q":
+				cancelPendingDelete(&m.historyList, &m.historyPendingDeleteID)
 				m.screen = screenAgentPicker
 				return m, nil
+			default:
+				cancelPendingDelete(&m.historyList, &m.historyPendingDeleteID)
 			}
 		}
 		var cmd tea.Cmd

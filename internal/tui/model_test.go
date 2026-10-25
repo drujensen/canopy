@@ -944,13 +944,12 @@ func TestChatModel_CtrlH_OpensOverlay_SelectingResumesToDifferentChat(t *testing
 	m = next.(Model)
 	require.NotNil(t, m.chat.picker)
 	require.Equal(t, pickerHistory, m.chat.pickerKind)
-	require.Len(t, m.chat.picker.Items(), 2)
+	// Just chat-a: the in-chat overlay excludes the chat it was opened
+	// from (post-v0.1.0 addendum: "d" to delete would otherwise be able
+	// to delete the chat it's showing out from under its own session —
+	// see historyLoadedMsg's doc comment), so chat-b never appears here.
+	require.Len(t, m.chat.picker.Items(), 1)
 
-	// Move to the second entry and select it — deliberately not asserting
-	// which chat ID ends up first (recency-sorted, not hardcoded here);
-	// only that resuming actually switches to a *different* chat than the
-	// one ctrl+h was opened from.
-	m.chat.handleKey(tea.KeyMsg{Type: tea.KeyDown}, svc, ctx)
 	resumeCmd := m.chat.handleKey(tea.KeyMsg{Type: tea.KeyEnter}, svc, ctx)
 	require.NotNil(t, resumeCmd)
 	resumeMsg := resumeCmd()
@@ -962,6 +961,164 @@ func TestChatModel_CtrlH_OpensOverlay_SelectingResumesToDifferentChat(t *testing
 	m2 := final.(Model)
 	require.NotNil(t, m2.chat)
 	assert.NotEqual(t, "chat-b", m2.chat.chatID, "must have switched to the other chat")
+}
+
+// TestChatModel_PickerHistoryDelete_RequiresConfirmation drives "d" in the
+// in-chat ctrl+h overlay end-to-end (post-v0.1.0 addendum): the first "d"
+// on an item only arms confirmDelete's prompt — the item must still be
+// there, and the list's header must show the confirm text — and only a
+// second "d" on that same item actually deletes it via the real
+// AgentService.DeleteChat, confirmed by feeding the resulting
+// chatDeletedMsg back through Model.Update and checking the item is gone
+// both from the list and from storage.
+func TestChatModel_PickerHistoryDelete_RequiresConfirmation(t *testing.T) {
+	svc, closeServer := newLeakTestService(t, t.TempDir(), func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(chatCompletionResponse("ok"))
+	})
+	t.Cleanup(closeServer)
+
+	ctx := context.Background()
+	_, err := svc.StartChat(ctx, "chat-current", "assistant")
+	require.NoError(t, err)
+	_, err = svc.StartChat(ctx, "chat-x", "assistant")
+	require.NoError(t, err)
+	_, err = svc.StartChat(ctx, "chat-y", "assistant")
+	require.NoError(t, err)
+
+	c := newChatModel("chat-current", "assistant", nil, "m1", 80, 24)
+	loadCmd := c.handleKey(tea.KeyMsg{Type: tea.KeyCtrlH}, svc, ctx)
+	require.NotNil(t, loadCmd)
+	loadedMsg := loadCmd()
+
+	m := Model{svc: svc, ctx: ctx, screen: screenChat, chat: c}
+	next, _ := m.Update(loadedMsg)
+	m = next.(Model)
+	require.NotNil(t, m.chat.picker)
+	require.Len(t, m.chat.picker.Items(), 2, "the current chat must be excluded, leaving chat-x and chat-y")
+
+	// Select whichever item is chat-x — recency-sorted, not assumed to
+	// land at a fixed index.
+	idx := -1
+	for i, it := range m.chat.picker.Items() {
+		if it.(historyPickerItem).chatID == "chat-x" {
+			idx = i
+		}
+	}
+	require.GreaterOrEqual(t, idx, 0)
+	m.chat.picker.Select(idx)
+
+	cmd := m.chat.handlePickerKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'d'}}, svc, ctx)
+	assert.Nil(t, cmd, "the first d must only arm the confirmation, not return a delete command")
+	assert.Len(t, m.chat.picker.Items(), 2, "arming must not delete anything yet")
+	assert.Equal(t, historyDeleteConfirmTitle, m.chat.picker.Title)
+
+	cmd = m.chat.handlePickerKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'d'}}, svc, ctx)
+	require.NotNil(t, cmd, "a second d on the same item must confirm and return the delete command")
+	assert.Equal(t, historyListTitle, m.chat.picker.Title, "confirming must restore the normal header")
+
+	deletedMsg := cmd()
+	deleted, ok := deletedMsg.(chatDeletedMsg)
+	require.True(t, ok)
+	require.NoError(t, deleted.err)
+	assert.Equal(t, "chat-x", deleted.chatID)
+
+	next2, _ := m.Update(deletedMsg)
+	m = next2.(Model)
+	require.Len(t, m.chat.picker.Items(), 1, "a confirmed delete must remove just that one item")
+	remaining := m.chat.picker.Items()[0].(historyPickerItem)
+	assert.Equal(t, "chat-y", remaining.chatID)
+
+	_, err = svc.GetChat(ctx, "chat-x")
+	assert.Error(t, err, "the chat must actually be gone from storage too, not just the list")
+}
+
+// TestModel_CtrlH_TopLevel_DeleteRequiresConfirmation is
+// TestChatModel_PickerHistoryDelete_RequiresConfirmation's counterpart for
+// the top-level screenHistory screen (reachable before any chat has been
+// started, so there's no "current chat" to exclude the way the in-chat
+// overlay does).
+func TestModel_CtrlH_TopLevel_DeleteRequiresConfirmation(t *testing.T) {
+	svc, closeServer := newLeakTestService(t, t.TempDir(), func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(chatCompletionResponse("ok"))
+	})
+	t.Cleanup(closeServer)
+
+	ctx := context.Background()
+	_, err := svc.StartChat(ctx, "chat-1", "assistant")
+	require.NoError(t, err)
+
+	m := NewModel(ctx, svc, map[string]agentsource.AgentDefinition{"assistant": {Name: "assistant"}}, "", "")
+
+	next, loadCmd := m.handleKey(tea.KeyMsg{Type: tea.KeyCtrlH})
+	m = next.(Model)
+	require.NotNil(t, loadCmd)
+	loadedMsg := loadCmd()
+	next2, _ := m.Update(loadedMsg)
+	m = next2.(Model)
+	require.Equal(t, screenHistory, m.screen)
+	require.Len(t, m.historyList.Items(), 1)
+
+	next3, cmd := m.handleKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'d'}})
+	m = next3.(Model)
+	assert.Nil(t, cmd, "the first d must only arm the confirmation")
+	assert.Len(t, m.historyList.Items(), 1)
+	assert.Equal(t, historyDeleteConfirmTitle, m.historyList.Title)
+
+	next4, cmd := m.handleKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'d'}})
+	m = next4.(Model)
+	require.NotNil(t, cmd, "a second d on the same item must confirm and return the delete command")
+
+	deletedMsg := cmd()
+	next5, _ := m.Update(deletedMsg)
+	m = next5.(Model)
+	assert.Empty(t, m.historyList.Items(), "the deleted chat must be gone from the list")
+
+	_, err = svc.GetChat(ctx, "chat-1")
+	assert.Error(t, err, "the chat must actually be gone from storage too")
+}
+
+// TestModel_CtrlH_TopLevel_MovingSelectionCancelsPendingDelete covers the
+// other half of the safety property: any key other than a repeated "d"
+// drops an armed confirmation, so navigating away and back can't leave a
+// stale prompt for an unrelated later "d" to confirm.
+func TestModel_CtrlH_TopLevel_MovingSelectionCancelsPendingDelete(t *testing.T) {
+	svc, closeServer := newLeakTestService(t, t.TempDir(), func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(chatCompletionResponse("ok"))
+	})
+	t.Cleanup(closeServer)
+
+	ctx := context.Background()
+	_, err := svc.StartChat(ctx, "chat-1", "assistant")
+	require.NoError(t, err)
+	_, err = svc.StartChat(ctx, "chat-2", "assistant")
+	require.NoError(t, err)
+
+	m := NewModel(ctx, svc, map[string]agentsource.AgentDefinition{"assistant": {Name: "assistant"}}, "", "")
+	next, loadCmd := m.handleKey(tea.KeyMsg{Type: tea.KeyCtrlH})
+	m = next.(Model)
+	loadedMsg := loadCmd()
+	next2, _ := m.Update(loadedMsg)
+	m = next2.(Model)
+	require.Len(t, m.historyList.Items(), 2)
+
+	next3, cmd := m.handleKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'d'}})
+	m = next3.(Model)
+	require.Nil(t, cmd)
+	require.Equal(t, historyDeleteConfirmTitle, m.historyList.Title)
+
+	next4, cmd := m.handleKey(tea.KeyMsg{Type: tea.KeyDown})
+	m = next4.(Model)
+	assert.Nil(t, cmd)
+	assert.Equal(t, historyListTitle, m.historyList.Title, "moving the selection must cancel the armed prompt")
+
+	// A "d" right after that must arm again, not instantly delete.
+	next5, cmd := m.handleKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'d'}})
+	m = next5.(Model)
+	assert.Nil(t, cmd)
+	assert.Len(t, m.historyList.Items(), 2, "the cancelled-then-rearmed prompt must not have deleted anything")
 }
 
 // TestModel_FirstExchangeCompletes_TriggersTitleGeneration is the direct

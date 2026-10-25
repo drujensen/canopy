@@ -81,6 +81,45 @@ func TestAgentService_GetChat_UnknownChat(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------
+// DeleteChat
+// ---------------------------------------------------------------------
+
+// TestAgentService_DeleteChat_RemovesIt is the direct coverage for "d" in
+// ctrl+h's history browser (post-v0.1.0 addendum): deleting a chat must
+// make it unreachable by every other accessor afterward, not just absent
+// from a subsequent ListChatSummaries.
+func TestAgentService_DeleteChat_RemovesIt(t *testing.T) {
+	repo, err := jsonrepo.NewChatRepository(t.TempDir())
+	require.NoError(t, err)
+	svc := NewAgentService(AgentServiceConfig{
+		Definitions: Definitions{Agents: map[string]agentsource.AgentDefinition{"assistant": {Name: "assistant"}}},
+		Repository:  repo,
+	})
+
+	ctx := context.Background()
+	_, err = svc.StartChat(ctx, "chat-1", "assistant")
+	require.NoError(t, err)
+
+	require.NoError(t, svc.DeleteChat(ctx, "chat-1"))
+
+	_, err = svc.GetChat(ctx, "chat-1")
+	assert.Error(t, err, "a deleted chat must no longer be retrievable")
+
+	summaries, err := svc.ListChatSummaries(ctx)
+	require.NoError(t, err)
+	assert.Empty(t, summaries, "a deleted chat must not appear in the history list either")
+}
+
+func TestAgentService_DeleteChat_UnknownChat(t *testing.T) {
+	repo, err := jsonrepo.NewChatRepository(t.TempDir())
+	require.NoError(t, err)
+	svc := NewAgentService(AgentServiceConfig{Repository: repo})
+
+	err = svc.DeleteChat(context.Background(), "ghost")
+	assert.Error(t, err, "deleting a chat that was never created must be an error, not a silent no-op")
+}
+
+// ---------------------------------------------------------------------
 // GenerateChatTitle
 // ---------------------------------------------------------------------
 

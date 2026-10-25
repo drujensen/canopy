@@ -222,6 +222,13 @@ type chatModel struct {
 	picker     *list.Model
 	pickerKind pickerKind
 
+	// pendingDeleteChatID is the pickerHistory overlay's half of
+	// confirmDelete's "press d again to confirm" state (post-v0.1.0
+	// addendum) — empty when nothing is armed. Model's own
+	// historyPendingDeleteID field is the top-level screenHistory screen's
+	// equivalent; kept separate because the two lists are too.
+	pendingDeleteChatID string
+
 	statusErr error
 
 	width, height int
@@ -701,10 +708,32 @@ func (c *chatModel) handlePickerKey(msg tea.KeyMsg, svc *services.AgentService, 
 				return nil
 			}
 			return c.setAgentCmd(svc, ctx, item.name)
+		case "d":
+			// Post-v0.1.0 addendum: permanently deletes the selected
+			// chat, but only on the second "d" in a row for the same
+			// item — see confirmDelete's own doc comment. Not meaningful
+			// for any picker kind but pickerHistory, so falls straight
+			// through to the generic forward below for those (same as
+			// any other key they don't special-case).
+			if c.pickerKind == pickerHistory {
+				item, ok := c.picker.SelectedItem().(historyPickerItem)
+				if !ok {
+					return nil
+				}
+				if confirmDelete(c.picker, &c.pendingDeleteChatID, item.chatID) {
+					return deleteChatCmd(svc, ctx, item.chatID)
+				}
+				return nil
+			}
 		case "esc":
 			c.picker = nil
 			c.pickerKind = pickerNone
+			c.pendingDeleteChatID = ""
 			return nil
+		default:
+			if c.pickerKind == pickerHistory {
+				cancelPendingDelete(c.picker, &c.pendingDeleteChatID)
+			}
 		}
 	}
 	var cmd tea.Cmd
