@@ -81,27 +81,34 @@ func New(ctx context.Context, cfg entities.ProviderConfig, model entities.ModelC
 	}
 }
 
-// newOpenAINative builds an OpenAI-backed agent via the Chat Completions API
-// (openaiprovider.NewChatCompletionsAgent, not the Responses API — Design
-// §4/PLAN.md Phase 2 keeps native OpenAI on the same API surface as the
-// OpenAI-compatible adapter below). cfg.BaseURL is honored when set (e.g.
-// pointing at Azure OpenAI or a test server) but is not required.
+// newOpenAINative builds an OpenAI-backed agent via the Responses API
+// (openaiprovider.NewResponsesAgent). Chat Completions is deliberately not
+// used here: OpenAI applies a default reasoning_effort to its newer models
+// and rejects that default alongside function tools on /v1/chat/completions
+// ("Function tools with reasoning_effort are not supported ... use
+// /v1/responses"), which broke every tool-using turn. The OpenAI-compatible
+// adapter keeps Chat Completions, since other vendors only implement that.
+// Output storage is disabled because Canopy owns conversation history and
+// replays it itself rather than chaining on service-side response IDs.
+// cfg.BaseURL is honored when set (e.g. pointing at Azure OpenAI or a test
+// server) but is not required.
 func newOpenAINative(cfg entities.ProviderConfig, model entities.ModelConfig, agentCfg agent.Config) *agent.Agent {
-	opts := []openaioption.RequestOption{openaioption.WithAPIKey(cfg.APIKey), openaiRetryOption(), openaiRetryableStatusOption()}
+	opts := []openaioption.RequestOption{openaioption.WithAPIKey(cfg.APIKey), openaiRetryOption(), openaiRetryableStatusOption(), openaioption.WithMiddleware(openaiResponsesHistoryMiddleware)}
 	if cfg.BaseURL != "" {
 		opts = append(opts, openaioption.WithBaseURL(cfg.BaseURL))
 	}
 	opts = append(opts, openaiTimeoutOptions(cfg)...)
 	client := openai.NewClient(opts...)
-	return openaiprovider.NewChatCompletionsAgent(client, openaiprovider.AgentConfig{
-		Config: agentCfg,
-		Model:  model.ModelName,
+	return openaiprovider.NewResponsesAgent(client, openaiprovider.AgentConfig{
+		Config:             agentCfg,
+		Model:              model.ModelName,
+		DisableStoreOutput: true,
 	})
 }
 
 // newAnthropic builds an Anthropic-backed agent via anthropicprovider.NewAgent.
 func newAnthropic(cfg entities.ProviderConfig, model entities.ModelConfig, agentCfg agent.Config) *agent.Agent {
-	opts := []anthropicoption.RequestOption{anthropicoption.WithAPIKey(cfg.APIKey), anthropicoption.WithMaxRetries(maxProviderRetries)}
+	opts := []anthropicoption.RequestOption{anthropicoption.WithAPIKey(cfg.APIKey), anthropicoption.WithMaxRetries(maxProviderRetries), anthropicoption.WithMiddleware(anthropicToolSchemaMiddleware)}
 	if cfg.BaseURL != "" {
 		opts = append(opts, anthropicoption.WithBaseURL(cfg.BaseURL))
 	}

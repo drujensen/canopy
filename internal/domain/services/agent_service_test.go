@@ -64,7 +64,7 @@ func testProviderModel(t *testing.T, responseText string) (entities.ProviderConf
 
 	provider := entities.ProviderConfig{
 		Name:    "test-provider",
-		Type:    entities.ProviderTypeOpenAI,
+		Type:    entities.ProviderType("openai-compatible"),
 		APIKey:  "sk-test",
 		BaseURL: server.URL + "/v1",
 	}

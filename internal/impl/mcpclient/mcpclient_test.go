@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"runtime"
 	"testing"
 
 	"github.com/microsoft/agent-framework-go/tool"
@@ -276,4 +277,30 @@ func resultText(t *testing.T, result any) string {
 // import the message package and type-switch by hand.
 func toString(v any) string {
 	return fmt.Sprintf("%v", v)
+}
+
+func TestUnwrapWindowsCmd(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("unwrapping is a no-op on windows")
+	}
+	tests := []struct {
+		name    string
+		command string
+		args    []string
+		wantCmd string
+		wantArg []string
+	}{
+		{"wrapped npx", "cmd", []string{"/c", "npx", "-y", "pkg"}, "npx", []string{"-y", "pkg"}},
+		{"case insensitive", "CMD", []string{"/C", "npx"}, "npx", []string{}},
+		{"not wrapped", "npx", []string{"-y", "pkg"}, "npx", []string{"-y", "pkg"}},
+		{"cmd without /c", "cmd", []string{"/k", "x"}, "cmd", []string{"/k", "x"}},
+		{"cmd with only /c", "cmd", []string{"/c"}, "cmd", []string{"/c"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			gotCmd, gotArgs := unwrapWindowsCmd(tt.command, tt.args)
+			assert.Equal(t, tt.wantCmd, gotCmd)
+			assert.Equal(t, tt.wantArg, gotArgs)
+		})
+	}
 }

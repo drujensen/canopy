@@ -45,7 +45,7 @@ func TestAgentService_RunMessages_PersistsUsageAndCost(t *testing.T) {
 	}))
 	t.Cleanup(server.Close)
 
-	provider := entities.ProviderConfig{Name: "p", Type: entities.ProviderTypeOpenAI, APIKey: "sk-test", BaseURL: server.URL + "/v1"}
+	provider := entities.ProviderConfig{Name: "p", Type: entities.ProviderType("openai-compatible"), APIKey: "sk-test", BaseURL: server.URL + "/v1"}
 	model := entities.ModelConfig{
 		Name: "m", Provider: provider.Name, ModelName: "gpt-test",
 		InputCostPerMillionTokens: 2, OutputCostPerMillionTokens: 10,
@@ -120,8 +120,8 @@ func TestAgentService_RunMessages_PersistsSubagentUsage(t *testing.T) {
 	}))
 	t.Cleanup(subServer.Close)
 
-	parentProvider := entities.ProviderConfig{Name: "parent-provider", Type: entities.ProviderTypeOpenAI, APIKey: "sk-test", BaseURL: parentServer.URL + "/v1"}
-	subProvider := entities.ProviderConfig{Name: "sub-provider", Type: entities.ProviderTypeOpenAI, APIKey: "sk-test", BaseURL: subServer.URL + "/v1"}
+	parentProvider := entities.ProviderConfig{Name: "parent-provider", Type: entities.ProviderType("openai-compatible"), APIKey: "sk-test", BaseURL: parentServer.URL + "/v1"}
+	subProvider := entities.ProviderConfig{Name: "sub-provider", Type: entities.ProviderType("openai-compatible"), APIKey: "sk-test", BaseURL: subServer.URL + "/v1"}
 	parentModel := entities.ModelConfig{Name: "parent-model", Provider: parentProvider.Name, ModelName: "gpt-parent"}
 	subModel := entities.ModelConfig{
 		Name: "sub-model", Provider: subProvider.Name, ModelName: "gpt-sub",

@@ -539,7 +539,7 @@ func newBashToolTestService(t *testing.T) (svc *services.AgentService, marker st
 	}))
 	t.Cleanup(server.Close)
 
-	provider := entities.ProviderConfig{Name: "p", Type: entities.ProviderTypeOpenAI, APIKey: "sk-test", BaseURL: server.URL + "/v1"}
+	provider := entities.ProviderConfig{Name: "p", Type: entities.ProviderType("openai-compatible"), APIKey: "sk-test", BaseURL: server.URL + "/v1"}
 	model := entities.ModelConfig{Name: "m", Provider: provider.Name, ModelName: "gpt-test"}
 
 	repo, err := jsonrepo.NewChatRepository(t.TempDir())
@@ -638,7 +638,7 @@ func TestChatModel_ResumedChat_ShowsRealUsageCost(t *testing.T) {
 	}))
 	t.Cleanup(server.Close)
 
-	provider := entities.ProviderConfig{Name: "p", Type: entities.ProviderTypeOpenAI, APIKey: "sk-test", BaseURL: server.URL + "/v1"}
+	provider := entities.ProviderConfig{Name: "p", Type: entities.ProviderType("openai-compatible"), APIKey: "sk-test", BaseURL: server.URL + "/v1"}
 	model := entities.ModelConfig{Name: "m1", Provider: "p", ModelName: "gpt-test", InputCostPerMillionTokens: 2, OutputCostPerMillionTokens: 10}
 	repo, err := jsonrepo.NewChatRepository(t.TempDir())
 	require.NoError(t, err)
@@ -1404,7 +1404,7 @@ func TestModel_FirstExchangeCompletes_TriggersTitleGeneration(t *testing.T) {
 		_ = json.NewEncoder(w).Encode(chatCompletionResponse("Arithmetic Question"))
 	}))
 	t.Cleanup(titleServer.Close)
-	provider := entities.ProviderConfig{Name: "p", Type: entities.ProviderTypeOpenAI, APIKey: "sk-test", BaseURL: titleServer.URL + "/v1"}
+	provider := entities.ProviderConfig{Name: "p", Type: entities.ProviderType("openai-compatible"), APIKey: "sk-test", BaseURL: titleServer.URL + "/v1"}
 	model := entities.ModelConfig{Name: "m1", Provider: provider.Name, ModelName: "gpt-test"}
 
 	repo, err := jsonrepo.NewChatRepository(t.TempDir())

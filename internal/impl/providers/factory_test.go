@@ -53,7 +53,7 @@ func TestNew_OpenAINative(t *testing.T) {
 		gotAuth = r.Header.Get("Authorization")
 		_ = json.NewDecoder(r.Body).Decode(&gotBody)
 		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(chatCompletionResponse("hello from openai"))
+		_ = json.NewEncoder(w).Encode(responsesAPIResponse("hello from openai"))
 	}))
 	defer server.Close()
 
@@ -74,7 +74,8 @@ func TestNew_OpenAINative(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, "hello from openai", resp.String())
 
-	assert.Contains(t, gotPath, "/chat/completions")
+	assert.Contains(t, gotPath, "/responses")
+	assert.NotContains(t, gotPath, "/chat/completions")
 	assert.Equal(t, "Bearer sk-test-key", gotAuth)
 	require.NotNil(t, gotBody)
 	assert.Equal(t, "gpt-test", gotBody["model"])
@@ -297,4 +298,23 @@ func TestNew_Gemini(t *testing.T) {
 	require.NotNil(t, a)
 	assert.Equal(t, "gemini", a.ProviderName())
 	assert.Equal(t, "test-agent", a.Name())
+}
+
+func responsesAPIResponse(text string) map[string]any {
+	return map[string]any{
+		"id":     "resp_test",
+		"object": "response",
+		"status": "completed",
+		"output": []any{map[string]any{
+			"type":   "message",
+			"id":     "msg_test",
+			"role":   "assistant",
+			"status": "completed",
+			"content": []any{map[string]any{
+				"type":        "output_text",
+				"text":        text,
+				"annotations": []any{},
+			}},
+		}},
+	}
 }

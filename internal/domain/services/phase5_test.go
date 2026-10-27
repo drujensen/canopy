@@ -72,7 +72,7 @@ func TestAgentService_Todos_PersistAcrossRestart(t *testing.T) {
 	}))
 	t.Cleanup(server.Close)
 
-	provider := entities.ProviderConfig{Name: "p", Type: entities.ProviderTypeOpenAI, APIKey: "sk-test", BaseURL: server.URL + "/v1"}
+	provider := entities.ProviderConfig{Name: "p", Type: entities.ProviderType("openai-compatible"), APIKey: "sk-test", BaseURL: server.URL + "/v1"}
 	model := entities.ModelConfig{Name: "m", Provider: provider.Name, ModelName: "gpt-test"}
 
 	repo, err := jsonrepo.NewChatRepository(t.TempDir())
@@ -358,7 +358,7 @@ func TestAgentService_ModelOverride_RoutesProviderDispatch(t *testing.T) {
 	}))
 	t.Cleanup(geminiServer.Close)
 
-	openaiProvider := entities.ProviderConfig{Name: "p-openai", Type: entities.ProviderTypeOpenAI, APIKey: "sk-test", BaseURL: openaiServer.URL + "/v1"}
+	openaiProvider := entities.ProviderConfig{Name: "p-openai", Type: entities.ProviderType("openai-compatible"), APIKey: "sk-test", BaseURL: openaiServer.URL + "/v1"}
 	geminiProvider := entities.ProviderConfig{Name: "p-gemini", Type: entities.ProviderTypeGemini, APIKey: "test-key", BaseURL: geminiServer.URL}
 	openaiModel := entities.ModelConfig{Name: "m-openai", Provider: openaiProvider.Name, ModelName: "gpt-test"}
 	geminiModel := entities.ModelConfig{Name: "m-gemini", Provider: geminiProvider.Name, ModelName: "gemini-test"}
@@ -503,8 +503,8 @@ func TestAgentService_SetAgent_SwitchesAgentKeepsHistory(t *testing.T) {
 	}))
 	t.Cleanup(grumpyServer.Close)
 
-	helpfulProvider := entities.ProviderConfig{Name: "p-helpful", Type: entities.ProviderTypeOpenAI, APIKey: "sk-test", BaseURL: helpfulServer.URL + "/v1"}
-	grumpyProvider := entities.ProviderConfig{Name: "p-grumpy", Type: entities.ProviderTypeOpenAI, APIKey: "sk-test", BaseURL: grumpyServer.URL + "/v1"}
+	helpfulProvider := entities.ProviderConfig{Name: "p-helpful", Type: entities.ProviderType("openai-compatible"), APIKey: "sk-test", BaseURL: helpfulServer.URL + "/v1"}
+	grumpyProvider := entities.ProviderConfig{Name: "p-grumpy", Type: entities.ProviderType("openai-compatible"), APIKey: "sk-test", BaseURL: grumpyServer.URL + "/v1"}
 	helpfulModel := entities.ModelConfig{Name: "m-helpful", Provider: helpfulProvider.Name, ModelName: "gpt-test"}
 	grumpyModel := entities.ModelConfig{Name: "m-grumpy", Provider: grumpyProvider.Name, ModelName: "gpt-test"}
 

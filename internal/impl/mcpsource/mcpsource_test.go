@@ -109,3 +109,14 @@ func TestLoad_MalformedEntry_RemoteMissingURL(t *testing.T) {
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "no-url")
 }
+
+func TestLoad_ExplicitStdioType(t *testing.T) {
+	projectRoot := t.TempDir()
+	writeMCPFile(t, projectRoot, `{"mcpServers":{"azure":{"type":"stdio","command":"npx","args":["-y","pkg"],"gallery":"https://example.com","version":"1.0.0"}}}`)
+
+	servers, err := Load(projectRoot)
+	require.NoError(t, err)
+	assert.Equal(t, KindStdio, servers["azure"].Kind)
+	assert.Equal(t, "npx", servers["azure"].Command)
+	assert.Equal(t, []string{"-y", "pkg"}, servers["azure"].Args)
+}

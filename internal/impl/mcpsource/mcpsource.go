@@ -100,8 +100,9 @@ func toServerConfig(name string, entry rawServerConfig) (MCPServerConfig, error)
 			return MCPServerConfig{}, fmt.Errorf("type %q requires a non-empty %q", "sse", "url")
 		}
 		return MCPServerConfig{Name: name, Kind: KindSSE, URL: entry.URL}, nil
-	case "":
-		// No explicit type: infer stdio if a command is present.
+	case "", "stdio":
+		// "stdio" is what Claude Code and VS Code write explicitly; absent a
+		// type, stdio is inferred from the command.
 		if entry.Command == "" {
 			return MCPServerConfig{}, fmt.Errorf("entry has neither a %q (stdio) nor a %q (remote)", "command", "type")
 		}
@@ -113,6 +114,6 @@ func toServerConfig(name string, entry rawServerConfig) (MCPServerConfig, error)
 			Env:     entry.Env,
 		}, nil
 	default:
-		return MCPServerConfig{}, fmt.Errorf("unrecognized %q value %q (expected %q or %q)", "type", entry.Type, "http", "sse")
+		return MCPServerConfig{}, fmt.Errorf("unrecognized %q value %q (expected %q, %q or %q)", "type", entry.Type, "stdio", "http", "sse")
 	}
 }

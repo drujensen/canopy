@@ -54,7 +54,7 @@ func newLeakTestService(t *testing.T, workDir string, handler http.HandlerFunc) 
 	t.Helper()
 	server := httptest.NewServer(handler)
 
-	provider := entities.ProviderConfig{Name: "p", Type: entities.ProviderTypeOpenAI, APIKey: "sk-test", BaseURL: server.URL + "/v1"}
+	provider := entities.ProviderConfig{Name: "p", Type: entities.ProviderType("openai-compatible"), APIKey: "sk-test", BaseURL: server.URL + "/v1"}
 	model := entities.ModelConfig{Name: "m", Provider: provider.Name, ModelName: "gpt-test"}
 
 	repo, err := jsonrepo.NewChatRepository(t.TempDir())

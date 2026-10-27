@@ -40,7 +40,9 @@ import (
 	"log/slog"
 	"os"
 	"os/exec"
+	"runtime"
 	"sort"
+	"strings"
 
 	"github.com/microsoft/agent-framework-go/tool"
 	"github.com/microsoft/agent-framework-go/tool/mcptool"
@@ -130,7 +132,8 @@ func buildTransport(cfg mcpsource.MCPServerConfig) (mcp.Transport, error) {
 		if cfg.Command == "" {
 			return nil, fmt.Errorf("MCP server %q: stdio config has no command", cfg.Name)
 		}
-		cmd := exec.Command(cfg.Command, cfg.Args...)
+		command, args := unwrapWindowsCmd(cfg.Command, cfg.Args)
+		cmd := exec.Command(command, args...)
 		if len(cfg.Env) > 0 {
 			cmd.Env = os.Environ()
 			for k, v := range cfg.Env {
@@ -151,6 +154,17 @@ func buildTransport(cfg mcpsource.MCPServerConfig) (mcp.Transport, error) {
 	default:
 		return nil, fmt.Errorf("MCP server %q: unrecognized kind %q", cfg.Name, cfg.Kind)
 	}
+}
+
+// unwrapWindowsCmd strips a leading `cmd /c` from a stdio command on
+// non-Windows hosts. Shared .mcp.json files commonly wrap npx that way
+// because Windows can't spawn npx.cmd directly, but `cmd` doesn't exist
+// elsewhere, so the server would otherwise always fail to start.
+func unwrapWindowsCmd(command string, args []string) (string, []string) {
+	if runtime.GOOS == "windows" || !strings.EqualFold(command, "cmd") || len(args) < 2 || !strings.EqualFold(args[0], "/c") {
+		return command, args
+	}
+	return args[1], args[2:]
 }
 
 // ConnectError pairs a configured server's name with why ConnectAll failed

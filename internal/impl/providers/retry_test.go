@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -33,6 +34,10 @@ func rateLimitedThenOKHandler(t *testing.T, failCount int32, okText string) (htt
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
+		if strings.HasSuffix(r.URL.Path, "/responses") {
+			_ = json.NewEncoder(w).Encode(responsesAPIResponse(okText))
+			return
+		}
 		_ = json.NewEncoder(w).Encode(chatCompletionResponse(okText))
 	}, &calls
 }

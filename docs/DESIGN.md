@@ -401,7 +401,8 @@ personal ones. Output: a `map[string]AgentDefinition` the domain layer turns int
 instances (via `impl/providers` for the model, `impl/tools` + MCP + skills for the tool list).
 
 **`impl/mcpsource` (FR18).** Reads `.mcp.json` at the project root:
-`{"mcpServers": {"<name>": {"command", "args", "env"}}}` for stdio servers, or
+`{"mcpServers": {"<name>": {"command", "args", "env"}}}` for stdio servers (an explicit `"type": "stdio"` is
+accepted, and a Windows-style `cmd /c <cmd>` wrapper is unwrapped on non-Windows hosts), or
 `{"type": "http"|"sse", "url": "..."}` for remote ones. For each entry, constructs an MCP client
 and wraps its tools via `tool/mcptool`, added to every agent's tool list alongside the core
 built-ins (§3.2).
@@ -558,7 +559,7 @@ something a requirements/design/planning stage needs to do itself.
 
 | Provider | Canopy implementation |
 |---|---|
-| OpenAI | `provider/openaiprovider` (native) |
+| OpenAI | `provider/openaiprovider` (native, Responses API with `store=false`; see below) |
 | Anthropic | `provider/anthropicprovider` (native) |
 | Google | `provider/geminiprovider` (native) |
 | DeepSeek, Ollama, Groq, Mistral, Together, xAI | `impl/providers/openaicompat.go` — thin wrapper constructing `openaiprovider` with a custom `BaseURL` |
@@ -663,6 +664,16 @@ own ID differs from Canopy's `ProviderTypeTogether` const value), mistral, and x
 the `"api"` (base URL) field entirely, presumably because their consuming SDKs bake in a default
 base URL elsewhere. `DetectProviders` accounts for this: a non-native provider with no catalog base
 URL is skipped rather than emitting a config that would fail at dispatch time.
+
+Addendum: native OpenAI uses the Responses API, not Chat Completions, because OpenAI applies a default
+`reasoning_effort` to newer models and rejects it alongside function tools on `/v1/chat/completions`.
+Output storage is disabled (`store=false`), so Canopy keeps owning the history: the full message list is sent
+every turn, no `previous_response_id` or conversation ID is used, and compaction or edits to history work as
+with any other provider. Reasoning is replayed via `encrypted_content`; because the reasoning item's id is not
+persisted, `impl/providers/openai_responses_history.go` drops reasoning items that can't be replayed validly
+(missing id, or no following output after reloading/compaction/edit) instead of letting the API reject them.
+Anthropic requests are likewise patched (`anthropic_schema.go`) to backfill `input_schema` on parameterless
+tools, which the framework otherwise omits and the API rejects.
 
 Addendum (post-v0.1.0): `ProviderTypeOllama` was pulled out of the generic OpenAI-compatible
 dispatch table above and given its own path, `impl/providers.newOllama` (`ollama.go`), for two
