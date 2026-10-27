@@ -466,10 +466,11 @@ func writeOSC52ToStdout(text string) {
 }
 
 const (
-	// Five extra columns give the sidebar enough room for compact Vim-style
+	// Extra columns give the sidebar enough room for compact Vim-style
 	// control-key hints without spending a second row on each setting.
-	sidebarWidth  = 33
-	composerLines = 3
+	sidebarWidth        = 36
+	sidebarContentWidth = sidebarWidth - 4 // right border plus left/right padding
+	composerLines       = 3
 )
 
 // mainWidth returns how many columns the transcript/composer get: the full
@@ -2013,7 +2014,7 @@ func (c *chatModel) View(width, height int) string {
 // ctrl+u/showUsage instead), and the live todo panel (Design §3.7) last.
 func (c *chatModel) renderSidebar() string {
 	var b strings.Builder
-	contentWidth := sidebarWidth - 2
+	contentWidth := sidebarContentWidth
 	b.WriteString(sidebarTitleStyle.Width(contentWidth).Render("Canopy " + c.version))
 	b.WriteString("\n")
 	b.WriteString("Directory: " + currentDirectoryLabel())
@@ -2057,7 +2058,7 @@ func (c *chatModel) renderSidebar() string {
 func sidebarSettingLine(value, hint string) string {
 	valueWidth := lipgloss.Width(value)
 	hintWidth := lipgloss.Width(hint)
-	gap := sidebarWidth - 2 - valueWidth - hintWidth
+	gap := sidebarContentWidth - valueWidth - hintWidth
 	if gap < 1 {
 		gap = 1
 	}

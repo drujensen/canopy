@@ -17,7 +17,7 @@ LDFLAGS    := -s -w -X 'main.version=$(VERSION)'
 
 # Platforms `make build-all` cross-compiles for (Requirements §7
 # "Portability" / Plan Phase 7's cross-compilation guidance).
-PLATFORMS  := linux/amd64 linux/arm64 darwin/amd64 darwin/arm64
+PLATFORMS  := linux/amd64 linux/arm64 darwin/amd64 darwin/arm64 windows/amd64 windows/arm64
 
 .PHONY: build build-all clean fmt vet tidy test lint qa install docker
 

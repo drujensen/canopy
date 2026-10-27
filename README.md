@@ -102,7 +102,7 @@ Requires Go 1.25+.
 
 ```sh
 make build          # dist/canopy, a static binary for the host GOOS/GOARCH
-make build-all       # dist/canopy_<version>_<os>_<arch> for linux/darwin × amd64/arm64
+make build-all       # dist/canopy_<version>_<os>_<arch> for Linux/macOS/Windows × amd64/arm64
 make install         # go install with the version baked in, into $GOBIN
 ```
 
@@ -112,6 +112,33 @@ Every target bakes a version string into the binary at link time
 ```sh
 make build VERSION=v0.1.0
 ```
+
+`make build-all VERSION=v0.1.0` produces release binaries for Linux, macOS, and Windows on
+amd64 and arm64. Windows binaries use the `.exe` suffix:
+
+```text
+dist/canopy_v0.1.0_linux_amd64
+dist/canopy_v0.1.0_linux_arm64
+dist/canopy_v0.1.0_darwin_amd64
+dist/canopy_v0.1.0_darwin_arm64
+dist/canopy_v0.1.0_windows_amd64.exe
+dist/canopy_v0.1.0_windows_arm64.exe
+```
+
+### Creating a GitHub release
+
+Push a semantic-version tag such as `v0.2.0` to the repository:
+
+```sh
+git tag v0.2.0
+git push origin v0.2.0
+```
+
+The `release.yml` GitHub Actions workflow runs for tags matching `v*`, builds all six binaries
+with the tag as the embedded version, and attaches them to a GitHub Release. The release workflow
+requires the repository's Actions setting **Workflow permissions** to allow read and write access,
+which is provided by the workflow's `contents: write` permission.
+
 
 Without `VERSION`, it defaults to `git describe` (or `dev` outside a git checkout). Run it from the
 project directory you want Canopy to work in:
