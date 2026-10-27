@@ -10,7 +10,10 @@ var (
 			Border(lipgloss.NormalBorder(), false, true, false, false).
 			Padding(0, 1)
 
-	modeStyle = lipgloss.NewStyle().Bold(true)
+	sidebarTitleStyle = lipgloss.NewStyle().Bold(true).Align(lipgloss.Center)
+
+	modeStyle        = lipgloss.NewStyle().Bold(true)
+	sidebarHintStyle = lipgloss.NewStyle().Faint(true)
 
 	// userMessageStyle sets a user message off from an assistant reply
 	// with a lighter background block instead of a "you"/"assistant" label

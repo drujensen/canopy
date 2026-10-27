@@ -47,8 +47,8 @@ const modelsDevCacheMaxAge = 24 * time.Hour
 // it at link time via `-ldflags="-X main.version=..."` (Go's -X flag only
 // rewrites string variables, not constants) without editing source — see
 // the Makefile's `build`/`build-all`/`install` targets (Plan Phase 7).
-// Bumped at release time; unset (this default) means a dev build.
-var version = "0.1.0-dev"
+// Bumped at release time; release builds can override this via -ldflags.
+var version = "v0.1.0"
 
 func main() {
 	if err := run(); err != nil {
@@ -581,7 +581,7 @@ func run() error {
 	// races with a direct os.Stdout write from a mouse-copy, which can
 	// corrupt the OSC 52 sequence badly enough that some terminals silently
 	// fail to update the clipboard. See output.go's stdoutMu doc comment.
-	program := tea.NewProgram(tui.NewModel(ctx, svc, agents, startAgent, resumeChatID), tea.WithAltScreen(), tea.WithMouseCellMotion(), tea.WithOutput(tui.Output()))
+	program := tea.NewProgram(tui.NewModel(ctx, svc, agents, startAgent, resumeChatID, version), tea.WithAltScreen(), tea.WithMouseCellMotion(), tea.WithOutput(tui.Output()))
 	if _, err := program.Run(); err != nil {
 		return fmt.Errorf("running the TUI: %w", err)
 	}

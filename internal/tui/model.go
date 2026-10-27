@@ -65,6 +65,7 @@ type Model struct {
 	// resume a specific conversation, a stronger signal than the passive
 	// "which agent was last active" default.
 	resumeChatID string
+	version      string
 
 	// historyList is the ctrl+h chat-history browser's item list
 	// (post-v0.1.0 addendum, Design §5's addendum), populated by
@@ -118,7 +119,7 @@ func newChatID(agentName string) string {
 // exact same startChatCmd/resumeChatCmd -> chatStartedMsg path a manual
 // picker selection or ctrl+h already uses — the picker screen is simply
 // never shown if that Cmd succeeds before the user would have seen it.
-func NewModel(ctx context.Context, svc *services.AgentService, agents map[string]agentsource.AgentDefinition, startAgent, resumeChatID string) Model {
+func NewModel(ctx context.Context, svc *services.AgentService, agents map[string]agentsource.AgentDefinition, startAgent, resumeChatID string, version ...string) Model {
 	names := make([]string, 0, len(agents))
 	for name := range agents {
 		names = append(names, name)
@@ -147,6 +148,11 @@ func NewModel(ctx context.Context, svc *services.AgentService, agents map[string
 	hl.SetShowStatusBar(false)
 	hl.SetFilteringEnabled(true)
 
+	displayVersion := "v0.1.0"
+	if len(version) > 0 && version[0] != "" {
+		displayVersion = version[0]
+	}
+
 	return Model{
 		svc:          svc,
 		ctx:          ctx,
@@ -158,6 +164,7 @@ func NewModel(ctx context.Context, svc *services.AgentService, agents map[string
 		height:       24,
 		startAgent:   startAgent,
 		resumeChatID: resumeChatID,
+		version:      displayVersion,
 	}
 }
 
@@ -251,6 +258,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		m.chat = newChatModel(msg.chatID, msg.agentName, msg.todos, msg.model, m.width, m.height)
+		m.chat.version = m.version
 		m.chat.toolCount = msg.capabilities.ToolCount
 		m.chat.skillCount = msg.capabilities.SkillCount
 		m.chat.usage = msg.usage

@@ -166,3 +166,30 @@ func TestRenderSidebar_NoUsageYet_ShowsPlaceholder(t *testing.T) {
 	c := newChatModel("chat-1", "assistant", nil, "m1", 80, 24)
 	assert.Contains(t, c.renderSidebar(), "Cost: (none yet)")
 }
+
+func TestDisplayWorkingDirectory_UsesHomeAbbreviation(t *testing.T) {
+	tests := []struct {
+		name, dir, home, want string
+	}{
+		{"home", "/home/alice", "/home/alice", "~"},
+		{"child", "/home/alice/project", "/home/alice", "~/project"},
+		{"outside", "/tmp/project", "/home/alice", "/tmp/project"},
+		{"sibling", "/home/alice-other", "/home/alice", "/home/alice-other"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, displayWorkingDirectory(tt.dir, tt.home))
+		})
+	}
+}
+
+func TestRenderSidebar_ShowsTitleAndDirectory(t *testing.T) {
+	c := newChatModel("chat-1", "assistant", nil, "m1", 80, 24)
+	rendered := c.renderSidebar()
+
+	assert.Contains(t, rendered, "Canopy")
+	assert.Contains(t, rendered, "Directory:")
+	// Long paths wrap inside the fixed-width sidebar, so verify the
+	// directory label is present rather than expecting the whole path on one line.
+	assert.Contains(t, rendered, "~")
+}

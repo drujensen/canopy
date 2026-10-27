@@ -145,6 +145,7 @@ const autoScrollInterval = 60 * time.Millisecond
 type chatModel struct {
 	chatID    string
 	agentName string
+	version   string
 
 	transcript []transcriptEntry
 
@@ -375,6 +376,7 @@ func newChatModel(chatID, agentName string, todos []todo.Item, model string, wid
 		agentName:       agentName,
 		todos:           todos,
 		model:           model,
+		version:         "v0.1.0",
 		spinner:         sp,
 		composer:        composer,
 		viewport:        viewport.New(width, height),
@@ -464,7 +466,9 @@ func writeOSC52ToStdout(text string) {
 }
 
 const (
-	sidebarWidth  = 28
+	// Five extra columns give the sidebar enough room for compact Vim-style
+	// control-key hints without spending a second row on each setting.
+	sidebarWidth  = 33
 	composerLines = 3
 )
 
@@ -2009,19 +2013,27 @@ func (c *chatModel) View(width, height int) string {
 // ctrl+u/showUsage instead), and the live todo panel (Design §3.7) last.
 func (c *chatModel) renderSidebar() string {
 	var b strings.Builder
-	b.WriteString(modeStyle.Render("Agent: " + c.agentName))
-	b.WriteString("\n[ctrl+a]\n")
-	b.WriteString(modeStyle.Render("Model: " + c.model))
-	b.WriteString("\n[ctrl+o]\n")
-	b.WriteString(modeStyle.Render(fmt.Sprintf("Tools: %d", c.toolCount)))
-	b.WriteString("\n[ctrl+t]\n")
-	b.WriteString(modeStyle.Render(fmt.Sprintf("Skills: %d", c.skillCount)))
-	b.WriteString("\n[ctrl+s]\n")
-	b.WriteString(modeStyle.Render("Cost: " + usageCostLine(c.usage)))
-	b.WriteString("\n[ctrl+u]\n")
-	b.WriteString("History  [ctrl+h]\n")
-	b.WriteString("New chat [ctrl+n]\n")
-	b.WriteString("Hide     [ctrl+b]\n")
+	contentWidth := sidebarWidth - 2
+	b.WriteString(sidebarTitleStyle.Width(contentWidth).Render("Canopy " + c.version))
+	b.WriteString("\n")
+	b.WriteString("Directory: " + currentDirectoryLabel())
+	b.WriteString("\n\n")
+	b.WriteString(sidebarSettingLine("Agent: "+c.agentName, "^A"))
+	b.WriteString("\n")
+	b.WriteString(sidebarSettingLine("Model: "+c.model, "^O"))
+	b.WriteString("\n")
+	b.WriteString(sidebarSettingLine(fmt.Sprintf("Tools: %d", c.toolCount), "^T"))
+	b.WriteString("\n")
+	b.WriteString(sidebarSettingLine(fmt.Sprintf("Skills: %d", c.skillCount), "^S"))
+	b.WriteString("\n")
+	b.WriteString(sidebarSettingLine("Cost: "+usageCostLine(c.usage), "^U"))
+	b.WriteString("\n")
+	b.WriteString(sidebarSettingLine("History", "^H"))
+	b.WriteString("\n")
+	b.WriteString(sidebarSettingLine("New chat", "^N"))
+	b.WriteString("\n")
+	b.WriteString(sidebarSettingLine("Hide", "^B"))
+	b.WriteString("\n")
 	b.WriteString("Todos:\n")
 	if len(c.todos) == 0 {
 		b.WriteString("  (none yet)\n")
@@ -2036,6 +2048,20 @@ func (c *chatModel) renderSidebar() string {
 		fmt.Fprintf(&b, "  %s %s\n", mark, title)
 	}
 	return sidebarStyle.Width(sidebarWidth - 2).Height(c.sidebarHeight()).Render(b.String())
+}
+
+// sidebarSettingLine keeps the sidebar readable at a glance: the value is
+// prominent and the compact ^X hint is right-aligned on the same row, in the
+// style of Vim's control-key notation. The fixed-width sidebar still wraps
+// unusually long agent/model names rather than clipping them.
+func sidebarSettingLine(value, hint string) string {
+	valueWidth := lipgloss.Width(value)
+	hintWidth := lipgloss.Width(hint)
+	gap := sidebarWidth - 2 - valueWidth - hintWidth
+	if gap < 1 {
+		gap = 1
+	}
+	return modeStyle.Render(value) + strings.Repeat(" ", gap) + sidebarHintStyle.Render(hint)
 }
 
 // usageCostLine renders the sidebar's compact "Cost: ..." value: just the
