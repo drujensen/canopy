@@ -186,15 +186,45 @@ func TestDisplayWorkingDirectory_UsesHomeAbbreviation(t *testing.T) {
 	}
 }
 
-func TestRenderSidebar_ShowsTitleAndDirectory(t *testing.T) {
+// TestRenderSidebar_ShowsWorkingDirectoryUnlabelled asserts the sidebar's
+// working-directory line renders the bare path: the "Directory: " prefix
+// is gone (it cost 11 of the sidebar's 32 content columns just to name
+// something a ~/-prefixed path already makes obvious), so the whole line's
+// budget goes to the path itself.
+func TestRenderSidebar_ShowsWorkingDirectoryUnlabelled(t *testing.T) {
 	c := newChatModel("chat-1", "assistant", nil, "m1", 80, 24)
 	rendered := c.renderSidebar()
 
 	assert.Contains(t, rendered, "Canopy")
-	assert.Contains(t, rendered, "Directory:")
-	// Long paths wrap inside the fixed-width sidebar, so verify the
-	// directory label is present rather than expecting the whole path on one line.
-	assert.Contains(t, rendered, "~")
+	assert.NotContains(t, rendered, "Directory:", "the label was dropped to give the path the full width")
+	assert.Contains(t, rendered, fitTailToWidth(currentDirectoryLabel(), sidebarContentWidth))
+}
+
+// TestFitTailToWidth covers fitTailToWidth's whole contract: text within
+// budget is untouched, over-budget text is trimmed from the left with a
+// leading "…" so the tail (a path's leaf directory) survives, and
+// degenerate widths never panic or overrun the budget.
+func TestFitTailToWidth(t *testing.T) {
+	longPath := "/home/alice/dev/projects/canopy/internal"
+
+	t.Run("within budget untouched", func(t *testing.T) {
+		assert.Equal(t, "~/dev/projects/canopy", fitTailToWidth("~/dev/projects/canopy", sidebarContentWidth))
+	})
+	t.Run("exactly at budget untouched", func(t *testing.T) {
+		assert.Equal(t, "~/abc", fitTailToWidth("~/abc", 5))
+	})
+	t.Run("over budget keeps the tail", func(t *testing.T) {
+		got := fitTailToWidth(longPath, 16)
+		assert.Equal(t, 16, lipgloss.Width(got), "must fill exactly the budget, never overrun it")
+		assert.True(t, strings.HasPrefix(got, "…"), "a left trim must be signalled with a leading ellipsis")
+		assert.True(t, strings.HasSuffix(longPath, strings.TrimPrefix(got, "…")), "the kept portion must be the path's real tail")
+		assert.Contains(t, got, "internal", "the leaf directory is the part worth keeping visible")
+	})
+	t.Run("degenerate widths", func(t *testing.T) {
+		assert.Equal(t, "", fitTailToWidth(longPath, 0))
+		assert.Equal(t, "", fitTailToWidth(longPath, -3))
+		assert.Equal(t, "…", fitTailToWidth(longPath, 1))
+	})
 }
 
 // TestFitToWidth is a direct unit test of fitToWidth's trim-plus-ellipsis
@@ -276,4 +306,49 @@ func TestRenderSidebar_LongModelNameStaysOneRow(t *testing.T) {
 	assert.Contains(t, modelLines[0], "^O")
 	assert.Contains(t, modelLines[0], "…")
 	assert.NotContains(t, rendered, longName)
+}
+
+// TestRenderSidebar_LongNamesKeepEveryRowUniform is the broader structural
+// regression guard behind the two tests above: with over-long agent and
+// model names present, every rendered sidebar row must still be exactly as
+// wide as every other one. That's the real invariant the reported wrapping
+// violated — an over-budget value used to make its row wider than the
+// sidebar's own column, so the whole View exceeded the terminal width and
+// the terminal itself wrapped that physical row, orphaning the ^X hint on
+// the next line. Uniform row widths mean nothing overflowed.
+func TestRenderSidebar_LongNamesKeepEveryRowUniform(t *testing.T) {
+	c := newChatModel("chat-1",
+		"a-very-long-agent-name-that-cannot-fit-in-the-sidebar",
+		nil,
+		"drujensen/qwen3.8-super-large-very-long-slug",
+		80, 24)
+
+	lines := strings.Split(c.renderSidebar(), "\n")
+	require.NotEmpty(t, lines)
+	want := lipgloss.Width(lines[0])
+	for i, l := range lines {
+		assert.Equal(t, want, lipgloss.Width(l),
+			"sidebar row %d is %q — every row must render at the same width, or the view overflows the terminal and wraps", i, l)
+	}
+}
+
+// TestRenderSidebar_LongAgentNameStaysOneRow is that same check for the
+// ctrl+a agent line: a long agent name must not push the ^A hint onto its
+// own row either.
+func TestRenderSidebar_LongAgentNameStaysOneRow(t *testing.T) {
+	longAgent := "a-very-long-agent-name-that-cannot-fit-in-the-sidebar"
+	c := newChatModel("chat-1", longAgent, nil, "m1", 80, 24)
+	rendered := c.renderSidebar()
+
+	var agentLines []string
+	for _, l := range strings.Split(rendered, "\n") {
+		if strings.Contains(l, "Agent:") {
+			agentLines = append(agentLines, l)
+		}
+	}
+	require.NotEmpty(t, agentLines)
+	assert.Len(t, agentLines, 1, "the Agent line must stay on a single physical row (no wrap)")
+	assert.Contains(t, agentLines[0], "^A")
+	assert.Contains(t, agentLines[0], "…")
+	assert.NotContains(t, rendered, longAgent)
 }

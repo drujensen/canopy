@@ -2005,26 +2005,28 @@ func (c *chatModel) View(width, height int) string {
 	return lipgloss.JoinHorizontal(lipgloss.Top, sidebar, main)
 }
 
-// renderSidebar renders the agent/model indicators (post-v0.1.0 §3.4/§4
-// addendum), what's available to the current agent (ToolCount/SkillCount,
-// post-v0.1.0 addendum: services.AgentCapabilities), this chat's running
-// cost as a single compact line (post-v0.1.0 addendum: entities.Chat.Usage
-// — see usageCostLine's own doc comment on why the sidebar shows only the
-// total, not renderUsageLines' full per-model breakdown, which belongs to
+// renderSidebar renders the working directory, the agent/model indicators
+// (post-v0.1.0 §3.4/§4 addendum), what's available to the current agent
+// (ToolCount/SkillCount, post-v0.1.0 addendum:
+// services.AgentCapabilities), this chat's running cost as a single compact
+// line (post-v0.1.0 addendum: entities.Chat.Usage — see usageCostLine's own
+// doc comment on why the sidebar shows only the total, not
+// renderUsageLines' full per-model breakdown, which belongs to
 // ctrl+u/showUsage instead), and the live todo panel (Design §3.7) last.
 func (c *chatModel) renderSidebar() string {
 	var b strings.Builder
 	contentWidth := sidebarContentWidth
 	b.WriteString(sidebarTitleStyle.Width(contentWidth).Render("Canopy " + c.version))
 	b.WriteString("\n")
-	b.WriteString("Directory: " + currentDirectoryLabel())
+	// The working directory renders unlabeled (post-v0.1.0 addendum: the
+	// "Directory: " prefix cost 11 of the sidebar's 32 content columns just
+	// to name something a bare ~/-prefixed path already makes obvious), and
+	// trimmed from the left (fitTailToWidth) so a deep path keeps its leaf
+	// directory visible instead of wrapping onto extra rows.
+	b.WriteString(fitTailToWidth(currentDirectoryLabel(), contentWidth))
 	b.WriteString("\n\n")
-	b.WriteString(sidebarSettingLine("Agent: "+c.agentName, "^A"))
+	b.WriteString(sidebarSettingLineFit("Agent: "+c.agentName, "^A"))
 	b.WriteString("\n")
-	// The model name specifically is trimmed to fit (sidebarSettingLineFit)
-	// rather than wrapping the ^O hint onto a second row (post-v0.1.0
-	// addendum: long real model slugs, e.g. provider-scoped Qwen/Groq
-	// names, routinely exceed the sidebar's usable width).
 	b.WriteString(sidebarSettingLineFit("Model: "+c.model, "^O"))
 	b.WriteString("\n")
 	b.WriteString(sidebarSettingLine(fmt.Sprintf("Tools: %d", c.toolCount), "^T"))
@@ -2067,19 +2069,19 @@ func sidebarSettingLine(value, hint string) string {
 	return modeStyle.Render(value) + strings.Repeat(" ", gap) + sidebarHintStyle.Render(hint)
 }
 
-// sidebarSettingLineFit is sidebarSettingLine for values (like the model
-// name, renderSidebar's Model:^O line) that can get long enough — real
-// provider-scoped slugs, e.g. "groq/qwen/qwen3.8-27b" or a self-hosted
-// "drujensen/qwen3.8"-style name — that value + gap + hint no longer fits
-// in sidebarContentWidth at all: sidebarSettingLine only ever *grows* the
-// gap down to a minimum of 1 column, so anything beyond budget overflows
-// past the sidebar's right border and lipgloss wraps it, dropping the ^X
-// hint onto its own row (the wrap the user was seeing). This variant
-// trims the value — dropping its trailing runes, appending "…" as a cue
-// something was cut off (the same idiom truncatePreview/renderStatusErrLine
-// use) — to make room for the hint on every value, fitting the whole line
-// in exactly sidebarContentWidth columns before delegating to
-// sidebarSettingLine to render it.
+// sidebarSettingLineFit is sidebarSettingLine for setting lines whose value
+// is user-configured and can get arbitrarily long — renderSidebar's
+// Agent:^A and Model:^O lines (a long agent name, or a real provider-scoped
+// model slug like "groq/qwen/qwen3.8-27b" or "drujensen/qwen3.8") — where
+// value + gap + hint no longer fits in sidebarContentWidth at all:
+// sidebarSettingLine only ever *grows* the gap down to a minimum of 1
+// column, so anything beyond budget overflows past the sidebar's right
+// border and lipgloss wraps it, dropping the ^X hint onto its own row (the
+// bug this was added to fix). This variant trims the value — dropping its
+// trailing runes, appending "…" as a cue something was cut off (the same
+// idiom truncatePreview/renderStatusErrLine use) — to make room for the
+// hint on every value, fitting the whole line in exactly sidebarContentWidth
+// columns before delegating to sidebarSettingLine to render it.
 func sidebarSettingLineFit(value, hint string) string {
 	value = fitToWidth(value, sidebarContentWidth-lipgloss.Width(hint)-1)
 	return sidebarSettingLine(value, hint)
@@ -2101,6 +2103,27 @@ func fitToWidth(text string, width int) string {
 		return string(runes[:1])
 	}
 	return string(runes[:width-1]) + "…"
+}
+
+// fitTailToWidth is fitToWidth's mirror image: it trims text to at most
+// width columns by dropping runes off the *left* and prefixing "…", so the
+// end of the string — the part that actually identifies it — stays visible.
+// That's the right trade for a path (renderSidebar's working-directory
+// line): "…/projects/canopy" still tells the user which project they're in,
+// where fitToWidth's "~/dev/projects/ca…" would bury the leaf directory
+// under the parent path nobody needs. width < 1 returns "".
+func fitTailToWidth(text string, width int) string {
+	if width < 1 {
+		return ""
+	}
+	runes := []rune(text)
+	if len(runes) <= width {
+		return text
+	}
+	if width == 1 {
+		return "…"
+	}
+	return "…" + string(runes[len(runes)-(width-1):])
 }
 
 // usageCostLine renders the sidebar's compact "Cost: ..." value: just the
