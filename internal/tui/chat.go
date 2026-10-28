@@ -2021,7 +2021,11 @@ func (c *chatModel) renderSidebar() string {
 	b.WriteString("\n\n")
 	b.WriteString(sidebarSettingLine("Agent: "+c.agentName, "^A"))
 	b.WriteString("\n")
-	b.WriteString(sidebarSettingLine("Model: "+c.model, "^O"))
+	// The model name specifically is trimmed to fit (sidebarSettingLineFit)
+	// rather than wrapping the ^O hint onto a second row (post-v0.1.0
+	// addendum: long real model slugs, e.g. provider-scoped Qwen/Groq
+	// names, routinely exceed the sidebar's usable width).
+	b.WriteString(sidebarSettingLineFit("Model: "+c.model, "^O"))
 	b.WriteString("\n")
 	b.WriteString(sidebarSettingLine(fmt.Sprintf("Tools: %d", c.toolCount), "^T"))
 	b.WriteString("\n")
@@ -2053,16 +2057,50 @@ func (c *chatModel) renderSidebar() string {
 
 // sidebarSettingLine keeps the sidebar readable at a glance: the value is
 // prominent and the compact ^X hint is right-aligned on the same row, in the
-// style of Vim's control-key notation. The fixed-width sidebar still wraps
-// unusually long agent/model names rather than clipping them.
+// style of Vim's control-key notation.
 func sidebarSettingLine(value, hint string) string {
 	valueWidth := lipgloss.Width(value)
-	hintWidth := lipgloss.Width(hint)
-	gap := sidebarContentWidth - valueWidth - hintWidth
+	gap := sidebarContentWidth - valueWidth - lipgloss.Width(hint)
 	if gap < 1 {
 		gap = 1
 	}
 	return modeStyle.Render(value) + strings.Repeat(" ", gap) + sidebarHintStyle.Render(hint)
+}
+
+// sidebarSettingLineFit is sidebarSettingLine for values (like the model
+// name, renderSidebar's Model:^O line) that can get long enough — real
+// provider-scoped slugs, e.g. "groq/qwen/qwen3.8-27b" or a self-hosted
+// "drujensen/qwen3.8"-style name — that value + gap + hint no longer fits
+// in sidebarContentWidth at all: sidebarSettingLine only ever *grows* the
+// gap down to a minimum of 1 column, so anything beyond budget overflows
+// past the sidebar's right border and lipgloss wraps it, dropping the ^X
+// hint onto its own row (the wrap the user was seeing). This variant
+// trims the value — dropping its trailing runes, appending "…" as a cue
+// something was cut off (the same idiom truncatePreview/renderStatusErrLine
+// use) — to make room for the hint on every value, fitting the whole line
+// in exactly sidebarContentWidth columns before delegating to
+// sidebarSettingLine to render it.
+func sidebarSettingLineFit(value, hint string) string {
+	value = fitToWidth(value, sidebarContentWidth-lipgloss.Width(hint)-1)
+	return sidebarSettingLine(value, hint)
+}
+
+// fitToWidth trims text to at most width columns (width < 1 returns ""),
+// appending an ellipsis to signal it was cut — the same convention
+// truncatePreview, oneLinePreview, and renderStatusErrLine already use for
+// long tool output/commands/error messages elsewhere in this package.
+func fitToWidth(text string, width int) string {
+	if width < 1 {
+		return ""
+	}
+	runes := []rune(text)
+	if len(runes) <= width {
+		return text
+	}
+	if width == 1 {
+		return string(runes[:1])
+	}
+	return string(runes[:width-1]) + "…"
 }
 
 // usageCostLine renders the sidebar's compact "Cost: ..." value: just the

@@ -2,15 +2,18 @@ package tui
 
 import (
 	"context"
+	"strings"
 	"testing"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/charmbracelet/lipgloss"
 	"github.com/drujensen/canopy/internal/domain/entities"
 	"github.com/drujensen/canopy/internal/domain/services"
 	"github.com/drujensen/canopy/internal/impl/agentsource"
+
 	jsonrepo "github.com/drujensen/canopy/internal/impl/repositories/json"
 	"github.com/drujensen/canopy/internal/impl/skillsource"
 )
@@ -192,4 +195,85 @@ func TestRenderSidebar_ShowsTitleAndDirectory(t *testing.T) {
 	// Long paths wrap inside the fixed-width sidebar, so verify the
 	// directory label is present rather than expecting the whole path on one line.
 	assert.Contains(t, rendered, "~")
+}
+
+// TestFitToWidth is a direct unit test of fitToWidth's trim-plus-ellipsis
+// behavior at the boundaries — text already within width is left
+// untouched, text past width is trimmed with a "…" cue, and degenerate
+// widths (1, 0, negative) never panic or return more than width columns.
+func TestFitToWidth(t *testing.T) {
+	tests := []struct {
+		name  string
+		text  string
+		width int
+		want  string
+	}{
+		{"fits", "m1", 10, "m1"},
+		{"exact", "abc", 3, "abc"},
+		{"trim one", "abcd", 3, "ab…"},
+		{"trim many", "abcdef", 2, "a…"},
+		{"width one", "abcd", 1, "a"},
+		{"zero width", "abcd", 0, ""},
+		{"negative width", "abcd", -5, ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := fitToWidth(tt.text, tt.width)
+			assert.Equal(t, tt.want, got)
+			if tt.width >= 1 {
+				assert.LessOrEqual(t, lipgloss.Width(got), tt.width, "output must never exceed its budgeted width")
+			}
+		})
+	}
+}
+
+// TestSidebarSettingLineFit_ShortNameUnchanged asserts a value already
+// within the sidebar's budget renders identically to plain
+// sidebarSettingLine — no spurious ellipsis or trimming for names that
+// already fit.
+func TestSidebarSettingLineFit_ShortNameUnchanged(t *testing.T) {
+	assert.Equal(t, sidebarSettingLine("Model: m1", "^O"), sidebarSettingLineFit("Model: m1", "^O"))
+	assert.Equal(t, sidebarSettingLine("Model: gpt-4o", "^O"), sidebarSettingLineFit("Model: gpt-4o", "^O"))
+}
+
+// TestSidebarSettingLineFit_LongNameTrimsToOneRow asserts the reported
+// bug's fix directly: a value long enough that value+gap+hint would
+// otherwise overflow sidebarContentWidth (and wrap the ^O hint onto a
+// second row) now gets trimmed to fit, keeping the ellipsis and the hint
+// on the same single row.
+func TestSidebarSettingLineFit_LongNameTrimsToOneRow(t *testing.T) {
+	longName := "drujensen/qwen3.8-super-large-very-long-slug"
+	value := "Model: " + longName
+
+	got := sidebarSettingLineFit(value, "^O")
+
+	// Exactly one content row's worth of columns (32 =
+	// sidebarContentWidth), not two rows' worth — i.e. no wrap.
+	assert.Equal(t, sidebarContentWidth, lipgloss.Width(got))
+	assert.Contains(t, got, "…", "the trim must be signalled with an ellipsis")
+	assert.Contains(t, got, "^O", "the hint must survive the trim, on the same row")
+	assert.NotContains(t, got, longName, "the full over-long name must be trimmed, not rendered whole")
+}
+
+// TestRenderSidebar_LongModelNameStaysOneRow is the integration-level
+// check matching the reported bug end-to-end: with a long real-world-
+// shaped model slug set on the chat, the sidebar renders the Model:^O
+// line on a single row (trimmed, not wrapped), so the ^O hint is still
+// visible right there rather than orphaned on its own row.
+func TestRenderSidebar_LongModelNameStaysOneRow(t *testing.T) {
+	longName := "drujensen/qwen3.8-super-large-very-long-slug"
+	c := newChatModel("chat-1", "assistant", nil, longName, 80, 24)
+	rendered := c.renderSidebar()
+
+	var modelLines []string
+	for _, l := range strings.Split(rendered, "\n") {
+		if strings.Contains(l, "Model:") {
+			modelLines = append(modelLines, l)
+		}
+	}
+	require.NotEmpty(t, modelLines)
+	assert.Len(t, modelLines, 1, "the Model line must stay on a single physical row (no wrap)")
+	assert.Contains(t, modelLines[0], "^O")
+	assert.Contains(t, modelLines[0], "…")
+	assert.NotContains(t, rendered, longName)
 }
