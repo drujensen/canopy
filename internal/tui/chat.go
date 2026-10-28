@@ -240,6 +240,13 @@ type chatModel struct {
 	toolCount  int
 	skillCount int
 
+	// sessionCount is how many chats are persisted — the sidebar's
+	// "History: N" line, shown next to Tools/Skills as another "what's
+	// here" count (and kept current by Model.Update: seeded from
+	// chatStartedMsg, refreshed when ctrl+h's list loads, decremented on a
+	// delete). Display-only: nothing in a turn depends on it.
+	sessionCount int
+
 	// usage is this chat's persisted entities.Chat.Usage (post-v0.1.0
 	// addendum: sidebar usage/cost display), keyed by ModelConfig.Name
 	// since a chat's lifetime usage can span more than one model — a
@@ -984,7 +991,11 @@ func (c *chatModel) startNewChatCmd(svc *services.AgentService, ctx context.Cont
 		if err != nil {
 			return chatStartedMsg{err: fmt.Errorf("loading agent capabilities: %w", err)}
 		}
-		return chatStartedMsg{chatID: chatID, agentName: agentName, todos: todos, model: model, capabilities: capabilities}
+		sessions, err := sessionCountOf(svc, ctx)
+		if err != nil {
+			return chatStartedMsg{err: fmt.Errorf("counting chats: %w", err)}
+		}
+		return chatStartedMsg{chatID: chatID, agentName: agentName, todos: todos, model: model, capabilities: capabilities, sessionCount: sessions}
 	}
 }
 
@@ -2008,11 +2019,16 @@ func (c *chatModel) View(width, height int) string {
 // renderSidebar renders the working directory, the agent/model indicators
 // (post-v0.1.0 §3.4/§4 addendum), what's available to the current agent
 // (ToolCount/SkillCount, post-v0.1.0 addendum:
-// services.AgentCapabilities), this chat's running cost as a single compact
+// services.AgentCapabilities), how many chats are persisted (sessionCount,
+// rendered exactly like Tools/Skills since it answers the same kind of
+// "what's here" question), this chat's running cost as a single compact
 // line (post-v0.1.0 addendum: entities.Chat.Usage — see usageCostLine's own
 // doc comment on why the sidebar shows only the total, not
 // renderUsageLines' full per-model breakdown, which belongs to
 // ctrl+u/showUsage instead), and the live todo panel (Design §3.7) last.
+//
+// History sits above Cost so the count rows (Tools, Skills, History) stay
+// grouped rather than being split by the cost line.
 func (c *chatModel) renderSidebar() string {
 	var b strings.Builder
 	contentWidth := sidebarContentWidth
@@ -2033,9 +2049,9 @@ func (c *chatModel) renderSidebar() string {
 	b.WriteString("\n")
 	b.WriteString(sidebarSettingLine(fmt.Sprintf("Skills: %d", c.skillCount), "^S"))
 	b.WriteString("\n")
-	b.WriteString(sidebarSettingLine("Cost: "+usageCostLine(c.usage), "^U"))
+	b.WriteString(sidebarSettingLine(fmt.Sprintf("History: %d", c.sessionCount), "^H"))
 	b.WriteString("\n")
-	b.WriteString(sidebarSettingLine("History", "^H"))
+	b.WriteString(sidebarSettingLine("Cost: "+usageCostLine(c.usage), "^U"))
 	b.WriteString("\n")
 	b.WriteString(sidebarSettingLine("New chat", "^N"))
 	b.WriteString("\n")

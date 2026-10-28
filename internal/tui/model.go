@@ -261,6 +261,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.chat.version = m.version
 		m.chat.toolCount = msg.capabilities.ToolCount
 		m.chat.skillCount = msg.capabilities.SkillCount
+		m.chat.sessionCount = msg.sessionCount
 		m.chat.usage = msg.usage
 		if len(msg.messages) > 0 {
 			// A resume (ctrl+h/--continue, resumeChatCmd), not a genuinely
@@ -295,6 +296,12 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			items = append(items, historyPickerItem{chatID: s.ID, title: s.Title, agentName: s.AgentName, updatedAt: s.UpdatedAt})
 		}
 		if m.screen == screenChat && m.chat != nil {
+			// msg.summaries is the *unfiltered* list — the current chat is
+			// filtered out of the overlay just below — so its length is
+			// exactly the sidebar's "History: N" total, refreshed here so
+			// opening ctrl+h picks up chats started or deleted in other
+			// sessions since this one began.
+			m.chat.sessionCount = len(msg.summaries)
 			// The in-chat overlay excludes the chat it was opened from
 			// (post-v0.1.0 addendum: "d" to delete — chat.go's
 			// handlePickerKey) — deleting the chat you're currently typing
@@ -346,6 +353,14 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, nil
 			}
 			removeHistoryItem(m.chat.picker, msg.chatID)
+			// The sidebar's "History: N" follows the delete (see
+			// chatStartedMsg.sessionCount) — decremented rather than
+			// recounting, since this path already knows exactly one chat
+			// went away and a fresh ListChatSummaries would mean a second
+			// disk read just to re-learn that.
+			if m.chat.sessionCount > 0 {
+				m.chat.sessionCount--
+			}
 			return m, nil
 		}
 		if msg.err != nil {
@@ -553,7 +568,11 @@ func (m Model) startChatCmd(agentName string) tea.Cmd {
 		if err != nil {
 			return chatStartedMsg{err: fmt.Errorf("loading agent capabilities: %w", err)}
 		}
-		return chatStartedMsg{chatID: chatID, agentName: agentName, todos: todos, model: model, capabilities: capabilities}
+		sessions, err := sessionCountOf(svc, ctx)
+		if err != nil {
+			return chatStartedMsg{err: fmt.Errorf("counting chats: %w", err)}
+		}
+		return chatStartedMsg{chatID: chatID, agentName: agentName, todos: todos, model: model, capabilities: capabilities, sessionCount: sessions}
 	}
 }
 

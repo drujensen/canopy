@@ -1234,6 +1234,58 @@ func TestChatModel_CtrlH_OpensOverlay_SelectingResumesToDifferentChat(t *testing
 	assert.NotEqual(t, "chat-b", m2.chat.chatID, "must have switched to the other chat")
 }
 
+// TestChatStartedMsg_CarriesSessionCount covers the sidebar's "History: N"
+// value flowing through all three chatStartedMsg producers (Model's
+// startChatCmd, chatModel's startNewChatCmd, resumeChatCmd) — each resolves
+// it from the real persisted chat list, so the count the chat screen first
+// renders with is already correct, including the chat that was just created
+// (StartChat persists before these producers count).
+func TestChatStartedMsg_CarriesSessionCount(t *testing.T) {
+	svc := newCapabilitiesSwitchTestService(t)
+	ctx := context.Background()
+	for _, id := range []string{"chat-1", "chat-2", "chat-3"} {
+		_, err := svc.StartChat(ctx, id, "assistant")
+		require.NoError(t, err)
+	}
+
+	t.Run("startChatCmd", func(t *testing.T) {
+		m := Model{svc: svc, ctx: ctx}
+		started, ok := m.startChatCmd("assistant")().(chatStartedMsg)
+		require.True(t, ok)
+		require.NoError(t, started.err)
+		assert.Equal(t, 4, started.sessionCount, "the chat this just created counts too")
+	})
+
+	t.Run("startNewChatCmd", func(t *testing.T) {
+		c := newChatModel("chat-1", "assistant", nil, "m1", 80, 24)
+		started, ok := c.startNewChatCmd(svc, ctx)().(chatStartedMsg)
+		require.True(t, ok)
+		require.NoError(t, started.err)
+		assert.Equal(t, 5, started.sessionCount)
+	})
+
+	t.Run("resumeChatCmd", func(t *testing.T) {
+		started, ok := resumeChatCmd(svc, ctx, "chat-1")().(chatStartedMsg)
+		require.True(t, ok)
+		require.NoError(t, started.err)
+		assert.Equal(t, 5, started.sessionCount, "resuming doesn't create a chat, so the count is unchanged")
+	})
+}
+
+// TestModel_ChatStartedMsg_SeedsSessionCount is the plumbing check behind
+// TestChatStartedMsg_CarriesSessionCount: whatever count the message
+// carries must actually reach the chatModel the sidebar reads it from.
+func TestModel_ChatStartedMsg_SeedsSessionCount(t *testing.T) {
+	m := Model{width: 80, height: 24}
+
+	next, _ := m.Update(chatStartedMsg{chatID: "chat-1", agentName: "assistant", model: "m1", sessionCount: 7})
+	m = next.(Model)
+	require.NotNil(t, m.chat)
+
+	assert.Equal(t, 7, m.chat.sessionCount)
+	assert.Contains(t, m.chat.renderSidebar(), "History: 7")
+}
+
 // TestChatModel_PickerHistoryDelete_RequiresConfirmation drives "d" in the
 // in-chat ctrl+h overlay end-to-end (post-v0.1.0 addendum): the first "d"
 // on an item only arms confirmDelete's prompt — the item must still be
@@ -1267,6 +1319,7 @@ func TestChatModel_PickerHistoryDelete_RequiresConfirmation(t *testing.T) {
 	m = next.(Model)
 	require.NotNil(t, m.chat.picker)
 	require.Len(t, m.chat.picker.Items(), 2, "the current chat must be excluded, leaving chat-x and chat-y")
+	assert.Equal(t, 3, m.chat.sessionCount, "loading ctrl+h refreshes the History count from the full list, current chat included")
 
 	// Select whichever item is chat-x — recency-sorted, not assumed to
 	// land at a fixed index.
@@ -1297,6 +1350,7 @@ func TestChatModel_PickerHistoryDelete_RequiresConfirmation(t *testing.T) {
 	next2, _ := m.Update(deletedMsg)
 	m = next2.(Model)
 	require.Len(t, m.chat.picker.Items(), 1, "a confirmed delete must remove just that one item")
+	assert.Equal(t, 2, m.chat.sessionCount, "the sidebar's History count must follow the delete down from 3")
 	remaining := m.chat.picker.Items()[0].(historyPickerItem)
 	assert.Equal(t, "chat-y", remaining.chatID)
 

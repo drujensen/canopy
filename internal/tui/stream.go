@@ -106,6 +106,16 @@ type chatStartedMsg struct {
 	// so --continue/ctrl+h shows the chat's running cost immediately
 	// rather than resetting it to zero until the next turn completes.
 	usage map[string]entities.ModelUsage
+
+	// sessionCount is how many chats are persisted at the moment this chat
+	// starts — the sidebar's "History: N" value, sitting next to Tools/
+	// Skills as another "what's here" count. Resolved by every producer
+	// (sessionCountOf), the same way capabilities is, so the number is
+	// already correct the first time the chat screen renders; from then on
+	// Model.Update keeps it current from historyLoadedMsg/chatDeletedMsg
+	// (loadHistoryCmd's own doc comment explains why counting has to be a
+	// disk read rather than a synchronous in-memory one).
+	sessionCount int
 }
 
 // resumeChatCmd loads chatID's full state (post-v0.1.0 addendum: ctrl+h
@@ -142,6 +152,10 @@ func resumeChatCmd(svc *services.AgentService, ctx context.Context, chatID strin
 		if err != nil {
 			return chatStartedMsg{err: fmt.Errorf("loading agent capabilities: %w", err)}
 		}
+		sessions, err := sessionCountOf(svc, ctx)
+		if err != nil {
+			return chatStartedMsg{err: fmt.Errorf("counting chats: %w", err)}
+		}
 		return chatStartedMsg{
 			chatID:       chatID,
 			agentName:    chat.AgentName,
@@ -150,6 +164,7 @@ func resumeChatCmd(svc *services.AgentService, ctx context.Context, chatID strin
 			messages:     chat.Messages,
 			capabilities: capabilities,
 			usage:        chat.Usage,
+			sessionCount: sessions,
 		}
 	}
 }
@@ -177,6 +192,21 @@ func loadHistoryCmd(svc *services.AgentService, ctx context.Context) tea.Cmd {
 		summaries, err := svc.ListChatSummaries(ctx)
 		return historyLoadedMsg{summaries: summaries, err: err}
 	}
+}
+
+// sessionCountOf resolves how many chats are persisted right now — the
+// sidebar's "History: N" value (chatStartedMsg.sessionCount). Reuses
+// ListChatSummaries rather than reaching past AgentService to
+// interfaces.ChatRepository.List, for the same reason loadHistoryCmd goes
+// through the service: the repository's List is the only way to count
+// (there's no cheaper Count method to reach for), and the service is
+// already the one place that owns that dependency.
+func sessionCountOf(svc *services.AgentService, ctx context.Context) (int, error) {
+	summaries, err := svc.ListChatSummaries(ctx)
+	if err != nil {
+		return 0, err
+	}
+	return len(summaries), nil
 }
 
 // chatDeletedMsg reports the outcome of deleting a chat (post-v0.1.0

@@ -308,6 +308,48 @@ func TestRenderSidebar_LongModelNameStaysOneRow(t *testing.T) {
 	assert.NotContains(t, rendered, longName)
 }
 
+// TestRenderSidebar_HistoryShowsSessionCount asserts the sidebar's History
+// line carries the persisted-chat count, rendered from the same
+// sidebarSettingLine helper as the Tools/Skills counts so it reads as one
+// more "what's here" number rather than as an action-only row.
+func TestRenderSidebar_HistoryShowsSessionCount(t *testing.T) {
+	c := newChatModel("chat-1", "assistant", nil, "m1", 80, 24)
+	c.sessionCount = 10
+
+	rendered := c.renderSidebar()
+
+	assert.Contains(t, rendered, "History: 10")
+	assert.Contains(t, rendered, sidebarSettingLine("History: 10", "^H"),
+		"the count must be laid out exactly like Tools/Skills (value, then the right-aligned ^X hint)")
+}
+
+// TestRenderSidebar_HistoryDefaultsToZero asserts a chatModel nobody has
+// counted sessions for yet (what newChatModel itself leaves, since only
+// Model.Update's chatStartedMsg case seeds a real value) renders "History:
+// 0" rather than a bare "History" or a blank — the zero value still reads
+// as a count, the same way "Tools: 0" would.
+func TestRenderSidebar_HistoryDefaultsToZero(t *testing.T) {
+	c := newChatModel("chat-1", "assistant", nil, "m1", 80, 24)
+	assert.Contains(t, c.renderSidebar(), "History: 0")
+}
+
+// TestRenderSidebar_HistoryPrecedesCost pins the sidebar's ordering: the
+// History count sits directly above Cost, so the count rows (Tools, Skills,
+// History) stay grouped and the ctrl+h hint sits next to the number it
+// opens.
+func TestRenderSidebar_HistoryPrecedesCost(t *testing.T) {
+	c := newChatModel("chat-1", "assistant", nil, "m1", 80, 24)
+	c.usage = map[string]entities.ModelUsage{"m1": {CostUSD: 0.0123}}
+
+	rendered := c.renderSidebar()
+
+	historyAt := strings.Index(rendered, "History:")
+	costAt := strings.Index(rendered, "Cost:")
+	require.NotEqual(t, -1, historyAt, "the sidebar must still show History")
+	require.NotEqual(t, -1, costAt, "the sidebar must still show Cost")
+	assert.Less(t, historyAt, costAt, "History must render above Cost")
+}
+
 // TestRenderSidebar_LongNamesKeepEveryRowUniform is the broader structural
 // regression guard behind the two tests above: with over-long agent and
 // model names present, every rendered sidebar row must still be exactly as
