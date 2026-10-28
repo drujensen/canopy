@@ -9,6 +9,7 @@
 package skillsource
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -34,6 +35,16 @@ type frontmatter struct {
 	Description string `yaml:"description"`
 }
 
+// malformedSkillError marks errors caused by invalid skill content. File
+// system errors remain ordinary errors so callers can still fail loudly when
+// a skill exists but cannot be read.
+type malformedSkillError struct {
+	err error
+}
+
+func (e *malformedSkillError) Error() string { return e.err.Error() }
+func (e *malformedSkillError) Unwrap() error { return e.err }
+
 // Load scans three sources, in ascending precedence order:
 //
 //  1. homeDir/.canopy/skills/*/SKILL.md — Canopy-generated defaults (see
@@ -46,9 +57,9 @@ type frontmatter struct {
 // result is a map of skill name -> SkillDefinition. On a name conflict, the
 // higher-precedence source wins: project beats personal, and personal beats
 // a Canopy-generated default. Missing directories are not an error and
-// simply contribute no definitions. A malformed file produces a clear,
-// specific error identifying the file and what's wrong (fail loud, per
-// docs/DESIGN.md §8) rather than being silently skipped.
+// simply contribute no definitions. A malformed skill is skipped with a
+// warning naming the file and the parse error; one broken skill must not
+// prevent the remaining skills (or Canopy) from loading.
 func Load(projectRoot, homeDir string) (map[string]SkillDefinition, error) {
 	canopyDefaults, err := loadDir(filepath.Join(homeDir, ".canopy", "skills"))
 	if err != nil {
@@ -113,7 +124,12 @@ func loadDir(dir string) (map[string]SkillDefinition, error) {
 
 		def, err := parseSkillFile(skillFile, skillDir)
 		if err != nil {
-			return nil, err
+			var malformed *malformedSkillError
+			if !errors.As(err, &malformed) {
+				return nil, err
+			}
+			fmt.Fprintf(os.Stderr, "canopy: warning: skipping invalid skill file %s: %v\n", skillFile, err)
+			continue
 		}
 		result[def.Name] = def
 	}
@@ -129,19 +145,21 @@ func parseSkillFile(path, dir string) (SkillDefinition, error) {
 
 	fm, body, err := splitFrontmatter(string(raw))
 	if err != nil {
-		return SkillDefinition{}, fmt.Errorf("skill file %s: %w", path, err)
+		return SkillDefinition{}, fmt.Errorf("skill file %s: %w", path, &malformedSkillError{err: err})
 	}
 
 	var parsed frontmatter
 	if err := yaml.Unmarshal([]byte(fm), &parsed); err != nil {
-		return SkillDefinition{}, fmt.Errorf("skill file %s: invalid YAML frontmatter: %w", path, err)
+		return SkillDefinition{}, fmt.Errorf("skill file %s: invalid YAML frontmatter: %w", path, &malformedSkillError{err: err})
 	}
 
 	if strings.TrimSpace(parsed.Name) == "" {
-		return SkillDefinition{}, fmt.Errorf("skill file %s: frontmatter missing required field %q", path, "name")
+		err := fmt.Errorf("frontmatter missing required field %q", "name")
+		return SkillDefinition{}, fmt.Errorf("skill file %s: %w", path, &malformedSkillError{err: err})
 	}
 	if strings.TrimSpace(parsed.Description) == "" {
-		return SkillDefinition{}, fmt.Errorf("skill file %s: frontmatter missing required field %q", path, "description")
+		err := fmt.Errorf("frontmatter missing required field %q", "description")
+		return SkillDefinition{}, fmt.Errorf("skill file %s: %w", path, &malformedSkillError{err: err})
 	}
 
 	return SkillDefinition{

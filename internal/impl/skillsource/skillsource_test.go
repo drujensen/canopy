@@ -96,34 +96,38 @@ func TestLoad_SkipsDirsWithoutSkillFile(t *testing.T) {
 	assert.Empty(t, defs)
 }
 
-func TestLoad_MalformedFrontmatter_MissingFences(t *testing.T) {
+func TestLoad_MalformedFrontmatter_IsSkipped(t *testing.T) {
 	projectRoot := t.TempDir()
 	homeDir := t.TempDir()
 
-	path := filepath.Join(projectRoot, ".claude", "skills", "broken", "SKILL.md")
-	writeFile(t, path, "no frontmatter at all\n")
+	brokenPath := filepath.Join(projectRoot, ".claude", "skills", "broken", "SKILL.md")
+	writeFile(t, brokenPath, "no frontmatter at all\n")
+	writeFile(t, filepath.Join(projectRoot, ".claude", "skills", "valid", "SKILL.md"), `---
+name: valid
+description: A valid skill.
+---
+Body.
+`)
 
-	_, err := Load(projectRoot, homeDir)
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), path)
-	assert.Contains(t, err.Error(), "frontmatter")
+	defs, err := Load(projectRoot, homeDir)
+	require.NoError(t, err)
+	assert.NotContains(t, defs, "broken")
+	assert.Contains(t, defs, "valid")
 }
 
-func TestLoad_MalformedFrontmatter_MissingRequiredField(t *testing.T) {
+func TestLoad_MalformedFrontmatter_MissingRequiredField_IsSkipped(t *testing.T) {
 	projectRoot := t.TempDir()
 	homeDir := t.TempDir()
 
-	path := filepath.Join(projectRoot, ".claude", "skills", "no-name", "SKILL.md")
-	writeFile(t, path, `---
+	writeFile(t, filepath.Join(projectRoot, ".claude", "skills", "no-name", "SKILL.md"), `---
 description: Missing a name.
 ---
 Body.
 `)
 
-	_, err := Load(projectRoot, homeDir)
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), path)
-	assert.Contains(t, err.Error(), "name")
+	defs, err := Load(projectRoot, homeDir)
+	require.NoError(t, err)
+	assert.Empty(t, defs)
 }
 
 // TestLoad_CanopyDefaultSource covers the third, lowest-precedence source

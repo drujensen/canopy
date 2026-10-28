@@ -1057,9 +1057,15 @@ dispatched subagent has no `Chat` of its own to read one from in the first place
 - MAF-Go public-preview API churn — pin version, track upstream changelog before upgrading.
 - Go 1.25 toolchain bump required.
 - File-format compatibility (§3.11) is Canopy-maintained, not guaranteed by any dependency —
-  Claude Code's subagent/`.mcp.json` formats aren't formally versioned, so the loaders should be
-  built to fail loud and specific (clear error on a file it can't parse) rather than silently
-  ignoring a definition it doesn't understand.
+  Claude Code's subagent/`.mcp.json` formats aren't formally versioned. Agent and MCP loaders
+  fail loud and specific (clear error on a file they can't parse); the skills loader is deliberately
+  more resilient because skills are optional: it skips malformed individual `SKILL.md` files and
+  emits a warning naming each skipped file, while still failing on directory/filesystem errors.
+- Skill files with malformed or incomplete frontmatter are skipped individually with a startup
+  warning naming the file and parse error; a broken optional skill must not prevent Canopy from
+  loading the remaining skills or starting. I/O failures while scanning the skill directories
+  (for example, an unreadable directory) remain fatal because they indicate a broader
+  configuration or permissions problem.
 - The "faster and lighter" goal (Requirements §4.9) is now verified, not assumed — the plan's
   Phase 8 (v0.1.0) measured it, and `docs/BENCHMARKS.md` records the real figures;
   re-measure before re-asserting the claim if a future dependency upgrade changes Canopy's
