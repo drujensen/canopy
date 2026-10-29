@@ -247,6 +247,28 @@ out of scope and aren't repeated here).
     (DESIGN.md), and decide whether Canopy's own default is tight enough. If it doesn't, add a
     configurable per-turn ceiling (max tool calls and/or a wall-clock timeout) in `impl/harness`,
     surfaced as a clear error/stop rather than a silent infinite loop.
+  - **Stall-timeout half DONE (2026-10-29), from a real incident:** a self-hosted Ollama request
+    went completely silent mid-stream (GPU idle, zero SSE events) while the host memory-thrashed
+    processing an oversized, uncompacted prompt — and `TimeoutSeconds` (the only existing timeout)
+    turned out to bound only the wait for a response's *headers*, not an already-started streaming
+    body, so nothing caught it; "esc" (`cancelTurn`) exists but depends on Canopy's own process
+    staying responsive, which a thrashing machine can't guarantee. Fixed with a new opt-in
+    `entities.ProviderConfig.StallTimeoutSeconds`: a watchdog (`impl/providers/stalltimeout.go`)
+    that aborts a response if zero bytes arrive for the configured window, wired identically into
+    every provider construction path (native OpenAI, Anthropic, Gemini, OpenAI-compatible, Ollama)
+    — no provider-type special-casing. A response that's merely slow but still producing bytes is
+    never aborted, no matter its total duration. The max-turns/max-tool-calls ceiling above is
+    still open; this only closes the "went completely silent" half of the guardrail.
+  - The same incident's other half was a config issue, not a guardrail gap: `context_window_tokens`
+    (auto-detected from models.dev, sizes `impl/harness/compaction.go`'s trigger) had let a local
+    27B model's conversation grow to ~192K tokens before ever compacting, then sent that whole
+    prompt to a box that couldn't back it. Auto-detection deliberately stays unchanged — it was
+    tempting to special-case self-hosted providers there too, but `ContextWindowTokens` is already
+    write-once (a later `--refresh-providers` never touches an existing model's value — see that
+    field's doc comment), so the fix is the config override the field already supports: lower or
+    remove it by hand in `providers.json` for a self-hosted model whose real usable context is
+    smaller than the catalog's theoretical max. No code change; see the README's provider-config
+    section for the documented guidance.
 
 - **Git-aware safety net.** With no approval-gating, the implicit assumption is "git is the user's
   safety net," but nothing today makes that easy: no dirty-tree warning before a multi-file

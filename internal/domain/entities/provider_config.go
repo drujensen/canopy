@@ -60,6 +60,25 @@ type ProviderConfig struct {
 	// already-started streaming response body, only on how long Canopy
 	// waits for the response to *begin*.
 	TimeoutSeconds int `json:"timeout_seconds,omitempty"`
+
+	// StallTimeoutSeconds bounds how long impl/providers will keep waiting
+	// once a response has already started streaming without receiving any
+	// further bytes (post-v0.1.0 addendum) — complementary to
+	// TimeoutSeconds, not a replacement for it: TimeoutSeconds only governs
+	// the wait for a response to *begin* (its doc comment above), so a
+	// request that gets headers back quickly and then goes completely
+	// silent mid-stream is, today, unbounded by TimeoutSeconds at all. Zero
+	// disables this watchdog entirely — opt-in, since a sensible value
+	// depends on how slow a provider's first token can legitimately be (a
+	// cold-loading local model vs. an always-warm hosted API), and guessing
+	// wrong is worse than asking the provider's owner to set it once where
+	// it matters. A response that's merely slow but still producing bytes
+	// is never aborted by this, no matter how long the whole response
+	// takes — only a genuine gap with zero progress trips it. See
+	// impl/providers/stalltimeout.go for the real incident (a self-hosted
+	// Ollama request that went silent mid-generation while the host
+	// memory-thrashed) that prompted adding this.
+	StallTimeoutSeconds int `json:"stall_timeout_seconds,omitempty"`
 }
 
 // ModelConfig pairs a model with one configured provider and its invocation
@@ -87,6 +106,21 @@ type ModelConfig struct {
 	// set this before compaction works. Follow-up: seed this automatically
 	// from known-model tables per provider instead of requiring manual
 	// configuration.
+	//
+	// impl/config.DetectProviders auto-populates this from the models.dev
+	// catalog's own value for every provider type, including self-hosted
+	// ones (Ollama, or a self-hosted server behind the generic
+	// OpenAI-compatible fallback) — deliberately not special-cased, since
+	// the catalog's number is a model's theoretical architecture max, not a
+	// claim about what memory any particular box has behind it. If you're
+	// self-hosting and the model's real usable context is smaller than
+	// what got auto-detected, lower (or remove) this by hand in
+	// providers.json: a model's ContextWindowTokens is only ever written
+	// once, when it's first added, and a later --refresh-providers run
+	// never overwrites an existing model's value for this field (unlike
+	// per-model cost, which does stay synced — see
+	// cmd/canopy/main.go's updateExistingModelCosts) — so a correction
+	// made here is permanent.
 	ContextWindowTokens int `json:"context_window_tokens,omitempty"`
 
 	// InputCostPerMillionTokens and OutputCostPerMillionTokens are the

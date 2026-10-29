@@ -68,6 +68,22 @@ func fixtureCatalog() *modelsdev.Catalog {
 				},
 			},
 		},
+		"ollama": {
+			ID:      "ollama",
+			Name:    "Ollama",
+			Env:     []string{"OLLAMA_API_KEY"},
+			BaseURL: "https://ollama.example.com",
+			Models: map[string]modelsdev.ModelData{
+				"qwen3.8": {
+					ID: "qwen3.8", ToolCall: true, ReleaseDate: "2025-01-01",
+					// A real-world value from models.dev for this model
+					// family — the model's theoretical architecture max, with
+					// no idea what RAM a self-hosted Ollama server actually
+					// has backing it.
+					Limit: modelsdev.LimitData{Context: 256000},
+				},
+			},
+		},
 		"nobase": {
 			ID:   "nobase",
 			Name: "No Base URL Provider",
@@ -199,6 +215,30 @@ func TestDetectProviders_GenericProviderUsesCatalogIDAsType(t *testing.T) {
 	// (missing "/v1", confirmed to 404) to the working URL — see that var's
 	// doc comment in detect.go.
 	assert.Equal(t, "https://api.deepseek.com/v1", provider.BaseURL)
+}
+
+// TestDetectProviders_OllamaContextWindowTokensComesFromCatalogLikeAnyOther
+// proves auto-detection does NOT special-case Ollama (or any other provider
+// type): ContextWindowTokens always comes straight from the catalog, the
+// same as every other provider. A self-hosted model's actual memory limits
+// are something only its owner can know, so the correction belongs in
+// providers.json (a one-time write — see DetectProviders' doc comment on
+// why a later --refresh-providers run never touches this field again on an
+// existing model), not in per-provider-type logic here.
+func TestDetectProviders_OllamaContextWindowTokensComesFromCatalogLikeAnyOther(t *testing.T) {
+	environ := []string{"OLLAMA_API_KEY=real-key"}
+
+	file, detected, _ := DetectProviders(fixtureCatalog(), environ)
+
+	require.Contains(t, detected, "ollama")
+	var model entities.ModelConfig
+	for _, m := range file.Models {
+		if m.Provider == "ollama" {
+			model = m
+		}
+	}
+	require.Equal(t, "qwen3.8", model.ModelName)
+	assert.Equal(t, 256000, model.ContextWindowTokens)
 }
 
 func TestDetectProviders_EnvVarNotSetIsSkipped(t *testing.T) {

@@ -207,6 +207,25 @@ func DetectProviders(catalog *modelsdev.Catalog, environ []string) (file Provide
 			BaseURL:   baseURL,
 		})
 		for _, model := range models {
+			// ContextWindowTokens here is the catalog's value for every
+			// provider type, including self-hosted ones (Ollama, or a
+			// generic OpenAI-compatible self-hosted server) — it's a
+			// model's theoretical architecture max, not a claim about what
+			// a *particular* self-hosted box can actually back with real
+			// memory, and auto-detection has no way to know that. This is
+			// deliberately not special-cased per provider type: the
+			// correction belongs in providers.json (see that field's doc
+			// comment on entities.ModelConfig and the README's provider-
+			// config section), the same one-time, user-owned override path
+			// every other auto-detected field already relies on — this
+			// write only ever happens once, the moment a model is first
+			// added (mergeNewProviders/mergeNewModelsForExistingProviders,
+			// cmd/canopy/main.go); a later --refresh-providers run never
+			// touches an existing model's ContextWindowTokens again
+			// (unlike cost, which updateExistingModelCosts deliberately
+			// does keep fresh — see that function's doc comment for why
+			// cost and everything else get different treatment), so a
+			// value corrected by hand here is permanent.
 			file.Models = append(file.Models, entities.ModelConfig{
 				Name:                       name + "/" + model.ID,
 				Provider:                   name,

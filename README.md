@@ -83,6 +83,22 @@ doesn't match any configured model is logged and ignored rather than erroring �
 gitignored by default, one teammate missing a pinned local model shouldn't break the agent for
 them.
 
+Two provider-level timeouts exist for a slow or unreliable backend, and they cover different parts
+of a request's lifetime — set them independently:
+
+- `timeout_seconds` bounds how long Canopy waits for a response to **begin** (its headers). Useful
+  for a provider that can be slow to even start responding (a self-hosted model cold-loading).
+  Zero/unset falls back to the provider SDK's own default.
+- `stall_timeout_seconds` bounds how long Canopy will keep waiting once a response has **already
+  started streaming** without receiving any further bytes — `timeout_seconds` has no effect once
+  the body is streaming, so without this a request that gets headers back quickly and then goes
+  silent mid-generation is unbounded. A response that's merely slow but still producing bytes, no
+  matter how long it takes in total, is never aborted by this — only a genuine gap with zero
+  progress trips it. Zero/unset disables it. Most useful for self-hosted/local providers (Ollama),
+  where a stalled or memory-thrashing backend can otherwise look identical to a working one from the
+  outside (no error, just silence) until the much longer `timeout_seconds` (if even set) eventually
+  elapses.
+
 The nine `type` values with first-class adapters are `openai`, `anthropic`, `gemini`, `deepseek`,
 `ollama`, `groq`, `mistral`, `together`, and `xai`. Any other `type` also works as long as
 `base_url` is set — it's routed through the generic OpenAI-compatible adapter, so a provider not on
@@ -102,7 +118,18 @@ run Canopy:
 2. Fetches the free [models.dev](https://models.dev) catalog (24h-cached locally, no
    authentication), checks which provider API-key environment variables are already set, and
    writes a `providers.json` pairing each match with its most recently released tool-call-capable
-   model. The provider's API key is stored as `api_key_env`, never as a literal.
+   model, including each model's `context_window_tokens` from the catalog. The provider's API key
+   is stored as `api_key_env`, never as a literal.
+
+   `context_window_tokens` drives when Canopy's own compaction kicks in (Design §3.5) — worth a
+   second look if auto-detection ever matches a *self-hosted* provider (e.g. a reverse-proxied
+   Ollama server reachable via its own env-var-matched API key, not just bare `localhost`): the
+   catalog's number is a model's theoretical architecture max, with no idea how much memory your
+   own box actually has behind it. If a self-hosted model's real usable context is smaller,
+   lower (or remove) `context_window_tokens` for it in `providers.json` by hand — this field is
+   only ever written once, when a model is first added, so a value you correct here is permanent;
+   a later `--refresh-providers` run never overwrites it (unlike per-model cost, which does stay
+   synced).
 
 Ordinary startup afterwards re-syncs against the cached catalog, additively: newly detectable
 providers and newly listed models get added, models the catalog no longer lists for a re-detected

@@ -98,6 +98,7 @@ func newOpenAINative(cfg entities.ProviderConfig, model entities.ModelConfig, ag
 		opts = append(opts, openaioption.WithBaseURL(cfg.BaseURL))
 	}
 	opts = append(opts, openaiTimeoutOptions(cfg)...)
+	opts = append(opts, openaiStallTimeoutOption(cfg)...)
 	client := openai.NewClient(opts...)
 	return openaiprovider.NewResponsesAgent(client, openaiprovider.AgentConfig{
 		Config:             agentCfg,
@@ -114,6 +115,9 @@ func newAnthropic(cfg entities.ProviderConfig, model entities.ModelConfig, agent
 	}
 	if cfg.TimeoutSeconds > 0 {
 		opts = append(opts, anthropicoption.WithRequestTimeout(time.Duration(cfg.TimeoutSeconds)*time.Second))
+	}
+	if d := stallTimeoutDuration(cfg); d > 0 {
+		opts = append(opts, anthropicoption.WithHTTPClient(&http.Client{Transport: newStallTimeoutTransport(nil, d)}))
 	}
 	client := anthropic.NewClient(opts...)
 	return anthropicprovider.NewAgent(client, anthropicprovider.AgentConfig{
@@ -166,7 +170,7 @@ func newGemini(ctx context.Context, cfg entities.ProviderConfig, model entities.
 	}
 	clientCfg := &genai.ClientConfig{
 		APIKey:      cfg.APIKey,
-		HTTPClient:  &http.Client{Transport: newGeminiFunctionCallIDPatchingTransport(http.DefaultTransport)},
+		HTTPClient:  &http.Client{Transport: newGeminiFunctionCallIDPatchingTransport(newStallTimeoutTransport(nil, stallTimeoutDuration(cfg)))},
 		HTTPOptions: httpOptions,
 	}
 	client, err := genai.NewClient(ctx, clientCfg)

@@ -52,7 +52,7 @@ func newOllama(cfg entities.ProviderConfig, model entities.ModelConfig, agentCfg
 		return nil, fmt.Errorf("providers: provider %q (%s) has an invalid base_url %q: %w", cfg.Name, cfg.Type, cfg.BaseURL, err)
 	}
 
-	httpClient := newOllamaHTTPClient(nil)
+	httpClient := newOllamaHTTPClient(newStallTimeoutTransport(nil, stallTimeoutDuration(cfg)))
 	opts := []option.RequestOption{
 		option.WithBaseURL(baseURL),
 		option.WithAPIKey(cfg.APIKey),

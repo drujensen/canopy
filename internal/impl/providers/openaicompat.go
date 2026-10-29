@@ -145,6 +145,7 @@ func newOpenAICompatible(cfg entities.ProviderConfig, model entities.ModelConfig
 		openaiRetryableStatusOption(),
 	}
 	opts = append(opts, openaiTimeoutOptions(cfg)...)
+	opts = append(opts, openaiStallTimeoutOption(cfg)...)
 	client := openai.NewClient(opts...)
 	return openaiprovider.NewChatCompletionsAgent(client, openaiprovider.AgentConfig{
 		Config: agentCfg,
