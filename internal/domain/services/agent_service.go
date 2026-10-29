@@ -61,7 +61,7 @@ import (
 // (see coreTools) — so its presence in this fixed name list matters for
 // allowlist validation and MCP-name-collision avoidance (isCoreToolName)
 // even on a deployment where it isn't currently offered.
-var coreToolNames = []string{"Bash", "FileRead", "FileWrite", "FileSearch", "DirectoryList", "WebFetch", "WebSearch", "Skill"}
+var coreToolNames = []string{"Bash", "FileRead", "FileWrite", "FileEdit", "FileSearch", "DirectoryList", "WebFetch", "WebSearch", "Skill"}
 
 // isCoreToolName reports whether name is one of the seven core built-in tool
 // names, used at NewAgentService construction time to keep a same-named MCP
@@ -1582,6 +1582,7 @@ func (s *AgentService) coreTools() (map[string]tool.Tool, error) {
 		"Bash":          bash,
 		"FileRead":      tools.NewFileReadTool(tools.FileReadConfig{Root: s.toolsCfg.WorkingRoot}),
 		"FileWrite":     tools.NewFileWriteTool(tools.FileWriteConfig{Root: s.toolsCfg.WorkingRoot}),
+		"FileEdit":      tools.NewFileEditTool(tools.FileEditConfig{Root: s.toolsCfg.WorkingRoot}),
 		"FileSearch":    tools.NewFileSearchTool(tools.FileSearchConfig{Root: s.toolsCfg.WorkingRoot}),
 		"DirectoryList": tools.NewDirectoryListTool(tools.DirectoryListConfig{Root: s.toolsCfg.WorkingRoot}),
 		"WebFetch":      tools.NewWebFetchTool(tools.WebFetchConfig{HTTPClient: s.toolsCfg.WebFetchHTTPClient}),

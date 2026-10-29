@@ -18,6 +18,7 @@ restating them.
 | 0–8 | **Done** — shipped as `v0.1.0`, tagged at commit `c731abd`. |
 | 9 (post-v0.1.0) | **Done** — 34 commits after the tag, latest `5742933`. |
 | 10 (deferred/candidate) | **Not started, not scheduled** — real, stated-but-unscoped work, carried forward. |
+| 11 (Edit tool, read-only agents, agent/model pinning) | **Not started** — scoped below, starting with the Edit tool. |
 
 Build/test/lint commands and QA workflow: see `AGENTS.md`. Benchmark numbers: see
 `docs/BENCHMARKS.md`.
@@ -133,6 +134,76 @@ governance note). Nothing here is assumed to be next.
 
 (Deferred items are *candidates awaiting scope*, not a committed roadmap — picking one up means
 writing its requirements/exit criteria into a new numbered phase first, not just starting.)
+
+---
+
+## Phase 11 — Edit tool, specialized read-only agents, agent/model pinning (NOT started)
+
+Scoped out of a design-review conversation (2026-10-28) critiquing the built-in agent/tool set for
+gaps, not carried forward as a vague idea — this phase exists so the three items below don't go
+the same "addendum in a comment, never in the plan" route Phase 9 had to retroactively fix (see the
+Governance note). Starting with the Edit tool; the other two follow.
+
+- **Targeted `Edit` tool (no exit criteria met yet).** `internal/impl/tools/file_write.go` only
+  supports full-file overwrite (`FileWriteInput.Content` — "Overwrites any existing file at
+  path"), with no Claude-Code-`Edit`-equivalent string-replace tool. Every single-line fix
+  currently forces the model to retransmit the whole file, costing output tokens proportional to
+  file size instead of change size, and risking silent corruption wherever the model's memory of
+  untouched lines drifts from disk — worse on smaller/local models, which are far more likely to
+  mangle a large verbatim retransmission than a targeted diff.
+  - Exit criteria: new `tool.FuncTool` (`NewFileEditTool` or similar) taking `{path, old_string,
+    new_string, replace_all}`; same path-safety confinement as `FileRead`/`FileWrite`
+    (`pathsafety.go`); errors (not silent no-ops) when `old_string` isn't found, or isn't unique
+    and `replace_all` is false; same added/removed line-stat output `FileWriteOutput` already
+    gives the TUI; unit tests; wired into the tool-name allowlist agent frontmatter `tools:` lines
+    reference (alongside `FileWrite`, not replacing it — full overwrite still has legitimate uses,
+    e.g. creating a new file).
+
+- **Three new built-in read-only agents: `explore`, `review`, `debug`.** Current built-in set
+  (`general` + the four SDLC personas) has no agent that's safe to delegate to regardless of which
+  model backs it, because none of them withhold write access. A read-only agent is low-risk to
+  dispatch even to a weak/untrusted model, since it cannot mutate anything no matter how it
+  misbehaves.
+  - `explore` — `FileRead`/`FileSearch`/`DirectoryList` only. Fast, cheap, parallelizable codebase
+    locator; primary value is keeping a parent agent's own context clean by returning only findings,
+    not every file it had to open to get there.
+  - `review` — read-only code-review / second-opinion pass, severity-rated findings, no write
+    access.
+  - `debug` — root-cause/regression-investigation persona (reproduce → isolate → hypothesize),
+    distinct from `execute`'s build-first framing; needs `Bash` to actually reproduce/run tests,
+    otherwise read-only.
+  - `general.md`'s system prompt gets a short delegation paragraph (mirroring `execute.md`'s
+    existing one) once these three exist, since `AgentService.buildTopLevelTools` already wraps
+    every other loaded agent as a dispatch tool for `general` — nothing currently tells `general`
+    to actually reach for them.
+  - Exit criteria: three new `.md` defaults added to `agentsource.WriteDefaults`'s seeded set
+    (`~/.canopy/agents`, per-file idempotent like the existing five); picked up automatically by the
+    `ctrl+a` picker and by every other agent's subagent-dispatch wrapping; `general.md` updated;
+    fixture/loader tests extended to cover the three new names.
+
+- **Project-level agent → model pinning.** Today `resolveModelName` (`agent_service.go:1265`)
+  only has two tiers below the model catalog itself — `chat.ModelOverride` (session, ctrl+o) and
+  the agent definition's own `model:` frontmatter — so pinning a specific model to a specific agent
+  *for one project* currently means forking that agent's entire `.md` file into
+  `.claude/agents/`, freezing its prompt body at whatever it said the day it was forked. Add a
+  third tier instead: an optional `agent_models` map in the existing project-local
+  `.canopy/providers.json` (already gitignored/per-checkout, no new config file needed) naming a
+  model per agent name, resolved between `chat.ModelOverride` and the agent's own frontmatter
+  `model:`.
+  - Precedence: `chat.ModelOverride` → project `agent_models[name]` → agent frontmatter `model:` →
+    `defaultModel`.
+  - Must fail soft: if `agent_models` names a model not present in the resolved model list (e.g. a
+    teammate without the pinned local Ollama model running, if this file is ever deliberately
+    checked in despite the default gitignore), log and fall through to the next tier — the same
+    "one bad config doesn't break everything" posture DESIGN.md §3.4's bugfix addendum already
+    established for subagent construction — not a hard error.
+  - Also fixes a related gap: switching agents mid-chat via `ctrl+a` currently leaves a stale
+    `chat.ModelOverride` in place, silently overriding the newly-selected agent's own pin (project
+    or frontmatter) until the user manually clears it with a second `ctrl+o`. Agent switch should
+    re-resolve through both pin tiers rather than carrying the old override forward unconditionally.
+  - Exit criteria: `agent_models` field added to the provider-config schema (`impl/config`) and
+    `resolveModelName`/`resolveProviderModel`; ctrl+a re-resolution fix; tests covering precedence
+    order and the fail-soft fallback.
 
 ---
 

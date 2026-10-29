@@ -203,13 +203,13 @@ func TestAgentService_BuildTools(t *testing.T) {
 			name:          "empty allowlist inherits every core tool",
 			allowlist:     nil,
 			withBackend:   true,
-			wantToolCount: 7,
+			wantToolCount: 8,
 		},
 		{
 			name:          "empty allowlist without a search backend omits WebSearch",
 			allowlist:     nil,
 			withBackend:   false,
-			wantToolCount: 6,
+			wantToolCount: 7,
 		},
 		{
 			name:          "explicit subset",
@@ -269,10 +269,10 @@ func TestAgentService_BuildTools_MCPTools(t *testing.T) {
 		svc := newSvc(t)
 		got, err := svc.buildTools(agentsource.AgentDefinition{Name: "assistant"})
 		require.NoError(t, err)
-		// 6 core tools (no WebSearchBackend configured, so WebSearch is
+		// 7 core tools (no WebSearchBackend configured, so WebSearch is
 		// omitted, matching TestAgentService_BuildTools' own count for that
 		// case) + 1 MCP tool.
-		assert.Len(t, got, 7)
+		assert.Len(t, got, 8)
 		assert.True(t, containsToolName(got, "search_docs"))
 	})
 
@@ -306,10 +306,10 @@ func TestAgentService_BuildTools_MCPToolCollidesWithCoreToolName(t *testing.T) {
 
 	got, err := svc.buildTools(agentsource.AgentDefinition{Name: "assistant"})
 	require.NoError(t, err)
-	// 6 core tools (no WebSearchBackend) and no extra entry for the
+	// 7 core tools (no WebSearchBackend) and no extra entry for the
 	// colliding "Bash" MCP tool — it must not be double-counted or replace
 	// the real Bash tool.
-	assert.Len(t, got, 6)
+	assert.Len(t, got, 7)
 }
 
 type stubBackend struct{}
@@ -401,10 +401,10 @@ func TestAgentService_BuildTopLevelAgent_WrapsOtherAgentsAsSubagentTools(t *test
 	toolList, err := svc.buildTopLevelTools(ctx, agentsource.AgentDefinition{Name: "parent", Description: "parent agent"})
 	require.NoError(t, err)
 
-	// 6 core tools (no WebSearchBackend configured here, so WebSearch is
+	// 7 core tools (no WebSearchBackend configured here, so WebSearch is
 	// omitted) + 2 subagent tools (helper, other) — parent must not wrap
 	// itself.
-	assert.Len(t, toolList, 8)
+	assert.Len(t, toolList, 9)
 
 	var wrappedNames []string
 	for _, tl := range toolList {

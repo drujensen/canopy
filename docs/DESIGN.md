@@ -133,7 +133,8 @@ for why:
 |---|---|
 | Bash/shell | `tool/shelltool` (framework-provided local shell) |
 | File read | `impl/tools`, ported from aiagent's `file_read.go` |
-| File write | `impl/tools`, ported from aiagent's `file_write.go` |
+| File write (full overwrite) | `impl/tools`, ported from aiagent's `file_write.go` |
+| File edit (targeted find/replace, Phase 11 addendum) | `impl/tools/file_edit.go` — no aiagent equivalent; added so a one-line fix doesn't cost a whole-file retransmission |
 | File search / grep | `impl/tools`, ported from aiagent's `file_search.go` |
 | Directory listing | `impl/tools`, ported from aiagent's `directory.go` |
 | Web search | `impl/tools`, ported from aiagent's `web_search.go` |
@@ -452,7 +453,7 @@ agent already uses:
 
 | Agent      | Persona            | Reads                          | Produces               | Tools                                                              |
 |------------|---------------------|---------------------------------|-------------------------|---------------------------------------------------------------------|
-| `research` | Product Owner       | (user, web)                     | `docs/REQUIREMENTS.md` | `FileRead, FileWrite, FileSearch, DirectoryList, WebFetch, WebSearch` |
+| `research` | Product Owner       | (user, web)                     | `docs/REQUIREMENTS.md` | `FileRead, FileWrite, FileEdit, FileSearch, DirectoryList, WebFetch, WebSearch` |
 | `design`   | Architect / UX      | `REQUIREMENTS.md`               | `docs/DESIGN.md`       | same as `research`                                                   |
 | `plan`     | Project Manager     | `REQUIREMENTS.md`, `DESIGN.md`  | `docs/PLAN.md`         | same as `research`                                                   |
 | `execute`  | Developer           | `PLAN.md` (+ the other two)     | working code, tests    | *(no `tools:` line — inherits everything, including `Bash`)*         |

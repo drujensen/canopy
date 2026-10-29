@@ -59,10 +59,10 @@ func TestAgentCapabilities_InheritsEverything_IncludesSkillsAndSubagent(t *testi
 
 	assert.Equal(t, 2, caps.SkillCount, "both loaded skills must be visible to an agent with no tools: allowlist")
 	// Every core tool except WebSearch (no backend configured: Bash,
-	// FileRead, FileWrite, FileSearch, DirectoryList, WebFetch, Skill = 7)
-	// plus one subagent-dispatch tool for the other loaded agent
-	// ("restricted") = 8.
-	assert.Equal(t, 8, caps.ToolCount)
+	// FileRead, FileWrite, FileEdit, FileSearch, DirectoryList, WebFetch,
+	// Skill = 8) plus one subagent-dispatch tool for the other loaded agent
+	// ("restricted") = 9.
+	assert.Equal(t, 9, caps.ToolCount)
 }
 
 // TestAgentCapabilities_ExplicitAllowlistWithoutSkill_ZeroSkills asserts
@@ -89,9 +89,9 @@ func TestAgentCapabilities_UnknownAgent_Errors(t *testing.T) {
 }
 
 // TestAgentService_ListTools_InheritsEverything_SortedAndLabeled asserts
-// ListTools, for an agent with no tools: allowlist, returns exactly the 8
+// ListTools, for an agent with no tools: allowlist, returns exactly the 9
 // entries AgentCapabilities.ToolCount counts for "assistant" (see
-// TestAgentCapabilities_InheritsEverything_IncludesSkillsAndSubagent): 7
+// TestAgentCapabilities_InheritsEverything_IncludesSkillsAndSubagent): 8
 // core tools labeled "Built-in" (no MCP server is configured in
 // newCapabilitiesTestService, so "MCP" never appears) plus one
 // subagent-dispatch tool for "restricted" labeled "Subagent" — proving
@@ -103,13 +103,13 @@ func TestAgentService_ListTools_InheritsEverything_SortedAndLabeled(t *testing.T
 	got, err := svc.ListTools(context.Background(), "assistant")
 	require.NoError(t, err)
 
-	require.Len(t, got, 8)
+	require.Len(t, got, 9)
 	bySource := map[string]int{}
 	for _, ts := range got {
 		bySource[ts.Source]++
 		assert.NotEmpty(t, ts.Description)
 	}
-	assert.Equal(t, 7, bySource["Built-in"])
+	assert.Equal(t, 8, bySource["Built-in"])
 	assert.Equal(t, 1, bySource["Subagent"])
 	assert.Equal(t, 0, bySource["MCP"], "no MCP server is configured in this test service")
 
@@ -117,7 +117,7 @@ func TestAgentService_ListTools_InheritsEverything_SortedAndLabeled(t *testing.T
 	for i, ts := range got {
 		names[i] = ts.Name
 	}
-	assert.Equal(t, []string{"Bash", "DirectoryList", "FileRead", "FileSearch", "FileWrite", "Skill", "WebFetch", "restricted"}, names)
+	assert.Equal(t, []string{"Bash", "DirectoryList", "FileEdit", "FileRead", "FileSearch", "FileWrite", "Skill", "WebFetch", "restricted"}, names)
 }
 
 // TestAgentService_ListTools_RespectsAllowlist asserts ListTools for
