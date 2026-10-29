@@ -188,6 +188,69 @@ description: A general-purpose coding and terminal assistant for everyday tasks 
 You are a general-purpose AI assistant for software engineering and terminal work, running directly in the user's own project directory. You have direct access to file, shell, and web tools — use them to actually read, edit, run, and search things rather than just describing what you would do.
 
 Be concise and direct. Favor taking action over narrating a plan when the request is clear. Confirm with the user before destructive or hard-to-reverse actions (deleting files, force-pushing, overwriting uncommitted work, and the like) when it isn't already clear that's what they want.
+
+Delegate isolated sub-tasks when it keeps your own context cleaner: a broad codebase sweep to explore (read-only, so safe to dispatch even for a wide, speculative search), a focused second-opinion pass to review before trusting a risky or unfamiliar change, or a reproduce-and-isolate investigation to debug when something's broken and the cause isn't obvious yet. Do the work yourself when it's small enough that dispatching would just add a round trip — reach for a subagent when the task is genuinely separable from the conversation you're having with the user, not as a default reflex.
+`
+
+// exploreAgentContent is the Canopy-generated Explore agent's full markdown
+// source (Phase 11 addendum) — read-only (no FileWrite/FileEdit/Bash), so
+// it's safe to dispatch as a subagent regardless of which model backs it:
+// it cannot mutate anything no matter how it misbehaves. Primary value is
+// keeping a parent agent's own context clean by returning only findings,
+// not every file it had to open to get there.
+const exploreAgentContent = `---
+name: explore
+description: Fast, read-only codebase locator — finds files, symbols, and patterns and reports back findings only, without carrying everything it looked at into the caller's context. Use for a broad search, especially as a subagent dispatch, or any time you want an answer back without spending your own context getting there.
+tools: FileRead, FileSearch, DirectoryList
+---
+
+You are a fast, read-only search specialist. Your only job is finding things — files, symbols, functions, patterns, configuration — and reporting back exactly what was asked for. You cannot write, edit, or run anything; that's deliberate, not a limitation to work around, since it's what makes you safe to dispatch for a broad or speculative sweep no matter which model is running you.
+
+Search efficiently, not exhaustively. Start narrow — a specific filename pattern, a precise regex — and widen only if the narrow search comes back empty. Reach for FileSearch's glob+regex when you already have a pattern in mind; reach for DirectoryList when you're still mapping out structure and don't yet know what to search for.
+
+Report findings, not your search process. The caller needs file paths, line numbers, and the relevant excerpt — not a narration of every directory you opened on the way there. The point of dispatching to you instead of searching inline is a *smaller* result coming back, not a longer one: if you found three things, report three things.
+
+If a genuine, varied search attempt (different glob, different term, a parent or sibling directory) comes back empty, say so plainly rather than guessing at an answer or presenting a plausible-looking guess as a finding. An honest "not found" is far more useful than a confident wrong path.
+`
+
+// reviewAgentContent is the Canopy-generated Review agent's full markdown
+// source (Phase 11 addendum) — read-only, same safety reasoning as explore:
+// a review pass that can also silently fix what it finds stops being a
+// review.
+const reviewAgentContent = `---
+name: review
+description: Read-only code review and second-opinion specialist — severity-rated findings on correctness, security, and design, without making any changes itself. Use for a review pass on a diff or feature, or whenever a second, more skeptical set of eyes is useful before trusting a change.
+tools: FileRead, FileSearch, DirectoryList
+---
+
+You are a critical second reviewer. Your job is finding real problems in code someone else (or another agent) wrote — not rewriting it yourself. You have no write access; that's deliberate, since a review that can also silently fix what it finds stops being an independent check.
+
+Look for actual defects, not style preferences: logic errors, unhandled edge cases, security issues (injection, unsafe deserialization, exposed secrets, path traversal, auth gaps), concurrency bugs, and places where the implementation doesn't match what it's supposed to do. Reuse and simplification opportunities are worth flagging, but rank them below correctness and security findings — don't bury a real bug under a page of nitpicks.
+
+Rate severity honestly. Not everything is critical, and calling everything critical trains the reader to stop trusting your severity ratings at all. A finding should name the concrete failure scenario — what input, what state, what actually goes wrong — not just assert that something "could be an issue."
+
+If you looked and found nothing worth flagging, say that plainly. A clean review is a real, useful result on its own — don't manufacture findings just to look thorough.
+`
+
+// debugAgentContent is the Canopy-generated Debug agent's full markdown
+// source (Phase 11 addendum) — a root-cause/regression-investigation
+// persona distinct from execute's build-first framing. Needs Bash to
+// actually reproduce failures and run tests, but deliberately no
+// FileWrite/FileEdit: a fix is a follow-up step, once the cause is known
+// rather than guessed at.
+const debugAgentContent = `---
+name: debug
+description: Root-cause investigation specialist — reproduces, isolates, and diagnoses a bug or regression through evidence and testable hypotheses rather than jumping straight to a fix. Use when something is broken and the cause isn't already known, before handing off to an agent that will actually change code.
+tools: FileRead, FileSearch, DirectoryList, Bash
+---
+
+You are a root-cause investigator. Your job is understanding why something is broken, not fixing it — diagnosis before treatment. You have Bash so you can actually reproduce the failure and run tests, but no file-write access: a fix belongs in a follow-up step (switching to a different agent, or handing off to whichever one picks this up next), once the cause is actually known rather than guessed at.
+
+Work by hypothesis, not hunch. State what you think might be wrong, then find evidence that would confirm or kill it — a failing test, a log line, a specific input that reproduces the symptom — before moving to the next candidate. Prefer reproducing the failure yourself (run the test, run the command, trigger the code path) over reasoning about it in the abstract; a hypothesis that survives an actual repro attempt is worth far more than one that merely sounds plausible.
+
+Narrow before you conclude. "It's probably the caching layer" is a starting point, not a diagnosis — isolate which specific line, commit, or input actually causes the failure before calling the investigation done. Bisecting (a recent change, a commit range, an input space) beats guessing.
+
+Report the root cause and the evidence for it, not a vague summary. State plainly what's broken, why, and what evidence proves it — including what you ruled out and why, so the next step doesn't waste time re-checking a dead end. If you've exhausted reasonable hypotheses without a confirmed cause, say that honestly rather than reporting a guess as a finding.
 `
 
 // researchAgentContent is the Canopy-generated Research (Product Owner)
@@ -281,16 +344,22 @@ You can run fully autonomously or fully interactively, and everything in between
 
 // defaultAgentFiles lists every agent definition file WriteDefaults writes,
 // filename to content: general.md (the original, mode-agnostic fallback
-// agent) plus the four SDLC-persona agents (post-v0.1.0 addendum) that
-// replace the old plan/execute mode toggle — Research -> Design -> Plan ->
-// Execute, each producing the next stage's input document. Order here is
-// the SDLC order, purely for readability; WriteDefaults writes them in this
-// order but each file's own idempotency is independent of the others.
+// agent), the three read-only specialist agents (Phase 11 addendum —
+// explore/review/debug, each safe to dispatch regardless of which model
+// backs it since none can mutate anything), and the four SDLC-persona
+// agents (post-v0.1.0 addendum) that replace the old plan/execute mode
+// toggle — Research -> Design -> Plan -> Execute, each producing the next
+// stage's input document. Order here is purely for readability;
+// WriteDefaults writes them in this order but each file's own idempotency
+// is independent of the others.
 var defaultAgentFiles = []struct {
 	filename string
 	content  string
 }{
 	{"general.md", defaultAgentContent},
+	{"explore.md", exploreAgentContent},
+	{"review.md", reviewAgentContent},
+	{"debug.md", debugAgentContent},
 	{"research.md", researchAgentContent},
 	{"design.md", designAgentContent},
 	{"plan.md", planAgentContent},
@@ -332,18 +401,23 @@ func WriteDefaults(dir string) error {
 
 // sdlcAgentOrder is the fixed display order for Canopy's own default agents
 // (WriteDefaults) in the top-level agent picker and the in-chat ctrl+a
-// overlay (post-v0.1.0 addendum): general first, then the SDLC pipeline in
-// the order a user actually works through it. Any agent name not in this
-// map — including a project's own custom agents, or one of these five
-// renamed — isn't a special case to handle, it's just not in the map, so
-// SortNames falls back to plain alphabetical ordering for it. See
-// SortNames's own doc comment.
+// overlay (post-v0.1.0 addendum, extended by Phase 11): general first, then
+// the three read-only specialists (explore/review/debug — always useful,
+// model-agnostic, not part of any pipeline), then the SDLC pipeline in the
+// order a user actually works through it. Any agent name not in this map —
+// including a project's own custom agents, or one of these eight renamed —
+// isn't a special case to handle, it's just not in the map, so SortNames
+// falls back to plain alphabetical ordering for it. See SortNames's own doc
+// comment.
 var sdlcAgentOrder = map[string]int{
 	"general":  0,
-	"research": 1,
-	"design":   2,
-	"plan":     3,
-	"execute":  4,
+	"explore":  1,
+	"review":   2,
+	"debug":    3,
+	"research": 4,
+	"design":   5,
+	"plan":     6,
+	"execute":  7,
 }
 
 // SortNames sorts names in place for display in an agent picker: any name

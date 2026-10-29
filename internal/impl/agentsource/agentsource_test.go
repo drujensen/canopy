@@ -231,14 +231,14 @@ func TestWriteDefaults_WritesLoadableAgents(t *testing.T) {
 
 	require.NoError(t, WriteDefaults(dir))
 
-	for _, name := range []string{"general.md", "research.md", "design.md", "plan.md", "execute.md"} {
+	for _, name := range []string{"general.md", "explore.md", "review.md", "debug.md", "research.md", "design.md", "plan.md", "execute.md"} {
 		_, err := os.Stat(filepath.Join(dir, name))
 		require.NoError(t, err, "expected %s to be written", name)
 	}
 
 	defs, err := Load(t.TempDir(), filepath.Dir(filepath.Dir(dir)))
 	require.NoError(t, err)
-	require.Len(t, defs, 5)
+	require.Len(t, defs, 8)
 
 	def, ok := defs["general"]
 	require.True(t, ok)

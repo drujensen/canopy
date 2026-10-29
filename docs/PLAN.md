@@ -18,7 +18,7 @@ restating them.
 | 0–8 | **Done** — shipped as `v0.1.0`, tagged at commit `c731abd`. |
 | 9 (post-v0.1.0) | **Done** — 34 commits after the tag, latest `5742933`. |
 | 10 (deferred/candidate) | **Not started, not scheduled** — real, stated-but-unscoped work, carried forward. |
-| 11 (Edit tool, read-only agents, agent/model pinning) | **Not started** — scoped below, starting with the Edit tool. |
+| 11 (Edit tool, read-only agents, agent/model pinning) | **In progress** — Edit tool and the three read-only agents done; agent/model pinning not started. |
 
 Build/test/lint commands and QA workflow: see `AGENTS.md`. Benchmark numbers: see
 `docs/BENCHMARKS.md`.
@@ -137,14 +137,14 @@ writing its requirements/exit criteria into a new numbered phase first, not just
 
 ---
 
-## Phase 11 — Edit tool, specialized read-only agents, agent/model pinning (NOT started)
+## Phase 11 — Edit tool, specialized read-only agents, agent/model pinning (IN PROGRESS)
 
 Scoped out of a design-review conversation (2026-10-28) critiquing the built-in agent/tool set for
 gaps, not carried forward as a vague idea — this phase exists so the three items below don't go
 the same "addendum in a comment, never in the plan" route Phase 9 had to retroactively fix (see the
 Governance note). Starting with the Edit tool; the other two follow.
 
-- **Targeted `Edit` tool (no exit criteria met yet).** `internal/impl/tools/file_write.go` only
+- **Targeted `Edit` tool. DONE.** `internal/impl/tools/file_write.go` only
   supports full-file overwrite (`FileWriteInput.Content` — "Overwrites any existing file at
   path"), with no Claude-Code-`Edit`-equivalent string-replace tool. Every single-line fix
   currently forces the model to retransmit the whole file, costing output tokens proportional to
@@ -159,7 +159,7 @@ Governance note). Starting with the Edit tool; the other two follow.
     reference (alongside `FileWrite`, not replacing it — full overwrite still has legitimate uses,
     e.g. creating a new file).
 
-- **Three new built-in read-only agents: `explore`, `review`, `debug`.** Current built-in set
+- **Three new built-in read-only agents: `explore`, `review`, `debug`. DONE.** Current built-in set
   (`general` + the four SDLC personas) has no agent that's safe to delegate to regardless of which
   model backs it, because none of them withhold write access. A read-only agent is low-risk to
   dispatch even to a weak/untrusted model, since it cannot mutate anything no matter how it

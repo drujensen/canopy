@@ -496,7 +496,7 @@ func TestAgentService_DefaultSDLCAgents_BuildOnZeroSkillsConfigured(t *testing.T
 	require.NoError(t, agentsource.WriteDefaults(filepath.Join(homeDir, ".canopy", "agents")))
 	agents, err := agentsource.Load(t.TempDir(), homeDir)
 	require.NoError(t, err)
-	require.Len(t, agents, 5, "general, research, design, plan, execute")
+	require.Len(t, agents, 8, "general, explore, review, debug, research, design, plan, execute")
 
 	provider, model := testProviderModel(t, "ok")
 	svc := NewAgentService(AgentServiceConfig{

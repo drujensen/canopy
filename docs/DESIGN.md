@@ -472,7 +472,8 @@ agent (these four included) is automatically also a subagent-dispatch tool for e
 can dispatch itself or `general` for isolated sub-tasks.
 
 **Bugfix (same addendum):** `research`/`design`/`plan`'s `tools:` line originally also named
-`Skill`, matching `coreToolNames`' full eight-entry list. That was wrong: `Skill` (like
+`Skill`, matching `coreToolNames`' full list (nine entries as of Phase 11's `FileEdit` addendum).
+That was wrong: `Skill` (like
 `WebSearch`) is only constructed into `coreTools()`'s available map when at least one skill is
 actually loaded (`len(s.defs.Skills) > 0` — see §3.2's Skill-tool addendum), and `buildTools`'
 explicit-allowlist branch treats naming an unavailable tool as a hard error, by design (proven by
@@ -487,15 +488,39 @@ about their actual behavior changes.
 
 **Picker order.** `ListAgents` (used by both the top-level picker and the in-chat `ctrl+a` overlay
 — §5) and the top-level picker's own `NewModel` both sort agent names via a new
-`agentsource.SortNames`, not plain alphabetical `sort.Strings`, so the five default agents actually
-read as a pipeline instead of scattering alphabetically (`design, execute, general, plan,
-research`): `general` first, then `research -> design -> plan -> execute` in that fixed order.
-This is deliberately name-keyed (a small `map[string]int` of the five known names, checked at sort
-time), not a config field or a required naming scheme — a project's own custom agents, or one of
-these five renamed by a user, simply aren't in that map and fall back to plain alphabetical order
-after the known ones, exactly like `sort.Strings` would already do for names `SortNames` has never
-heard of. Renaming a default agent is an ordinary, fully supported edit: nothing panics, nothing
-needs updating elsewhere, the renamed agent just stops sorting to a fixed pipeline position.
+`agentsource.SortNames`, not plain alphabetical `sort.Strings`, so the default agents actually
+read as a pipeline instead of scattering alphabetically: `general` first, then (as of Phase 11,
+below) the three read-only specialists, then `research -> design -> plan -> execute` in that fixed
+order. This is deliberately name-keyed (a small `map[string]int` of the known names, checked at
+sort time), not a config field or a required naming scheme — a project's own custom agents, or one
+of these default agents renamed by a user, simply aren't in that map and fall back to plain
+alphabetical order after the known ones, exactly like `sort.Strings` would already do for names
+`SortNames` has never heard of. Renaming a default agent is an ordinary, fully supported edit:
+nothing panics, nothing needs updating elsewhere, the renamed agent just stops sorting to a fixed
+pipeline position.
+
+**Addendum (Phase 11): three read-only specialist agents — `explore`, `review`, `debug`.** The
+four SDLC personas above are an opt-in preset for a new project or a large feature — the right
+shape for that specific workflow, not a good default for the much more common case of a small fix
+or an ad hoc question, where cycling through four ctrl+a switches and three documents is pure
+ceremony. What the built-in set lacked for that common case was any agent safe to delegate to
+*regardless* of which model backs it: every existing agent (including `general`) can write files
+and run `Bash`, so dispatching to one carries real risk if a weak or untrusted model misbehaves.
+
+`explore` (`FileRead, FileSearch, DirectoryList`), `review` (same three), and `debug` (same three
+plus `Bash`, needed to actually reproduce a failure) withhold `FileWrite`/`FileEdit` entirely — by
+construction, none of them can mutate anything no matter how badly they're driven, which is what
+makes them safe to dispatch even from a small local model you don't otherwise trust with write
+access. `explore` is a fast locator (report findings, not the search process); `review` is a
+second-opinion/code-review pass; `debug` is a reproduce-isolate-hypothesize investigator, distinct
+from `execute`'s build-first framing. `general.md`'s system prompt gained a short delegation
+paragraph pointing at all three, mirroring the one `execute.md` already had — `general` is wrapped
+with a subagent-dispatch tool for every other loaded agent the same way every agent is (§3.4), but
+previously had no prompt text telling it to actually reach for one.
+
+Added to `sdlcAgentOrder` between `general` and `research` (`general=0, explore=1, review=2,
+debug=3, research=4, design=5, plan=6, execute=7`) — always-useful and model-agnostic, so they sort
+right after the default fallback agent and before the opt-in pipeline, not interleaved with it.
 
 Addendum (post-v0.1.0): `impl/skillsource`'s progressive disclosure, described above in the
 original text of this section but never actually wired into `domain/services` until now, is

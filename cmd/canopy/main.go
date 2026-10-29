@@ -125,7 +125,7 @@ func run() error {
 	// three sources: a user with agents only in project/personal
 	// .claude/agents still gets Canopy's own defaults seeded into
 	// ~/.canopy/agents the first time it's missing/empty, and — since
-	// WriteDefaults is per-file idempotent — deleting one of the five files
+	// WriteDefaults is per-file idempotent — deleting one of the eight files
 	// later (e.g. `execute.md`) regenerates just that file on the next run
 	// that finds the directory in that missing/empty state again. Once the
 	// directory has at least one file, this branch is skipped entirely, so
@@ -143,7 +143,7 @@ func run() error {
 		if err != nil {
 			return fmt.Errorf("loading agent definitions: %w", err)
 		}
-		fmt.Fprintf(os.Stderr, "canopy: %s is missing or empty; created default agents (general, research, design, plan, execute) there\n", defaultAgentsDir)
+		fmt.Fprintf(os.Stderr, "canopy: %s is missing or empty; created default agents (general, explore, review, debug, research, design, plan, execute) there\n", defaultAgentsDir)
 	}
 
 	// Same zero-config posture, for skills (post-v0.1.0 addendum): Canopy
