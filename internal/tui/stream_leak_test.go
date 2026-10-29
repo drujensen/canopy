@@ -261,6 +261,41 @@ func TestStartTurn_NoLeak_ContextCancelledMidTurn(t *testing.T) {
 	goleak.VerifyNone(t, opts)
 }
 
+// TestStartTurn_NoLeak_AbandonedReader reproduces the exact failure mode
+// found in the field via a live SIGQUIT goroutine dump: startTurn's
+// forwarding goroutine blocked forever on "ch <- streamChunkMsg{...}" with
+// no reader anywhere in the process, nearly an hour after the model's
+// response had actually arrived — and pressing "esc" (cancelTurn) did
+// nothing to unstick it, because a bare, unconditional channel send has no
+// way to notice ctx cancellation at all. This test never calls the Cmd
+// startTurn returns at all — no reader is ever established, the worst
+// case the real incident could have been — then cancels ctx and confirms
+// (via goleak) the goroutine still exits rather than leaking forever,
+// proving trySend's ctx-aware sends actually close this gap regardless of
+// why a reader might be missing.
+func TestStartTurn_NoLeak_AbandonedReader(t *testing.T) {
+	handler := func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(chatCompletionResponse("ok"))
+	}
+	svc, closeServer := newLeakTestService(t, t.TempDir(), handler)
+
+	ctx := context.Background()
+	_, err := svc.StartChat(ctx, "chat-1", "assistant")
+	require.NoError(t, err)
+
+	opts := goleak.IgnoreCurrent()
+
+	turnCtx, cancel := context.WithCancel(ctx)
+	_, _ = startTurn(turnCtx, svc, "chat-1", []*message.Message{message.NewText("hi")})
+	// Deliberately never call the returned Cmd — no reader is ever
+	// established at all.
+	cancel()
+
+	settleHTTPGoroutines(closeServer)
+	goleak.VerifyNone(t, opts)
+}
+
 // TestChatModel_Esc_CancelsInFlightTurnViaHandleKey is
 // TestStartTurn_NoLeak_ContextCancelledMidTurn's counterpart for the actual
 // user-facing path (post-v0.1.0 addendum): rather than the test cancelling

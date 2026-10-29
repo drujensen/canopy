@@ -9,6 +9,7 @@ package tui
 import (
 	"context"
 	"fmt"
+	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/microsoft/agent-framework-go/agent"
@@ -283,32 +284,95 @@ func startTurn(ctx context.Context, svc *services.AgentService, chatID string, m
 		// WithRetryNotifier (providers package): reports a throttled/
 		// retried provider request back onto ch as a non-terminal
 		// streamRetryMsg, the same way a real response chunk arrives as
-		// streamChunkMsg — see that type's doc comment for why a blocking
-		// send here is safe (a waitForStreamEvent(ch) Cmd is always already
-		// pending while this goroutine runs).
+		// streamChunkMsg.
 		notifyCtx := providers.WithRetryNotifier(ctx, func(notice providers.RetryNotice) {
-			ch <- streamRetryMsg{notice: notice}
+			trySend(ctx, ch, streamRetryMsg{notice: notice})
 		})
 		stream, finalize, err := svc.RunMessagesStream(notifyCtx, chatID, msgs)
 		if err != nil {
-			ch <- streamErrMsg{err: err}
+			trySend(ctx, ch, streamErrMsg{err: err})
 			return
 		}
 		for update, err := range stream {
 			if err != nil {
-				ch <- streamErrMsg{err: err}
+				trySend(ctx, ch, streamErrMsg{err: err})
 				return
 			}
-			ch <- streamChunkMsg{update: update}
+			if !trySend(ctx, ch, streamChunkMsg{update: update}) {
+				// ctx was canceled with nobody (still) reading ch — see
+				// trySend's own doc comment. Returning here, rather than
+				// looping back to pull another update off stream, is what
+				// actually stops this goroutine: range-over-func's
+				// contract is that an early return from the loop body is
+				// reported to the iterator as its yield call returning
+				// false (confirmed against AgentService.RunMessagesStream's
+				// own ResponseStream closure, which already handles that
+				// case under "Caller stopped early").
+				return
+			}
 		}
 		result, err := finalize()
 		if err != nil {
-			ch <- streamErrMsg{err: err}
+			trySend(ctx, ch, streamErrMsg{err: err})
 			return
 		}
-		ch <- streamDoneMsg{result: result}
+		trySend(ctx, ch, streamDoneMsg{result: result})
 	}()
 	return ch, waitForStreamEvent(ch)
+}
+
+// sendAbandonGrace bounds how long trySend keeps offering msg to ch after
+// ctx is canceled before giving up — see trySend's own doc comment for why
+// this can't be zero (a reader racing against its own cancellation-caused
+// terminal message is the *normal*, expected case, not the bug) but also
+// has to stay short (an actually-abandoned reader, the real bug, should
+// resolve to "give up" quickly, not hang the goroutine's own shutdown).
+const sendAbandonGrace = 300 * time.Millisecond
+
+// trySend delivers msg on ch, but — unlike a bare, unconditional `ch <-` —
+// never waits on a vanished reader forever: once ctx is canceled, msg gets
+// sendAbandonGrace more to actually be delivered before trySend gives up on
+// it. A real reported bug (post-v0.1.0 addendum) is why this exists at all:
+// the whole streaming design assumes waitForStreamEvent's reader is always
+// pending while startTurn's goroutine runs, re-armed by chatModel.
+// handleStreamMsg after every non-terminal event, and a SIGQUIT goroutine
+// dump confirmed that invariant can be violated in the field — a startTurn
+// goroutine found blocked on `ch <-` with no reader anywhere in the
+// process, nearly an hour after the turn's model response actually
+// arrived, with "esc" unable to do anything about it because a bare
+// channel send has no way to notice ctx cancellation at all.
+//
+// The grace period, not an immediate ctx.Done()-vs-ch race, is deliberate:
+// ctx.Done() firing is the *normal* result of "esc", and the very message
+// trySend is often asked to deliver right after is the resulting
+// context.Canceled streamErrMsg — select'ing ch<- and ctx.Done() as
+// equally-weighted alternatives would let Go's pseudo-random tie-breaking
+// drop that message outright roughly half the time even though the
+// real, still-attentive reader was ready for it in the very same instant
+// (confirmed by this file's own leak tests regressing without the grace
+// window: the reader never got the terminal event, so handleStreamMsg's
+// finishStreaming — and the "Cancelled." note it folds into the transcript
+// — never ran). Giving the reader sendAbandonGrace to actually show up
+// after cancellation keeps that normal case reliable while still bounding
+// the genuinely-abandoned case to a short, fixed wait instead of forever.
+// Returns whether msg was actually delivered, so a caller that needs to
+// stop doing further work when it wasn't (the main stream-forwarding loop)
+// can.
+func trySend(ctx context.Context, ch chan tea.Msg, msg tea.Msg) bool {
+	select {
+	case ch <- msg:
+		return true
+	case <-ctx.Done():
+	}
+
+	timer := time.NewTimer(sendAbandonGrace)
+	defer timer.Stop()
+	select {
+	case ch <- msg:
+		return true
+	case <-timer.C:
+		return false
+	}
 }
 
 // waitForStreamEvent returns a tea.Cmd that reads the next event off ch. A
