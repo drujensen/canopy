@@ -119,6 +119,23 @@ func TestAgentService_RunText_RoundTrip(t *testing.T) {
 	assert.Len(t, stored2.Messages, 4)
 }
 
+// TestAgentService_StartChat_RecordsWorkingDir asserts StartChat persists
+// Chat.WorkingDir from AgentServiceConfig.Tools.WorkingRoot, so the ctrl+h
+// history browser can later show which project a chat belongs to.
+func TestAgentService_StartChat_RecordsWorkingDir(t *testing.T) {
+	repo, err := jsonrepo.NewChatRepository(t.TempDir())
+	require.NoError(t, err)
+	svc := NewAgentService(AgentServiceConfig{
+		Definitions: Definitions{Agents: map[string]agentsource.AgentDefinition{"assistant": {Name: "assistant"}}},
+		Repository:  repo,
+		Tools:       ToolsConfig{WorkingRoot: "/home/user/projects/canopy"},
+	})
+
+	chat, err := svc.StartChat(context.Background(), "chat-1", "assistant")
+	require.NoError(t, err)
+	assert.Equal(t, "/home/user/projects/canopy", chat.WorkingDir)
+}
+
 // TestAgentService_StartChat_RecordsLastAgent asserts StartChat calls
 // AgentServiceConfig.RecordLastAgent (post-v0.1.0 addendum, Design §5's
 // addendum) with the started chat's agent name, on success.

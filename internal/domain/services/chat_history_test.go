@@ -43,6 +43,32 @@ func TestAgentService_ListChatSummaries_SortedByRecency(t *testing.T) {
 	assert.Equal(t, "older", summaries[1].ID)
 }
 
+// TestAgentService_ListChatSummaries_IncludesWorkingDir is a regression
+// test for a reported bug: chats are persisted in one global store
+// (~/.canopy/chats/), not scoped per project, so the ctrl+h history
+// browser had no way to tell a user which of possibly several unrelated
+// projects a listed chat actually belonged to. Asserts WorkingDir (set by
+// StartChat from ToolsConfig.WorkingRoot) survives all the way through
+// ListChatSummaries.
+func TestAgentService_ListChatSummaries_IncludesWorkingDir(t *testing.T) {
+	repo, err := jsonrepo.NewChatRepository(t.TempDir())
+	require.NoError(t, err)
+	svc := NewAgentService(AgentServiceConfig{
+		Definitions: Definitions{Agents: map[string]agentsource.AgentDefinition{"assistant": {Name: "assistant"}}},
+		Repository:  repo,
+		Tools:       ToolsConfig{WorkingRoot: "/home/user/projects/canopy"},
+	})
+
+	ctx := context.Background()
+	_, err = svc.StartChat(ctx, "chat-1", "assistant")
+	require.NoError(t, err)
+
+	summaries, err := svc.ListChatSummaries(ctx)
+	require.NoError(t, err)
+	require.Len(t, summaries, 1)
+	assert.Equal(t, "/home/user/projects/canopy", summaries[0].WorkingDir)
+}
+
 func TestAgentService_ListChatSummaries_EmptyIsNotAnError(t *testing.T) {
 	repo, err := jsonrepo.NewChatRepository(t.TempDir())
 	require.NoError(t, err)

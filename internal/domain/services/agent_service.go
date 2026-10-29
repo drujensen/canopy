@@ -29,8 +29,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io/fs"
 	"log/slog"
 	"net/http"
+	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"time"
@@ -299,12 +302,24 @@ func (s *AgentService) StartChat(ctx context.Context, chatID, agentName string) 
 	if _, ok := s.defs.Agents[agentName]; !ok {
 		return nil, fmt.Errorf("agent service: unknown agent %q", agentName)
 	}
+	workingDir := s.toolsCfg.WorkingRoot
+	if workingDir == "" {
+		// No confinement configured — fall back to the process's own
+		// working directory, the same "empty WorkingRoot means bash's
+		// default cwd" convention ProjectFiles already applies. Best
+		// effort: an error here just means Chat.WorkingDir stays empty,
+		// the same as any chat persisted before this field existed.
+		if abs, err := os.Getwd(); err == nil {
+			workingDir = abs
+		}
+	}
 	now := time.Now().UTC()
 	chat := &entities.Chat{
-		ID:        chatID,
-		AgentName: agentName,
-		CreatedAt: now,
-		UpdatedAt: now,
+		ID:         chatID,
+		AgentName:  agentName,
+		WorkingDir: workingDir,
+		CreatedAt:  now,
+		UpdatedAt:  now,
 	}
 	if err := s.repository.Create(ctx, chat); err != nil {
 		return nil, fmt.Errorf("agent service: starting chat %q: %w", chatID, err)
@@ -876,14 +891,17 @@ func (s *AgentService) SetAgent(ctx context.Context, chatID, agentName string) e
 // ChatSummary is one entry in ListChatSummaries' result (post-v0.1.0
 // addendum, Design §5's addendum — the ctrl+h history browser): enough to
 // render a picker row (Title, falling back to a formatted date when empty —
-// tui.historyPickerItem's job, not this type's) and to resume the chat (ID)
+// tui.historyPickerItem's job, not this type's; WorkingDir, so a user can
+// tell which project a listed chat belongs to, since chats are persisted
+// in one global, non-project-scoped store) and to resume the chat (ID)
 // without needing the full entities.Chat (message history, session state)
 // up front.
 type ChatSummary struct {
-	ID        string
-	Title     string
-	AgentName string
-	UpdatedAt time.Time
+	ID         string
+	Title      string
+	AgentName  string
+	WorkingDir string
+	UpdatedAt  time.Time
 }
 
 // ListChatSummaries returns every persisted chat as a ChatSummary, most
@@ -898,10 +916,11 @@ func (s *AgentService) ListChatSummaries(ctx context.Context) ([]ChatSummary, er
 	summaries := make([]ChatSummary, 0, len(chats))
 	for _, chat := range chats {
 		summaries = append(summaries, ChatSummary{
-			ID:        chat.ID,
-			Title:     chat.Title,
-			AgentName: chat.AgentName,
-			UpdatedAt: chat.UpdatedAt,
+			ID:         chat.ID,
+			Title:      chat.Title,
+			AgentName:  chat.AgentName,
+			WorkingDir: chat.WorkingDir,
+			UpdatedAt:  chat.UpdatedAt,
 		})
 	}
 	sort.Slice(summaries, func(i, j int) bool {
@@ -1553,6 +1572,63 @@ func (s *AgentService) GetSkillBody(name string) (string, error) {
 		return "", fmt.Errorf("agent service: unknown skill %q", name)
 	}
 	return skill.Body, nil
+}
+
+// fileListingSizeBound caps how many files ProjectFiles returns. No user has
+// ever once typed "@" and then scrolled past a couple screens of candidates —
+// on a genuinely huge tree, a bound keeps both the walk and the picker's
+// own filter pass proportional to real use, at the same price FileSearch's
+// maxDefault already pays for its own result set; the (fuzzy) filter still
+// ranks within the bound.
+const fileListingSizeBound = 10000
+
+// ProjectFiles lists the project's regular files as project-root-relative
+// paths, sorted alphabetically and capped at fileListingSizeBound — the
+// source behind the TUI's @-mention file-reference picker (docs/PLAN.md's
+// Phase 12 @-mention story): confined to ToolsConfig.WorkingRoot the
+// way FileRead/FileSearch/DirectoryList already are (that's what "the
+// same project root" is), so the paths it returns are exactly ones the
+// FileRead/FileWrite tools will accept. .git is skipped, same as
+// FileSearch's own walk; the picker itself (the TUI, not this service)
+// does the fuzzy filtering.
+func (s *AgentService) ProjectFiles() ([]string, error) {
+	root := s.toolsCfg.WorkingRoot
+	if root == "" {
+		// No confinement configured — list from the process's working
+		// directory instead, matching every other root-relative behavior
+		// this service has for an empty WorkingRoot (bash's default cwd).
+		abs, err := os.Getwd()
+		if err != nil {
+			return nil, fmt.Errorf("failed to list project files: %w", err)
+		}
+		root = abs
+	}
+	var files []string
+	walkErr := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.IsDir() {
+			if d.Name() == ".git" {
+				return fs.SkipDir
+			}
+			return nil
+		}
+		rel, relErr := filepath.Rel(root, path)
+		if relErr != nil {
+			return fmt.Errorf("failed to relativize %q: %w", path, relErr)
+		}
+		files = append(files, filepath.ToSlash(rel))
+		return nil
+	})
+	if walkErr != nil {
+		return nil, fmt.Errorf("failed to list project files: %w", walkErr)
+	}
+	sort.Strings(files)
+	if len(files) > fileListingSizeBound {
+		files = files[:fileListingSizeBound]
+	}
+	return files, nil
 }
 
 // buildTools assembles def's tool list from the core built-in set (Design

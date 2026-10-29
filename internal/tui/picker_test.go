@@ -1,6 +1,7 @@
 package tui
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -108,6 +109,34 @@ func TestHistoryPickerItem_Description_AlwaysShowsAgentAndDate(t *testing.T) {
 	}
 	if !strings.Contains(desc, when.Local().Format(historyDateFormat)) {
 		t.Errorf("Description() = %q, want it to contain the formatted date", desc)
+	}
+}
+
+// TestHistoryPickerItem_Description_ShowsWorkingDirWhenKnown is a
+// regression test for a reported bug: chats are persisted in one global
+// store, not scoped per project, so a user juggling several unrelated
+// projects had no way to tell which one a listed chat belonged to.
+func TestHistoryPickerItem_Description_ShowsWorkingDirWhenKnown(t *testing.T) {
+	when := time.Date(2026, 3, 5, 14, 30, 0, 0, time.UTC)
+	item := historyPickerItem{chatID: "c1", title: "A title", agentName: "reviewer", workingDir: "~/projects/canopy", updatedAt: when}
+	desc := item.Description()
+	if !strings.Contains(desc, "~/projects/canopy") {
+		t.Errorf("Description() = %q, want it to contain the working directory", desc)
+	}
+	if !strings.Contains(desc, "reviewer") {
+		t.Errorf("Description() = %q, want it to still contain the agent name", desc)
+	}
+}
+
+// TestHistoryPickerItem_Description_OmitsWorkingDirWhenUnknown asserts a
+// chat persisted before Chat.WorkingDir existed (empty workingDir) shows
+// exactly the old agent+date format, not a stray blank segment.
+func TestHistoryPickerItem_Description_OmitsWorkingDirWhenUnknown(t *testing.T) {
+	when := time.Date(2026, 3, 5, 14, 30, 0, 0, time.UTC)
+	item := historyPickerItem{chatID: "c1", title: "A title", agentName: "reviewer", updatedAt: when}
+	want := fmt.Sprintf("reviewer · %s", when.Local().Format(historyDateFormat))
+	if got := item.Description(); got != want {
+		t.Errorf("Description() = %q, want %q", got, want)
 	}
 }
 

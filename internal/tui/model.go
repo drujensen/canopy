@@ -3,6 +3,7 @@ package tui
 import (
 	"context"
 	"fmt"
+	"os"
 	"time"
 
 	"github.com/charmbracelet/bubbles/list"
@@ -291,9 +292,17 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			return m, nil
 		}
+		// Resolved once per load, not per item: os.UserHomeDir() is a
+		// single syscall, and every row's WorkingDir shortens against the
+		// same home directory (displayWorkingDirectory, sidebar.go).
+		home, _ := os.UserHomeDir()
 		items := make([]list.Item, 0, len(msg.summaries))
 		for _, s := range msg.summaries {
-			items = append(items, historyPickerItem{chatID: s.ID, title: s.Title, agentName: s.AgentName, updatedAt: s.UpdatedAt})
+			workingDir := ""
+			if s.WorkingDir != "" {
+				workingDir = displayWorkingDirectory(s.WorkingDir, home)
+			}
+			items = append(items, historyPickerItem{chatID: s.ID, title: s.Title, agentName: s.AgentName, workingDir: workingDir, updatedAt: s.UpdatedAt})
 		}
 		if m.screen == screenChat && m.chat != nil {
 			// msg.summaries is the *unfiltered* list — the current chat is
@@ -331,6 +340,38 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.historyList.SetSize(m.width, m.height)
 		m.screen = screenHistory
 		return m, cmd
+
+	case filesLoadedMsg:
+		// The @-mention picker's load (docs/PLAN.md Phase 12) always came
+		// from the active chat's composer — the "@" trigger (handleKey's
+		// own "@" case) is only defined there.
+		if msg.err != nil {
+			if m.screen == screenChat && m.chat != nil {
+				m.chat.transcript = append(m.chat.transcript, transcriptEntry{system: true, text: fmt.Sprintf("error: %v", msg.err)})
+				m.chat.refreshViewport()
+			}
+			return m, nil
+		}
+		if m.screen != screenChat || m.chat == nil {
+			return m, nil
+		}
+		// Opening from an already-typing composer only happens for a real
+		// "@" *rune* (handleKey's own case) — a keybinding (ctrl+something)
+		// never opens it — and handleKey's case only fires when the
+		// composer was exactly empty, so the "mention" to replace is
+		// simply "@" itself, at rune 0 of the whole value.
+		m.chat.mentionStart = 0
+		items := make([]list.Item, 0, len(msg.files))
+		for _, p := range msg.files {
+			items = append(items, filePickerItem{path: p})
+		}
+		l := list.New(items, list.NewDefaultDelegate(), m.chat.mainWidth(), m.chat.height-4)
+		l.Title = "Project files (@)"
+		l.SetShowStatusBar(false)
+		l.SetFilteringEnabled(true)
+		m.chat.picker = &l
+		m.chat.pickerKind = pickerFiles
+		return m, nil
 
 	case chatDeletedMsg:
 		// Same dual-dispatch as historyLoadedMsg above, and for the same

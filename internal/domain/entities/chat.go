@@ -24,6 +24,17 @@ type Chat struct {
 	// only needs to remember which one it was talking to.
 	AgentName string `json:"agent_name"`
 
+	// WorkingDir is the project directory Canopy was run from when this
+	// chat was started (post-v0.1.0 addendum, AgentService.StartChat) —
+	// AgentServiceConfig's ToolsConfig.WorkingRoot at that moment. Chats are
+	// persisted in one global store (~/.canopy/chats/), not scoped per
+	// project, so the ctrl+h history browser otherwise has no way to tell a
+	// user which of possibly many unrelated projects a listed chat actually
+	// belongs to. Empty for any chat persisted before this field existed;
+	// the history browser's own display falls back to omitting it rather
+	// than showing a misleading blank for those.
+	WorkingDir string `json:"working_dir,omitempty"`
+
 	// Messages is the chat history for this conversation, in MAF-Go's own
 	// message type so it can later back an agent.HistoryProvider (Design
 	// §3.9) without a translation layer. message.Message and its Contents

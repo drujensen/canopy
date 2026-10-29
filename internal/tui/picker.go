@@ -36,6 +36,21 @@ func (i skillPickerItem) Title() string       { return i.name }
 func (i skillPickerItem) Description() string { return i.description }
 func (i skillPickerItem) FilterValue() string { return i.name }
 
+// filePickerItem adapts one of AgentService.ProjectFiles' project-root-
+// relative paths to bubbles/list's Item interfaces for the in-chat "@"
+// file-mention picker (chatModel's pickerFiles, docs/PLAN.md Phase 12).
+// Added to unblock a build break found already sitting uncommitted in this
+// tree (filesLoadedMsg/pickerFiles/mentionStart already referenced this
+// type without it existing) — this is only the picker-row adapter every
+// other overlay in this file already has; handlePickerKey's own selection
+// handling for pickerFiles (what actually happens on "enter") is still
+// unwritten, same as before this type existed.
+type filePickerItem struct{ path string }
+
+func (i filePickerItem) Title() string       { return i.path }
+func (i filePickerItem) Description() string { return "" }
+func (i filePickerItem) FilterValue() string { return i.path }
+
 // toolPickerItem adapts a services.ToolSummary's Name/Description/Source to
 // bubbles/list's Item interfaces for chatModel's ctrl+t tools-browser
 // overlay. Source is folded into Description() as a "(Built-in)"/"(MCP)"
@@ -132,7 +147,13 @@ type historyPickerItem struct {
 	chatID    string
 	title     string
 	agentName string
-	updatedAt time.Time
+	// workingDir is services.ChatSummary.WorkingDir already shortened for
+	// display (displayWorkingDirectory, sidebar.go's ~-substitution) — the
+	// project directory this chat was started in, or "" for a chat
+	// persisted before that field existed (Description omits it in that
+	// case rather than showing a misleading blank segment).
+	workingDir string
+	updatedAt  time.Time
 }
 
 // historyDateFormat is used both for a title-less entry's Title() fallback
@@ -170,12 +191,20 @@ func (i historyPickerItem) Title() string {
 // when Title() is already falling back to a date, Description adds the
 // agent name Title() alone can't carry, and when Title() is a real
 // generated title, Description is what actually surfaces the date/agent a
-// user picking between sessions needs.
+// user picking between sessions needs. workingDir, when known, is shown
+// between the two — a user juggling several unrelated projects otherwise
+// has no way to tell which one a listed chat actually belongs to, since
+// every chat is persisted in the same global, non-project-scoped store.
 func (i historyPickerItem) Description() string {
-	return fmt.Sprintf("%s · %s", i.agentName, i.updatedAt.Local().Format(historyDateFormat))
+	if i.workingDir == "" {
+		return fmt.Sprintf("%s · %s", i.agentName, i.updatedAt.Local().Format(historyDateFormat))
+	}
+	return fmt.Sprintf("%s · %s · %s", i.agentName, i.workingDir, i.updatedAt.Local().Format(historyDateFormat))
 }
 
-func (i historyPickerItem) FilterValue() string { return i.title + " " + i.agentName }
+func (i historyPickerItem) FilterValue() string {
+	return i.title + " " + i.agentName + " " + i.workingDir
+}
 
 // removeHistoryItem removes chatID's own historyPickerItem from l, if
 // present (post-v0.1.0 addendum: "d" to delete in ctrl+h's history

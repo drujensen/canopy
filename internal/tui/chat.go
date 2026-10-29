@@ -40,6 +40,14 @@ const (
 	pickerNone pickerKind = iota
 	pickerAgent
 	pickerModel
+	// pickerFiles identifies the in-chat @-mention file-reference picker
+	// (Plan Phase 12's @-mention story): opened on "@" typed into the
+	// empty composer, fuzzy-filters the project files as the user keeps
+	// typing, and on selection inserts the chosen project-relative path
+	// into the composer at the cursor — it never calls an AgentService
+	// mutator like pickerAgent/pickerModel (see handlePickerKey's
+	// pickerFiles branch).
+	pickerFiles
 	// pickerSkill identifies the ctrl+s read-only skills browser (post-v0.1.0
 	// addendum, Design §3.11/FR19) — unlike pickerAgent/pickerModel, selecting
 	// an entry never calls an AgentService mutator; it shows the skill's real
@@ -268,6 +276,18 @@ type chatModel struct {
 	// chosen skill's body.
 	picker     *list.Model
 	pickerKind pickerKind
+
+	// mentionStart marks where the current @-mention ("@" plus whatever
+	// the has typed since) starts in the composer's value, in runes —
+	// set the instant the pickerFiles overlay opens, and replaced with
+	// the selected file's path on selection (see handlePickerKey's
+	// pickerFiles branch). Only meaningful while pickerKind ==
+	// pickerFiles; never reset elsewhere on purpose — the composer is
+	// only ever rewritten as a whole (Reset/clear-on-submit or this
+	// replacement), never edited char-by-char under this field, so a
+	// stale value from a *previous* finished mention is always safe to
+	// overwrite before this one's opened again.
+	mentionStart int
 
 	// pendingDeleteChatID is the pickerHistory overlay's half of
 	// confirmDelete's "press d again to confirm" state (post-v0.1.0

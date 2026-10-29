@@ -190,6 +190,28 @@ type historyLoadedMsg struct {
 	err       error
 }
 
+// filesLoadedMsg reports the outcome of the @-mention picker's
+// AgentService.ProjectFiles call (docs/PLAN.md Phase 12) — Model.Update's
+// case for it (model.go) opens the in-chat overlay (pickerFiles) or folds
+// the error into the transcript, same split loadHistoryCmd's own
+// historyLoadedMsg relies on (see that type's doc comment for why the
+// decision can't be made inside this message instead).
+type filesLoadedMsg struct {
+	files []string
+	err   error
+}
+
+// listProjectFilesCmd calls AgentService.ProjectFiles asynchronously. It
+// can't build the @-mention picker synchronously inside handleKey the way
+// openPicker/openSkillPicker's in-memory reads can — ProjectFiles walks
+// the whole project tree, real disk I/O, same reason as loadHistoryCmd.
+func listProjectFilesCmd(svc *services.AgentService) tea.Cmd {
+	return func() tea.Msg {
+		files, err := svc.ProjectFiles()
+		return filesLoadedMsg{files: files, err: err}
+	}
+}
+
 // loadHistoryCmd calls AgentService.ListChatSummaries (post-v0.1.0
 // addendum: ctrl+h) asynchronously. Unlike openPicker/openSkillPicker's
 // ListAgents/ListModelSummaries/ListSkills — pure in-memory reads that can

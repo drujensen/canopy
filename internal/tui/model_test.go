@@ -1237,6 +1237,44 @@ func TestModel_CtrlH_TopLevel_LoadsHistoryAndResumesSelectedChat(t *testing.T) {
 	assert.True(t, m.chat.titleAttempted, "a resumed chat must never (re)trigger title generation")
 }
 
+// TestModel_CtrlH_TopLevel_HistoryItemsShowWorkingDir is a regression test
+// for a reported bug: chats are persisted in one global store
+// (~/.canopy/chats/), not scoped per project, so the ctrl+h history browser
+// had no way to tell a user which of possibly several unrelated projects a
+// listed chat actually belonged to. Drives a real StartChat (whose
+// WorkingDir comes from AgentServiceConfig.Tools.WorkingRoot, set here to
+// a real temp dir via newLeakTestService) through to the real historyList
+// Model.Update builds, and asserts the resulting item's Description
+// actually shows that directory.
+func TestModel_CtrlH_TopLevel_HistoryItemsShowWorkingDir(t *testing.T) {
+	workDir := t.TempDir()
+	svc, closeServer := newLeakTestService(t, workDir, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(chatCompletionResponse("ok"))
+	})
+	t.Cleanup(closeServer)
+
+	ctx := context.Background()
+	_, err := svc.StartChat(ctx, "chat-1", "assistant")
+	require.NoError(t, err)
+
+	m := NewModel(ctx, svc, map[string]agentsource.AgentDefinition{"assistant": {Name: "assistant"}}, "", "")
+
+	next, loadCmd := m.handleKey(tea.KeyMsg{Type: tea.KeyCtrlH})
+	m = next.(Model)
+	require.NotNil(t, loadCmd)
+	loadedMsg := loadCmd()
+	require.IsType(t, historyLoadedMsg{}, loadedMsg)
+
+	next2, _ := m.Update(loadedMsg)
+	m = next2.(Model)
+	require.Len(t, m.historyList.Items(), 1)
+
+	item, ok := m.historyList.Items()[0].(historyPickerItem)
+	require.True(t, ok)
+	assert.Contains(t, item.Description(), workDir, "the history row must show which project this chat belongs to")
+}
+
 // TestChatModel_CtrlH_OpensOverlay_SelectingResumesToDifferentChat is the
 // in-chat counterpart: ctrl+h while already chatting opens the overlay
 // (chatModel.picker/pickerHistory) rather than a top-level screen, and
