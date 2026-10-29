@@ -59,7 +59,11 @@ Example:
     { "name": "gpt", "provider": "openai", "model_name": "gpt-4o-mini" },
     { "name": "claude", "provider": "anthropic", "model_name": "claude-sonnet-4-5", "context_window_tokens": 200000 },
     { "name": "llama", "provider": "local-ollama", "model_name": "llama3.1" }
-  ]
+  ],
+  "agent_models": {
+    "execute": "claude",
+    "explore": "llama"
+  }
 }
 ```
 
@@ -68,8 +72,16 @@ resolve the key from at load time — only the variable's name is ever written t
 secret). An explicit `api_key` always wins over `api_key_env`.
 
 Any agent definition can be paired with any configured model by name (an agent's frontmatter
-`model:` field), falling back to the model you last switched to with `ctrl+o`, and failing that to
-the first entry in `models`.
+`model:` field). `agent_models` (optional, shown above) pins a specific agent to a specific model
+for *this project* without forking that agent's `.md` file just to change one frontmatter line —
+useful for pairing a strong model with `execute` and a cheap/fast one with `explore`, independent
+of whatever model you're currently driving the chat with. Precedence, highest first: a chat's own
+`ctrl+o` override, then `agent_models`, then the agent's own `model:` frontmatter, then the model
+you last switched to with `ctrl+o`, then the first entry in `models`. A name in `agent_models` that
+doesn't match any configured model is logged and ignored rather than erroring — since
+`.canopy/providers.json` is the kind of file a project might deliberately check in despite being
+gitignored by default, one teammate missing a pinned local model shouldn't break the agent for
+them.
 
 The nine `type` values with first-class adapters are `openai`, `anthropic`, `gemini`, `deepseek`,
 `ollama`, `groq`, `mistral`, `together`, and `xai`. Any other `type` also works as long as

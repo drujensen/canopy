@@ -68,6 +68,29 @@ func TestProviderStore_SaveLoadRoundTrip(t *testing.T) {
 	assert.Equal(t, 0.2, loaded.Models[0].Parameters["temperature"])
 }
 
+// TestProviderStore_AgentModelsRoundTrip covers the Phase 11 addendum field
+// specifically: AgentModels round-trips through Save/Load like any other
+// field, and omitting it (the common case — most installs won't pin any
+// agent) doesn't write an empty "agent_models" key into the file at all
+// (the field's omitempty tag).
+func TestProviderStore_AgentModelsRoundTrip(t *testing.T) {
+	dir := t.TempDir()
+
+	withPins := NewProviderStore(filepath.Join(dir, "with-pins.json"))
+	require.NoError(t, withPins.Save(&ProvidersFile{
+		AgentModels: map[string]string{"execute": "opus", "explore": "fast-local"},
+	}))
+	loaded, err := withPins.Load()
+	require.NoError(t, err)
+	assert.Equal(t, map[string]string{"execute": "opus", "explore": "fast-local"}, loaded.AgentModels)
+
+	withoutPins := NewProviderStore(filepath.Join(dir, "without-pins.json"))
+	require.NoError(t, withoutPins.Save(&ProvidersFile{}))
+	raw, err := os.ReadFile(withoutPins.Path())
+	require.NoError(t, err)
+	assert.NotContains(t, string(raw), `"agent_models"`, "a ProvidersFile with no AgentModels must not write the key at all")
+}
+
 func TestProviderStore_SaveCreatesParentDirectories(t *testing.T) {
 	root := t.TempDir()
 	path := filepath.Join(root, "nested", "dir", "providers.json")

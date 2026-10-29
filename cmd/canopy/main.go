@@ -522,6 +522,7 @@ func run() error {
 		Providers:    providersFile.Providers,
 		Models:       providersFile.Models,
 		DefaultModel: defaultModel,
+		AgentModels:  providersFile.AgentModels,
 		Repository:   repo,
 		MCPTools:     mcpRegistry.Tools(),
 		Tools: services.ToolsConfig{

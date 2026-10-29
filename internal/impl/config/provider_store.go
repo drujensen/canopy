@@ -27,6 +27,20 @@ const (
 type ProvidersFile struct {
 	Providers []entities.ProviderConfig `json:"providers"`
 	Models    []entities.ModelConfig    `json:"models"`
+
+	// AgentModels optionally pins an agent name (an AgentDefinition's
+	// "name" frontmatter) to a ModelConfig.Name (Design §4 Phase 11
+	// addendum). Lets a project pin, say, "execute" to a strong model and
+	// "explore" to a cheap one without forking that agent's entire .md
+	// file just to change one frontmatter field. Resolved between
+	// chat.ModelOverride and the agent's own "model" frontmatter — see
+	// AgentService.resolveActiveModelName — and fails soft (falls through
+	// to the next tier, logging rather than erroring) if the named model
+	// isn't actually configured, since this file is the kind a project
+	// might deliberately check in despite .canopy/ being gitignored by
+	// default, and one teammate's missing local model shouldn't break
+	// every other agent for them.
+	AgentModels map[string]string `json:"agent_models,omitempty"`
 }
 
 // ProviderStore reads and writes the flat provider/model config file

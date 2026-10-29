@@ -220,6 +220,40 @@ connection. def's *own* tool list still fails loudly (a user directly selecting 
 agent deserves an immediate, clear error) — only the eager background-wrapping step became
 resilient.
 
+**Addendum (Phase 11): project-level agent → model pinning.** Before this, pinning a specific
+model to a specific agent *for one project* meant forking that agent's entire `.md` file into
+`.claude/agents/` just to change its `model:` frontmatter line — freezing the copy's prompt body at
+whatever it said the day it was forked. `config.ProvidersFile` gained an optional `AgentModels map[string]string`
+field (agent name → `ModelConfig.Name`), threaded through as `AgentServiceConfig.AgentModels` /
+`AgentService.agentModels`, resolved by a new `resolveActiveModelName` inserted between
+`chat.ModelOverride` and `resolveModelName`'s existing `def.Model`/`s.defaultModel` pair:
+
+```
+chat.ModelOverride → s.agentModels[def.Name] → def.Model → s.defaultModel
+```
+
+`resolveProviderModel` (real dispatch) and `activeModelName` (`GetModel`/`RunResult.Model`'s
+read-only view) both call `resolveActiveModelName` so the two tiers below it (already shared via
+`resolveModelName`) stay in sync with the new one above them, same reasoning as §3.4's override
+note above. A pin naming a model that isn't actually configured is **not** a construction-time or
+call-time error — it's logged (`AgentService.logger`, if set) and treated as unset, falling through
+to the next tier. This matters specifically because `.canopy/providers.json` is designed to be
+safely checked in (`api_key_env` exists for exactly that reason — §4's addendum below) — a team
+that does check it in, with one `agent_models` entry naming a local-only model one teammate doesn't
+have configured, must not have every agent break for that teammate; the same "one bad config
+doesn't break everything" posture the bugfix addendum above established for a failed subagent
+build.
+
+**Related fix, same addendum: `SetAgent` now clears `chat.ModelOverride`.** Previously, switching
+a chat's active agent via `ctrl+a` left any `ctrl+o` override from the previously-active agent in
+place, silently overriding the newly-selected agent's own model (pin or frontmatter) until the user
+noticed and manually cleared it with a second `ctrl+o`. Since `resolveActiveModelName` makes
+`chat.ModelOverride` the single tier that outranks everything else — including the new
+project-level pin — an override surviving an agent switch defeated per-agent pinning for exactly
+the case it exists to serve. `SetAgent` clearing the override means each agent's own pin tiers
+reassert immediately on switch; `ctrl+o` remains available right afterward if the user wants to
+force a model for the newly-active agent too.
+
 ### 3.5 Context compaction (FR10)
 
 `agent/compaction`:

@@ -18,7 +18,7 @@ restating them.
 | 0–8 | **Done** — shipped as `v0.1.0`, tagged at commit `c731abd`. |
 | 9 (post-v0.1.0) | **Done** — 34 commits after the tag, latest `5742933`. |
 | 10 (deferred/candidate) | **Not started, not scheduled** — real, stated-but-unscoped work, carried forward. |
-| 11 (Edit tool, read-only agents, agent/model pinning) | **In progress** — Edit tool and the three read-only agents done; agent/model pinning not started. |
+| 11 (Edit tool, read-only agents, agent/model pinning) | **Done.** |
 
 Build/test/lint commands and QA workflow: see `AGENTS.md`. Benchmark numbers: see
 `docs/BENCHMARKS.md`.
@@ -137,7 +137,7 @@ writing its requirements/exit criteria into a new numbered phase first, not just
 
 ---
 
-## Phase 11 — Edit tool, specialized read-only agents, agent/model pinning (IN PROGRESS)
+## Phase 11 — Edit tool, specialized read-only agents, agent/model pinning (DONE)
 
 Scoped out of a design-review conversation (2026-10-28) critiquing the built-in agent/tool set for
 gaps, not carried forward as a vague idea — this phase exists so the three items below don't go
@@ -181,7 +181,7 @@ Governance note). Starting with the Edit tool; the other two follow.
     `ctrl+a` picker and by every other agent's subagent-dispatch wrapping; `general.md` updated;
     fixture/loader tests extended to cover the three new names.
 
-- **Project-level agent → model pinning.** Today `resolveModelName` (`agent_service.go:1265`)
+- **Project-level agent → model pinning. DONE.** Today `resolveModelName` (`agent_service.go:1265`)
   only has two tiers below the model catalog itself — `chat.ModelOverride` (session, ctrl+o) and
   the agent definition's own `model:` frontmatter — so pinning a specific model to a specific agent
   *for one project* currently means forking that agent's entire `.md` file into

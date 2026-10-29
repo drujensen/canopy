@@ -126,6 +126,15 @@ type AgentServiceConfig struct {
 	// doesn't set its own "model" frontmatter override.
 	DefaultModel string
 
+	// AgentModels optionally pins an agent name to a ModelConfig.Name
+	// (Phase 11 addendum, config.ProvidersFile.AgentModels) — resolved
+	// between chat.ModelOverride and the agent definition's own "model"
+	// frontmatter (see resolveActiveModelName). A name not present in
+	// Models is not a construction-time error: it's checked, and silently
+	// falls through to the next tier (with a Logger warning, if set), the
+	// first time that agent actually needs its model resolved.
+	AgentModels map[string]string
+
 	Repository interfaces.ChatRepository
 	Tools      ToolsConfig
 	Logger     *slog.Logger
@@ -197,6 +206,7 @@ type AgentService struct {
 	providers    map[string]entities.ProviderConfig
 	models       map[string]entities.ModelConfig
 	defaultModel string
+	agentModels  map[string]string
 	repository   interfaces.ChatRepository
 	toolsCfg     ToolsConfig
 	logger       *slog.Logger
@@ -269,6 +279,7 @@ func NewAgentService(cfg AgentServiceConfig) *AgentService {
 		providers:       providerIndex,
 		models:          modelIndex,
 		defaultModel:    cfg.DefaultModel,
+		agentModels:     cfg.AgentModels,
 		repository:      cfg.Repository,
 		toolsCfg:        cfg.Tools,
 		logger:          cfg.Logger,
@@ -782,17 +793,18 @@ func (s *AgentService) SetModel(ctx context.Context, chatID, modelName string) e
 }
 
 // activeModelName resolves chat's currently active model name — the shared
-// "chat.ModelOverride, else the agent definition's own model:, else
-// s.defaultModel" precedence (see resolveModelName) used by both GetModel's
-// read-only view and RunMessages/RunMessagesStream's RunResult.Model, kept
-// as one function so the two never drift from resolveProviderModel's own
-// resolution (which buildTopLevelAgent actually routes a turn through).
+// "chat.ModelOverride, else s.agentModels[agent], else the agent
+// definition's own model:, else s.defaultModel" precedence (see
+// resolveActiveModelName) used by both GetModel's read-only view and
+// RunMessages/RunMessagesStream's RunResult.Model, kept as one function so
+// the two never drift from resolveProviderModel's own resolution (which
+// buildTopLevelAgent actually routes a turn through).
 func (s *AgentService) activeModelName(chat *entities.Chat) (string, error) {
 	def, ok := s.defs.Agents[chat.AgentName]
 	if !ok {
 		return "", fmt.Errorf("agent service: chat %q references unknown agent %q", chat.ID, chat.AgentName)
 	}
-	name := resolveModelName(def, chat.ModelOverride, s.defaultModel)
+	name := s.resolveActiveModelName(def, chat.ModelOverride)
 	if name == "" {
 		return "", fmt.Errorf("agent service: agent %q has no model configured and no default model is set", def.Name)
 	}
@@ -828,6 +840,15 @@ func (s *AgentService) ListAgents() []string {
 // reference an already-loaded agent definition, the same validation
 // StartChat itself already performs, and the same defensive posture
 // SetModel applies against s.models.
+//
+// Phase 11 addendum: also clears chat.ModelOverride. Without this, a
+// ctrl+o override set while a different agent was active would silently
+// keep overriding every agent's own model pin (project agent_models or
+// frontmatter model:) until the user manually cleared it with a second
+// ctrl+o — defeating per-agent pinning for exactly the case it exists for.
+// Switching agents re-resolves through both pin tiers instead; ctrl+o
+// remains available immediately after if the user wants to force a model
+// for the newly-active agent too.
 func (s *AgentService) SetAgent(ctx context.Context, chatID, agentName string) error {
 	if _, ok := s.defs.Agents[agentName]; !ok {
 		return fmt.Errorf("agent service: unknown agent %q", agentName)
@@ -837,6 +858,7 @@ func (s *AgentService) SetAgent(ctx context.Context, chatID, agentName string) e
 		return fmt.Errorf("agent service: loading chat %q: %w", chatID, err)
 	}
 	chat.AgentName = agentName
+	chat.ModelOverride = ""
 	chat.UpdatedAt = time.Now().UTC()
 	if err := s.repository.Update(ctx, chat); err != nil {
 		return fmt.Errorf("agent service: switching agent for chat %q: %w", chatID, err)
@@ -1272,15 +1294,45 @@ func resolveModelName(def agentsource.AgentDefinition, override, defaultModel st
 	return defaultModel
 }
 
+// resolveActiveModelName resolves def's active model name, layering Phase
+// 11's project-level AgentModels pin between override and the rest of
+// resolveModelName's precedence: override (chat.ModelOverride) wins outright
+// when set; otherwise s.agentModels[def.Name], when it names a model that's
+// actually configured, wins next; otherwise def.Model, then s.defaultModel
+// (resolveModelName handles that last pair unchanged). A pinned name that
+// isn't in s.models is deliberately not an error here — see
+// AgentServiceConfig.AgentModels' doc comment on why this must fail soft —
+// it's logged (if s.logger is set) and treated the same as an unset pin.
+//
+// Shared by resolveProviderModel (routing a real turn) and activeModelName
+// (GetModel/RunResult.Model's read-only view) so the two never drift apart —
+// the same reasoning resolveModelName's own doc comment already states for
+// the tiers below this one.
+func (s *AgentService) resolveActiveModelName(def agentsource.AgentDefinition, override string) string {
+	if override != "" {
+		return override
+	}
+	if pinned, ok := s.agentModels[def.Name]; ok && pinned != "" {
+		if _, known := s.models[pinned]; known {
+			return pinned
+		}
+		if s.logger != nil {
+			s.logger.Warn("agent_models pins agent to an unconfigured model; falling back to the agent's own model/default", "agent", def.Name, "model", pinned)
+		}
+	}
+	return resolveModelName(def, "", s.defaultModel)
+}
+
 // resolveProviderModel resolves def's provider/model against the flat JSON
 // config (Design §4): override (chat.ModelOverride, post-v0.1.0 addendum —
 // empty for a subagent, which never receives one, see buildSubagentAgent's
 // doc comment on why subagents stay isolated from the parent chat's
-// override), when set, wins outright; otherwise def.Model, when set, names a
-// ModelConfig; otherwise s.defaultModel is used (resolveModelName). The
-// named ModelConfig's Provider then names a ProviderConfig.
+// override), when set, wins outright; otherwise s.agentModels[def.Name]
+// (Phase 11 addendum), then def.Model, then s.defaultModel is used
+// (resolveActiveModelName). The named ModelConfig's Provider then names a
+// ProviderConfig.
 func (s *AgentService) resolveProviderModel(def agentsource.AgentDefinition, override string) (entities.ProviderConfig, entities.ModelConfig, error) {
-	modelName := resolveModelName(def, override, s.defaultModel)
+	modelName := s.resolveActiveModelName(def, override)
 	if modelName == "" {
 		return entities.ProviderConfig{}, entities.ModelConfig{}, fmt.Errorf("agent service: agent %q has no model configured and no default model is set", def.Name)
 	}

@@ -1,9 +1,11 @@
 package services
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -553,4 +555,155 @@ func TestAgentService_SetAgent_SwitchesAgentKeepsHistory(t *testing.T) {
 		}
 	}
 	assert.True(t, sawFirstUserMessage, "the pre-switch user message must still be in chat history — SetAgent must never clear it")
+}
+
+// TestAgentService_AgentModels_RoutesProviderDispatch is the Phase 11
+// counterpart to TestAgentService_ModelOverride_RoutesProviderDispatch: a
+// real routing proof (two distinct httptest servers) that
+// AgentServiceConfig.AgentModels actually changes which provider a turn
+// hits, not just that a string resolves correctly in isolation. Also
+// proves the full precedence order in one pass: with no override set, the
+// agent_models pin wins over the agent's own empty model field and
+// s.defaultModel; once a chat-level override is set via SetModel, the
+// override wins back over the pin.
+func TestAgentService_AgentModels_RoutesProviderDispatch(t *testing.T) {
+	var defaultCalls, pinnedCalls int32
+	defaultServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&defaultCalls, 1)
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(chatCompletionResponse("hello from default"))
+	}))
+	t.Cleanup(defaultServer.Close)
+
+	pinnedServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&pinnedCalls, 1)
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(chatCompletionResponse("hello from pinned"))
+	}))
+	t.Cleanup(pinnedServer.Close)
+
+	defaultProvider := entities.ProviderConfig{Name: "p-default", Type: entities.ProviderType("openai-compatible"), APIKey: "sk-test", BaseURL: defaultServer.URL + "/v1"}
+	pinnedProvider := entities.ProviderConfig{Name: "p-pinned", Type: entities.ProviderType("openai-compatible"), APIKey: "sk-test", BaseURL: pinnedServer.URL + "/v1"}
+	defaultModel := entities.ModelConfig{Name: "m-default", Provider: defaultProvider.Name, ModelName: "gpt-test"}
+	pinnedModel := entities.ModelConfig{Name: "m-pinned", Provider: pinnedProvider.Name, ModelName: "gpt-test"}
+
+	repo, err := jsonrepo.NewChatRepository(t.TempDir())
+	require.NoError(t, err)
+
+	svc := NewAgentService(AgentServiceConfig{
+		Definitions: Definitions{
+			Agents: map[string]agentsource.AgentDefinition{
+				// No Model field set — the pin, not a frontmatter default,
+				// must be what resolves this agent's model.
+				"assistant": {Name: "assistant", Description: "test agent"},
+			},
+		},
+		Providers:    []entities.ProviderConfig{defaultProvider, pinnedProvider},
+		Models:       []entities.ModelConfig{defaultModel, pinnedModel},
+		DefaultModel: defaultModel.Name,
+		AgentModels:  map[string]string{"assistant": pinnedModel.Name},
+		Repository:   repo,
+	})
+
+	ctx := context.Background()
+	_, err = svc.StartChat(ctx, "chat-1", "assistant")
+	require.NoError(t, err)
+
+	// No chat.ModelOverride set: the project-level pin must win over
+	// s.defaultModel.
+	result1, err := svc.RunText(ctx, "chat-1", "hi")
+	require.NoError(t, err)
+	assert.Equal(t, "m-pinned", result1.Model)
+	assert.Equal(t, int32(1), atomic.LoadInt32(&pinnedCalls), "the agent_models pin must route to the pinned server")
+	assert.Equal(t, int32(0), atomic.LoadInt32(&defaultCalls), "the default model's server must not be hit while the pin applies")
+
+	// An explicit ctrl+o override must still win over the pin.
+	require.NoError(t, svc.SetModel(ctx, "chat-1", defaultModel.Name))
+	result2, err := svc.RunText(ctx, "chat-1", "hi again")
+	require.NoError(t, err)
+	assert.Equal(t, "m-default", result2.Model)
+	assert.Equal(t, int32(1), atomic.LoadInt32(&defaultCalls), "an explicit chat.ModelOverride must win over the agent_models pin")
+}
+
+// TestAgentService_AgentModels_UnconfiguredPinFallsSoft asserts the
+// documented fail-soft behavior (AgentServiceConfig.AgentModels' doc
+// comment): a pin naming a model that isn't actually configured must not
+// error the agent out — it logs a warning and falls through to the next
+// tier (here, s.defaultModel, since the agent defines no model: of its
+// own), the same "one bad config doesn't break everything" posture
+// DESIGN.md §3.4 already established for subagent construction.
+func TestAgentService_AgentModels_UnconfiguredPinFallsSoft(t *testing.T) {
+	provider, model := testProviderModel(t, "ok")
+	var logBuf bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&logBuf, nil))
+
+	repo, err := jsonrepo.NewChatRepository(t.TempDir())
+	require.NoError(t, err)
+
+	svc := NewAgentService(AgentServiceConfig{
+		Definitions: Definitions{
+			Agents: map[string]agentsource.AgentDefinition{
+				"assistant": {Name: "assistant", Description: "test agent"},
+			},
+		},
+		Providers:    []entities.ProviderConfig{provider},
+		Models:       []entities.ModelConfig{model},
+		DefaultModel: model.Name,
+		AgentModels:  map[string]string{"assistant": "no-such-model"},
+		Repository:   repo,
+		Logger:       logger,
+	})
+
+	ctx := context.Background()
+	_, err = svc.StartChat(ctx, "chat-1", "assistant")
+	require.NoError(t, err)
+
+	gotModel, err := svc.GetModel(ctx, "chat-1")
+	require.NoError(t, err, "an unconfigured pin must fall through, not error")
+	assert.Equal(t, model.Name, gotModel, "must fall back to s.defaultModel once the pinned model is found to be unconfigured")
+	assert.Contains(t, logBuf.String(), "no-such-model", "the unconfigured pin must be logged, not silently dropped")
+}
+
+// TestAgentService_SetAgent_ClearsStaleModelOverride is the fix for the gap
+// flagged alongside Phase 11's AgentModels pin: before this, a ctrl+o
+// override set while one agent was active kept silently overriding every
+// subsequently-selected agent's own model (pin or frontmatter) until the
+// user manually cleared it with a second ctrl+o. SetAgent must clear
+// chat.ModelOverride so the newly-selected agent's own pin tiers reassert.
+func TestAgentService_SetAgent_ClearsStaleModelOverride(t *testing.T) {
+	providerA, modelA := testProviderModel(t, "a")
+	providerB, modelB := testProviderModel(t, "b")
+
+	repo, err := jsonrepo.NewChatRepository(t.TempDir())
+	require.NoError(t, err)
+
+	svc := NewAgentService(AgentServiceConfig{
+		Definitions: Definitions{
+			Agents: map[string]agentsource.AgentDefinition{
+				"first":  {Name: "first", Description: "first agent"},
+				"second": {Name: "second", Description: "second agent", Model: modelB.Name},
+			},
+		},
+		Providers:    []entities.ProviderConfig{providerA, providerB},
+		Models:       []entities.ModelConfig{modelA, modelB},
+		DefaultModel: modelA.Name,
+		Repository:   repo,
+	})
+
+	ctx := context.Background()
+	_, err = svc.StartChat(ctx, "chat-1", "first")
+	require.NoError(t, err)
+
+	// Override while "first" is active.
+	require.NoError(t, svc.SetModel(ctx, "chat-1", modelA.Name))
+
+	require.NoError(t, svc.SetAgent(ctx, "chat-1", "second"))
+
+	gotModel, err := svc.GetModel(ctx, "chat-1")
+	require.NoError(t, err)
+	assert.Equal(t, modelB.Name, gotModel, "switching agents must clear the stale override so 'second' resolves its own model: frontmatter, not the override set for 'first'")
+
+	chat, err := repo.Get(ctx, "chat-1")
+	require.NoError(t, err)
+	assert.Empty(t, chat.ModelOverride, "chat.ModelOverride must be cleared by SetAgent")
 }
