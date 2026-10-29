@@ -19,6 +19,7 @@ restating them.
 | 9 (post-v0.1.0) | **Done** — 34 commits after the tag, latest `5742933`. |
 | 10 (deferred/candidate) | **Not started, not scheduled** — real, stated-but-unscoped work, carried forward. |
 | 11 (Edit tool, read-only agents, agent/model pinning) | **Done.** |
+| 12 (headless mode, loop/spend guardrails, git safety net, context visibility, @-mention, slash commands, OAuth) | **Not started** — scoped below. |
 
 Build/test/lint commands and QA workflow: see `AGENTS.md`. Benchmark numbers: see
 `docs/BENCHMARKS.md`.
@@ -204,6 +205,90 @@ Governance note). Starting with the Edit tool; the other two follow.
   - Exit criteria: `agent_models` field added to the provider-config schema (`impl/config`) and
     `resolveModelName`/`resolveProviderModel`; ctrl+a re-resolution fix; tests covering precedence
     order and the fail-soft fallback.
+
+---
+
+## Phase 12 — headless mode, loop/spend guardrails, git safety net, context visibility, @-mention, slash commands, OAuth (NOT started)
+
+Scoped out of a design-review conversation (2026-10-28, same thread as Phase 11) auditing what's
+still missing against "works in almost all situations," after checking each candidate against
+REQUIREMENTS.md §5's existing non-goals so this doesn't re-litigate decisions already made (no web
+UI, no vision/image input, no claim of parity with Claude Code's hooks system, etc. — those stay
+out of scope and aren't repeated here).
+
+- **Non-interactive/headless mode.** `cmd/canopy/main.go`'s `run()` always ends in
+  `tea.NewProgram(...)` — there is no one-shot `-p "prompt"` path, no stdin-pipe input, no
+  machine-readable output format. Every existing flag (`--global`, `--storage`, `--version`,
+  `--otel`, `--refresh-providers`, `--continue`) assumes an interactive TUI session, so Canopy
+  currently cannot be used from CI, a git hook, or a script pipeline at all — the single biggest
+  gap against "almost all situations."
+  - Exit criteria: a new flag (e.g. `-p`/`--print`) that runs one turn against a fresh or
+    `--continue`d chat without starting the Bubble Tea program, reads the prompt from the flag's
+    argument or stdin if piped, and writes the final response to stdout — plus a machine-readable
+    output mode (e.g. `--output-format json`) covering at least the final response text, the model
+    used, and token/cost usage, so a script can parse it without screen-scraping. Reuses
+    `domain/services.AgentService` directly (`StartChat`/`RunText`), no new orchestration path.
+
+- **Runaway-loop / spend-cap guardrail.** DESIGN.md §3.6 deliberately removed all approval-gating;
+  the natural follow-up question is what stops a bad tool-call loop from running away — on tokens,
+  on real API spend, or on wall-clock time. Nothing in `impl/harness` sets a max-turns/max-tool-calls
+  ceiling today.
+  - First step is investigation, not code: confirm whether MAF-Go's `agent/harness/loop` /
+    `toolautocall` already enforces some cap internally. If it does, document what it is and where
+    (DESIGN.md), and decide whether Canopy's own default is tight enough. If it doesn't, add a
+    configurable per-turn ceiling (max tool calls and/or a wall-clock timeout) in `impl/harness`,
+    surfaced as a clear error/stop rather than a silent infinite loop.
+
+- **Git-aware safety net.** With no approval-gating, the implicit assumption is "git is the user's
+  safety net," but nothing today makes that easy: no dirty-tree warning before a multi-file
+  `FileEdit`/`FileWrite` sweep, no sidebar git-branch/dirty indicator.
+  - Exit criteria: a `git status --porcelain` check (best-effort, non-fatal if `git` isn't
+    installed or the project isn't a repo) surfaced as a one-line sidebar indicator (branch name +
+    dirty/clean) and/or a one-time warning when a chat starts with uncommitted changes already
+    present. Read-only and advisory — this is visibility, not a new blocking/approval mechanism
+    (DESIGN.md §3.6's "no tool call is ever blocked on a human decision" stays intact).
+
+- **Manual context control.** Compaction (`impl/harness/compaction.go`) is fully automatic and
+  silent; `ctrl+u` shows per-model cost/token usage but not "how close am I to this model's context
+  window," and there's no way to force a compact before a known-large operation.
+  - Exit criteria: sidebar or `ctrl+u` shows current context usage as a fraction of
+    `ModelConfig.ContextWindowTokens`, and a new manual trigger (e.g. a composer command or
+    keybinding) forces `agent/compaction`'s pipeline to run immediately rather than waiting for the
+    next turn's automatic check.
+
+- **`@`-mention file-reference picker.** The composer is a plain `bubbles/textarea` with no
+  special handling for `@` — a user has to remember and type the exact relative path of any file
+  they want to point the model at. This is pure composer convenience, not a new capability (the
+  model can already `FileRead` any path mentioned in a prompt) — deliberately scoped to *inserting
+  a path*, not auto-reading file content into context on mention, which would be a separate,
+  larger decision (silently injecting arbitrarily large content).
+  - Reuses the overlay-picker infrastructure already backing `ctrl+a`/`ctrl+o`/`ctrl+s`
+    (`internal/tui/picker.go`'s `bubbles/list`-based pattern), triggered inline from the composer
+    on `@` instead of a dedicated keybinding, fuzzy-filtering project files as the user keeps
+    typing, and inserting the selected relative path at the cursor on selection.
+  - Exit criteria: typing `@` opens the picker; continued typing filters it; selecting an entry
+    replaces `@<filter text>` with the chosen relative path; `esc` cancels without inserting
+    anything. Confined to the project root the same way `FileSearch`/`DirectoryList` already are.
+  - Drag-and-drop is explicitly *not* separate implementation work: in virtually every terminal, a
+    dropped file is delivered as its path pasted into the focused input, which `bubbles/textarea`
+    already accepts as plain text with no code change needed — verify this manually in the terminal
+    you actually use rather than building anything. Actual drag-and-drop of file *content* (e.g. an
+    image) is a GUI-terminal-specific feature squarely inside REQUIREMENTS.md §5's existing
+    vision/image-input non-goal, and stays out of scope.
+
+- **Slash-command extension point** (lower priority — parity gap, not a missing capability).
+  Claude Code supports reusable, named, templated prompts via `.claude/commands/*.md`; Canopy has
+  no equivalent loader. Low urgency because the `Skill` tool already covers most of the same
+  need (a reusable, on-demand, named prompt) with the exact file-based, progressive-disclosure
+  pattern Canopy already favors — worth a loader (`commandsource`, mirroring `agentsource`/
+  `skillsource`) only if real usage shows skills aren't a good enough substitute in practice.
+
+- **OAuth/subscription login** (flagged, likely staying out of scope). Canopy only supports
+  `api_key`/`api_key_env` — no OAuth flow for a Claude Pro/Max subscription the way Claude Code
+  has. Real limitation for a subscription user who'd rather not pay per-token, but OAuth is
+  Anthropic-specific plumbing that cuts against "multi-provider, not locked to one vendor" —
+  Canopy's whole differentiator (README's opening paragraph) — so this needs an explicit decision
+  to take on that asymmetry before it's worth scoping, not a default yes.
 
 ---
 
