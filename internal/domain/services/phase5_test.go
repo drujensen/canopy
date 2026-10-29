@@ -338,8 +338,8 @@ func TestAgentService_ListModelSummaries_IncludesCostAndSorted(t *testing.T) {
 // shapes — an OpenAI Chat Completions-shaped httptest.Server (chatCompletionResponse,
 // this package's existing helper) and a Gemini generateContent-shaped one
 // (geminiTextResponse, mcp_stream_test.go's existing helper) — each paired
-// with its own ModelConfig, and an assertion that switching
-// Chat.ModelOverride via SetModel between the two actually changes which
+// with its own ModelConfig, and an assertion that switching the chat's
+// chat-wide override via SetModel between the two actually changes which
 // server receives the *next* turn's request. This is what proves
 // resolveProviderModel's override precedence is wired all the way through
 // buildTopLevelAgent's real dispatch path, not merely that a string got
@@ -609,7 +609,7 @@ func TestAgentService_AgentModels_RoutesProviderDispatch(t *testing.T) {
 	_, err = svc.StartChat(ctx, "chat-1", "assistant")
 	require.NoError(t, err)
 
-	// No chat.ModelOverride set: the project-level pin must win over
+	// No override set: the project-level pin must win over
 	// s.defaultModel.
 	result1, err := svc.RunText(ctx, "chat-1", "hi")
 	require.NoError(t, err)
@@ -664,15 +664,20 @@ func TestAgentService_AgentModels_UnconfiguredPinFallsSoft(t *testing.T) {
 	assert.Contains(t, logBuf.String(), "no-such-model", "the unconfigured pin must be logged, not silently dropped")
 }
 
-// TestAgentService_SetAgent_ClearsStaleModelOverride is the fix for the gap
-// flagged alongside Phase 11's AgentModels pin: before this, a ctrl+o
-// override set while one agent was active kept silently overriding every
-// subsequently-selected agent's own model (pin or frontmatter) until the
-// user manually cleared it with a second ctrl+o. SetAgent must clear
-// chat.ModelOverride so the newly-selected agent's own pin tiers reassert.
-func TestAgentService_SetAgent_ClearsStaleModelOverride(t *testing.T) {
+// TestAgentService_SetAgent_KeepsChatWideModelOverride is the final
+// settled behavior after two intermediate designs were tried and reverted
+// per explicit user feedback (first: SetAgent unconditionally cleared a
+// single chat-wide override on every switch; then: overrides were scoped
+// per agent via a map). Both were found confusing — "most of the time I
+// will want one model" regardless of which agent is active. The override
+// set via SetModel is chat-wide: switching to a *different* agent (even
+// one with its own "model" frontmatter) must keep using it, and switching
+// back must obviously still show the same thing, since nothing ever
+// touched it.
+func TestAgentService_SetAgent_KeepsChatWideModelOverride(t *testing.T) {
 	providerA, modelA := testProviderModel(t, "a")
 	providerB, modelB := testProviderModel(t, "b")
+	providerC, modelC := testProviderModel(t, "c")
 
 	repo, err := jsonrepo.NewChatRepository(t.TempDir())
 	require.NoError(t, err)
@@ -681,11 +686,11 @@ func TestAgentService_SetAgent_ClearsStaleModelOverride(t *testing.T) {
 		Definitions: Definitions{
 			Agents: map[string]agentsource.AgentDefinition{
 				"first":  {Name: "first", Description: "first agent"},
-				"second": {Name: "second", Description: "second agent", Model: modelB.Name},
+				"second": {Name: "second", Description: "second agent", Model: modelC.Name},
 			},
 		},
-		Providers:    []entities.ProviderConfig{providerA, providerB},
-		Models:       []entities.ModelConfig{modelA, modelB},
+		Providers:    []entities.ProviderConfig{providerA, providerB, providerC},
+		Models:       []entities.ModelConfig{modelA, modelB, modelC},
 		DefaultModel: modelA.Name,
 		Repository:   repo,
 	})
@@ -694,16 +699,26 @@ func TestAgentService_SetAgent_ClearsStaleModelOverride(t *testing.T) {
 	_, err = svc.StartChat(ctx, "chat-1", "first")
 	require.NoError(t, err)
 
-	// Override while "first" is active.
-	require.NoError(t, svc.SetModel(ctx, "chat-1", modelA.Name))
-
-	require.NoError(t, svc.SetAgent(ctx, "chat-1", "second"))
-
+	// Override via ctrl+o while "first" is active.
+	require.NoError(t, svc.SetModel(ctx, "chat-1", modelB.Name))
 	gotModel, err := svc.GetModel(ctx, "chat-1")
 	require.NoError(t, err)
-	assert.Equal(t, modelB.Name, gotModel, "switching agents must clear the stale override so 'second' resolves its own model: frontmatter, not the override set for 'first'")
+	assert.Equal(t, modelB.Name, gotModel)
+
+	// Switch to "second": even though it has its own "model" frontmatter
+	// (modelC), the chat-wide override must still win.
+	require.NoError(t, svc.SetAgent(ctx, "chat-1", "second"))
+	gotModel, err = svc.GetModel(ctx, "chat-1")
+	require.NoError(t, err)
+	assert.Equal(t, modelB.Name, gotModel, "the chat-wide override must apply regardless of which agent is active, overriding 'second''s own model: frontmatter")
+
+	// Switch back to "first": still the same override, untouched throughout.
+	require.NoError(t, svc.SetAgent(ctx, "chat-1", "first"))
+	gotModel, err = svc.GetModel(ctx, "chat-1")
+	require.NoError(t, err)
+	assert.Equal(t, modelB.Name, gotModel)
 
 	chat, err := repo.Get(ctx, "chat-1")
 	require.NoError(t, err)
-	assert.Empty(t, chat.ModelOverride, "chat.ModelOverride must be cleared by SetAgent")
+	assert.Equal(t, modelB.Name, chat.ModelOverride, "the override is a single chat-wide value, not scoped to any one agent")
 }

@@ -381,6 +381,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.chat.agentName = msg.agentName
 			m.chat.toolCount = msg.capabilities.ToolCount
 			m.chat.skillCount = msg.capabilities.SkillCount
+			m.chat.model = msg.model
 		}
 		return m, nil
 

@@ -70,6 +70,16 @@ type agentChangedMsg struct {
 	// here because switching agents can change both counts (a different
 	// tools: allowlist, or whether Skill is even in it).
 	capabilities services.AgentCapabilities
+
+	// model is the chat's currently active model name after the switch:
+	// Chat.ModelOverride if set (chat-wide, unaffected by which agent is
+	// active — SetAgent never touches it), else the newly-active agent's
+	// own project-level AgentModels pin, its "model" frontmatter, or
+	// AgentServiceConfig.DefaultModel. Without this field the sidebar kept
+	// showing the *previous* agent's resolved model after a switch even
+	// when the two genuinely differ (no override set, and the two agents
+	// pin/default to different models).
+	model string
 }
 
 // chatStartedMsg reports the outcome of picking an agent in the picker

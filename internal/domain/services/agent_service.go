@@ -757,10 +757,11 @@ func (s *AgentService) ListModelSummaries() []ModelSummary {
 
 // GetModel returns chat's currently *active* model name (post-v0.1.0
 // addendum, Design §4/FR1): chat.ModelOverride if set, otherwise whatever
-// resolveProviderModel would fall back to (the agent definition's own
-// "model" frontmatter, or s.defaultModel) — the caller (the TUI sidebar)
-// wants to know what's actually in effect for this chat's next turn, not
-// merely whether an override happens to be set.
+// resolveProviderModel would fall back to (the project-level AgentModels
+// pin, the agent definition's own "model" frontmatter, or s.defaultModel)
+// — the caller (the TUI sidebar) wants to know what's actually in effect
+// for this chat's next turn, not merely whether an override happens to be
+// set.
 func (s *AgentService) GetModel(ctx context.Context, chatID string) (string, error) {
 	chat, err := s.repository.Get(ctx, chatID)
 	if err != nil {
@@ -772,9 +773,14 @@ func (s *AgentService) GetModel(ctx context.Context, chatID string) (string, err
 // SetModel sets chat's per-chat model override (Chat.ModelOverride,
 // post-v0.1.0 addendum, Design §4/FR1) and persists it immediately — a
 // user-initiated switch doesn't need to wait for a run to take effect or to
-// be saved. modelName must name an already-configured ModelConfig; this is
-// a real, defensive check even though the TUI's model picker (ListModels)
-// only ever offers valid choices.
+// be saved. Deliberately chat-wide rather than scoped to whichever agent
+// is active when ctrl+o is pressed: switching agents afterward (SetAgent)
+// keeps using this same override, per explicit user feedback that a
+// per-agent scoping scheme (briefly tried) was confusing — "most of the
+// time I will want one model" regardless of which agent is active.
+// modelName must name an already-configured ModelConfig; this is a real,
+// defensive check even though the TUI's model picker (ListModels) only
+// ever offers valid choices.
 func (s *AgentService) SetModel(ctx context.Context, chatID, modelName string) error {
 	if _, ok := s.models[modelName]; !ok {
 		return fmt.Errorf("agent service: unknown model %q", modelName)
@@ -841,14 +847,15 @@ func (s *AgentService) ListAgents() []string {
 // StartChat itself already performs, and the same defensive posture
 // SetModel applies against s.models.
 //
-// Phase 11 addendum: also clears chat.ModelOverride. Without this, a
-// ctrl+o override set while a different agent was active would silently
-// keep overriding every agent's own model pin (project agent_models or
-// frontmatter model:) until the user manually cleared it with a second
-// ctrl+o — defeating per-agent pinning for exactly the case it exists for.
-// Switching agents re-resolves through both pin tiers instead; ctrl+o
-// remains available immediately after if the user wants to force a model
-// for the newly-active agent too.
+// Does NOT touch chat.ModelOverride (an earlier revision briefly made
+// this clear it, then an even later revision tried scoping it per agent
+// instead — both reworked back to this simpler behavior per explicit user
+// feedback): the override is chat-wide, so switching agents keeps using
+// whatever model the user last picked via ctrl+o, same as if they'd never
+// switched. A chat that has never called SetModel still resolves the
+// newly-selected agent's own AgentModels pin / "model" frontmatter /
+// s.defaultModel exactly as before, since there's no override to apply in
+// that case.
 func (s *AgentService) SetAgent(ctx context.Context, chatID, agentName string) error {
 	if _, ok := s.defs.Agents[agentName]; !ok {
 		return fmt.Errorf("agent service: unknown agent %q", agentName)
@@ -858,7 +865,6 @@ func (s *AgentService) SetAgent(ctx context.Context, chatID, agentName string) e
 		return fmt.Errorf("agent service: loading chat %q: %w", chatID, err)
 	}
 	chat.AgentName = agentName
-	chat.ModelOverride = ""
 	chat.UpdatedAt = time.Now().UTC()
 	if err := s.repository.Update(ctx, chat); err != nil {
 		return fmt.Errorf("agent service: switching agent for chat %q: %w", chatID, err)

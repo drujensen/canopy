@@ -936,7 +936,17 @@ func (c *chatModel) setAgentCmd(svc *services.AgentService, ctx context.Context,
 		if err != nil {
 			return streamErrMsg{err: fmt.Errorf("loading agent capabilities: %w", err)}
 		}
-		return agentChangedMsg{agentName: chosen, capabilities: capabilities}
+		// GetModel here picks up whatever's now active — the same
+		// Chat.ModelOverride as before the switch if one is set (SetAgent
+		// never touches it), otherwise chosen's own project-level
+		// AgentModels pin, "model" frontmatter, or DefaultModel — so the
+		// sidebar reflects it immediately rather than keeping the old
+		// agent's resolved model on display until the next turn completes.
+		model, err := svc.GetModel(ctx, chatID)
+		if err != nil {
+			return streamErrMsg{err: fmt.Errorf("loading model: %w", err)}
+		}
+		return agentChangedMsg{agentName: chosen, capabilities: capabilities, model: model}
 	}
 }
 

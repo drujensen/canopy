@@ -784,6 +784,61 @@ func TestChatModel_CtrlO_OpensModelPicker_SelectingSwitchesModel(t *testing.T) {
 	assert.Equal(t, "m2", gotModel, "SetModel must have actually persisted the switch, not just produced a message")
 }
 
+// TestChatModel_CtrlA_RefreshesSidebarModel is a regression test for a
+// reported bug: agentChangedMsg used to carry no model field at all, so
+// after switching agents via ctrl+a the sidebar's c.model kept showing
+// the *previous* agent's resolved model even when the newly-active agent
+// resolves to a genuinely different one (here: its own "model"
+// frontmatter pin, "helper" -> "m2" vs. "assistant" having none and
+// falling back to DefaultModel "m1"). No ctrl+o override is involved —
+// AgentService.SetModel's override is deliberately chat-wide, not scoped
+// per agent (TestAgentService_SetAgent_KeepsChatWideModelOverride covers
+// that), so this test isolates the separate "the sidebar must reflect
+// whatever the newly-active agent itself resolves to" concern.
+func TestChatModel_CtrlA_RefreshesSidebarModel(t *testing.T) {
+	repo, err := jsonrepo.NewChatRepository(t.TempDir())
+	require.NoError(t, err)
+	svc := services.NewAgentService(services.AgentServiceConfig{
+		Definitions: services.Definitions{
+			Agents: map[string]agentsource.AgentDefinition{
+				"assistant": {Name: "assistant"},           // no model: frontmatter -> falls back to DefaultModel "m1"
+				"helper":    {Name: "helper", Model: "m2"}, // pinned to "m2"
+			},
+		},
+		Providers:    []entities.ProviderConfig{{Name: "p", Type: entities.ProviderTypeOpenAI}},
+		Models:       []entities.ModelConfig{{Name: "m1", Provider: "p"}, {Name: "m2", Provider: "p"}},
+		DefaultModel: "m1",
+		Repository:   repo,
+	})
+	ctx := context.Background()
+	_, err = svc.StartChat(ctx, "chat-1", "assistant")
+	require.NoError(t, err)
+
+	c := newChatModel("chat-1", "assistant", nil, "m1", 80, 24)
+
+	cmd := c.handleKey(tea.KeyMsg{Type: tea.KeyCtrlA}, svc, ctx)
+	assert.Nil(t, cmd)
+	require.NotNil(t, c.picker)
+
+	// Agent names are sorted (ListAgents): "assistant", "helper". Move down
+	// to select "helper".
+	c.handleKey(tea.KeyMsg{Type: tea.KeyDown}, svc, ctx)
+	selectCmd := c.handleKey(tea.KeyMsg{Type: tea.KeyEnter}, svc, ctx)
+	require.NotNil(t, selectCmd)
+
+	msg := selectCmd()
+	agentMsg, ok := msg.(agentChangedMsg)
+	require.True(t, ok, "got %#v", msg)
+	assert.Equal(t, "helper", agentMsg.agentName)
+	assert.Equal(t, "m2", agentMsg.model, "'helper' pins its own model: frontmatter to \"m2\" — the sidebar must reflect that immediately, not keep showing 'assistant''s resolved model")
+
+	m := Model{svc: svc, ctx: ctx, screen: screenChat, chat: c, width: 80, height: 24}
+	updated, updCmd := m.Update(agentMsg)
+	assert.Nil(t, updCmd)
+	next := updated.(Model)
+	assert.Equal(t, "m2", next.chat.model, "the sidebar must display the newly-active agent's own resolved model")
+}
+
 // TestChatModel_CtrlA_CtrlO_NoopDuringActiveStream asserts ctrl+a/ctrl+o are
 // no-ops while a turn is actively streaming, the same guard "enter"
 // (sending a message) already applies — switching agent/model mid-tool-call
