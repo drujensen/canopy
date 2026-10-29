@@ -206,6 +206,15 @@ Governance note). Starting with the Edit tool; the other two follow.
     `resolveModelName`/`resolveProviderModel`; ctrl+a re-resolution fix; tests covering precedence
     order and the fail-soft fallback.
 
+**Follow-up (discovered dogfooding this phase, DONE): `--refresh-defaults` flag.** Shipping the
+three new agents above exposed a real gap in the zero-config seeding design: an existing install's
+`~/.canopy/agents` already had 5 files, so the missing-or-empty trigger never re-fired and
+`explore`/`review`/`debug` never appeared without manually deleting files and re-seeding — exactly
+the scenario a real upgrade hits. Added `--refresh-defaults`: calls `agentsource.WriteDefaults`/
+`skillsource.WriteDefaults` unconditionally, additive-only like `--refresh-providers` (fills in
+only what's missing, never touches a file that already exists). `cmd/canopy.writeMissingDefaults`
+reports exactly which filenames were added; see DESIGN.md §3.11's Phase 12 addendum.
+
 ---
 
 ## Phase 12 — headless mode, loop/spend guardrails, git safety net, context visibility, @-mention, slash commands, OAuth (NOT started)

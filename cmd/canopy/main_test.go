@@ -138,6 +138,72 @@ func TestDirMissingOrEmpty_HasAtLeastOneEntry(t *testing.T) {
 	assert.False(t, needs)
 }
 
+// fakeWriteDefaults mimics agentsource.WriteDefaults/skillsource.WriteDefaults'
+// per-file-idempotent contract for writeMissingDefaults' tests: writes each
+// named file only if it doesn't already exist, never overwriting one that
+// does.
+func fakeWriteDefaults(names ...string) func(dir string) error {
+	return func(dir string) error {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			return err
+		}
+		for _, name := range names {
+			path := filepath.Join(dir, name)
+			if _, err := os.Stat(path); err == nil {
+				continue
+			}
+			if err := os.WriteFile(path, []byte("content"), 0o644); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+}
+
+// TestWriteMissingDefaults_ReportsOnlyWhatWasActuallyAdded is --refresh-defaults'
+// core contract: a directory that already has some of the expected files
+// (e.g. an install that predates a newly-shipped default) gets exactly the
+// missing ones filled in, and writeMissingDefaults reports exactly those
+// names — not every file writeFn was asked to consider, and not the ones
+// that were already there.
+func TestWriteMissingDefaults_ReportsOnlyWhatWasActuallyAdded(t *testing.T) {
+	dir := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "general.md"), []byte("existing"), 0o644))
+
+	added, err := writeMissingDefaults(dir, fakeWriteDefaults("general.md", "explore.md", "review.md", "debug.md"))
+	require.NoError(t, err)
+	assert.Equal(t, []string{"debug.md", "explore.md", "review.md"}, added)
+
+	data, err := os.ReadFile(filepath.Join(dir, "general.md"))
+	require.NoError(t, err)
+	assert.Equal(t, "existing", string(data), "a file that already existed must never be overwritten")
+}
+
+// TestWriteMissingDefaults_NothingMissingReportsEmpty covers the
+// "already up to date" case --refresh-defaults' own messaging depends on:
+// every expected file is already present, so nothing is added and the
+// reported slice is empty, not nil-vs-empty ambiguous.
+func TestWriteMissingDefaults_NothingMissingReportsEmpty(t *testing.T) {
+	dir := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "general.md"), []byte("existing"), 0o644))
+
+	added, err := writeMissingDefaults(dir, fakeWriteDefaults("general.md"))
+	require.NoError(t, err)
+	assert.Empty(t, added)
+}
+
+// TestWriteMissingDefaults_MissingDirectoryIsFirstRun covers the original
+// zero-config first-run case: a directory that doesn't exist yet reports
+// every file writeFn creates as "added," matching dirMissingOrEmpty's own
+// "missing is a kind of empty" treatment.
+func TestWriteMissingDefaults_MissingDirectoryIsFirstRun(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "agents")
+
+	added, err := writeMissingDefaults(dir, fakeWriteDefaults("general.md", "explore.md"))
+	require.NoError(t, err)
+	assert.Equal(t, []string{"explore.md", "general.md"}, added)
+}
+
 // TestMergeNewProviders_AdditiveNeverClobbersExisting is the specific test
 // requested for --refresh-providers' contract (Design §4 addendum): a
 // provider already present in the destination file — including one the

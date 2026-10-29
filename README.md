@@ -93,10 +93,12 @@ that list needs no code change to use.
 Neither a `.claude/agents/*.md` file nor a `.canopy/providers.json` is required to start. On first
 run Canopy:
 
-1. Writes five default agents (`general`, plus the `research`/`design`/`plan`/`execute` SDLC
-   personas) to `~/.canopy/agents`, and one default skill (`mcp-server-setup`) to
-   `~/.canopy/skills`. Per-file idempotent, so a later-deleted default file regenerates on the next
-   run and your own edits are never overwritten.
+1. Writes eight default agents (`general`, the read-only `explore`/`review`/`debug` specialists,
+   and the `research`/`design`/`plan`/`execute` SDLC personas) to `~/.canopy/agents`, and one
+   default skill (`mcp-server-setup`) to `~/.canopy/skills`. Per-file idempotent — your own edits
+   are never overwritten — but only triggered while either directory is still missing or completely
+   empty; once it has at least one file, this first-run step is skipped on every later startup, by
+   design, so a hand-edited directory is never silently rewritten.
 2. Fetches the free [models.dev](https://models.dev) catalog (24h-cached locally, no
    authentication), checks which provider API-key environment variables are already set, and
    writes a `providers.json` pairing each match with its most recently released tool-call-capable
@@ -107,6 +109,12 @@ providers and newly listed models get added, models the catalog no longer lists 
 provider get removed, and per-model cost is refreshed. A provider you configured by hand — a
 private Ollama server, say — is never touched, since the catalog has no opinion on it. `--refresh-providers`
 forces an immediate live re-fetch instead of waiting out the cache.
+
+Because step 1 above only runs once (while the directory is still missing/empty), upgrading to a
+Canopy version that ships a new default agent or skill won't add it to an existing
+`~/.canopy/agents`/`~/.canopy/skills` on its own — run `--refresh-defaults` to fill in exactly
+what's missing. Same additive guarantee as `--refresh-providers`: it only ever adds a file that
+isn't there yet, and never touches or overwrites one that already exists, hand-edited or not.
 
 ## Build and run
 
@@ -160,6 +168,7 @@ project directory you want Canopy to work in:
 ./dist/canopy --global            # ~/.canopy config instead
 ./dist/canopy --continue          # resume the most recent chat session
 ./dist/canopy --refresh-providers # force a live models.dev re-fetch
+./dist/canopy --refresh-defaults  # fill in any missing default agents/skills (e.g. after upgrading)
 ./dist/canopy --version
 ```
 

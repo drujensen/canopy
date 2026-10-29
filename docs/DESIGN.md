@@ -479,6 +479,22 @@ already has at least one file — Canopy's own defaults, hand-authored agents, a
 touched, regardless of whether the user also has agents configured elsewhere in project/personal
 `.claude/agents`.
 
+**Addendum (Phase 12): `--refresh-defaults`.** The directory-emptiness trigger above has a real
+consequence worth being explicit about: once `~/.canopy/agents` (or `~/.canopy/skills`) has even
+one file, the first-run seeding step above never runs again on that machine — not even for a
+single file that's missing while the rest are present. A user who installed Canopy before a later
+version added a new default agent (exactly what happened adding Phase 11's `explore`/`review`/
+`debug`) gets no automatic path to that new file; the only prior workaround was deleting the whole
+directory and losing any hand edits in it. `--refresh-defaults` fixes this without weakening the
+"never touch an existing file" guarantee: it calls the same `agentsource.WriteDefaults`/
+`skillsource.WriteDefaults` functions unconditionally (bypassing the missing-or-empty gate, not
+replacing it — the gate still does its own job on an ordinary run), and those functions are already
+per-file idempotent, so the net effect is exactly "fill in whatever's missing, touch nothing that's
+already there" — the same additive-only contract `--refresh-providers` already established for
+`providers.json`. `cmd/canopy`'s `writeMissingDefaults` reports exactly which filenames were added
+(by diffing the directory's entries before/after the call) so the startup message can say what
+actually changed, distinct from "found nothing to add" when the directory was already current.
+
 Addendum (post-v0.1.0): `agentsource.WriteDefaults` was extended from writing one file
 (`general.md`) to writing five, replacing §3.8's superseded plan/execute mode toggle with four
 SDLC-persona agents, each an ordinary `agentsource.AgentDefinition` — no new mechanism, just more

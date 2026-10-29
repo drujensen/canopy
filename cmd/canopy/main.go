@@ -64,6 +64,7 @@ func run() error {
 		showVersion      bool
 		enableOTel       bool
 		refreshProviders bool
+		refreshDefaults  bool
 		continueLatest   bool
 	)
 	flag.BoolVar(&global, "global", false, "use ~/.canopy config/storage instead of a project-local .canopy directory")
@@ -72,6 +73,7 @@ func run() error {
 	flag.BoolVar(&showVersion, "version", false, "print the version and exit")
 	flag.BoolVar(&enableOTel, "otel", false, "enable optional OpenTelemetry tracing (Design §3.10); also enabled implicitly when OTEL_EXPORTER_OTLP_ENDPOINT or OTEL_EXPORTER_OTLP_TRACES_ENDPOINT is set")
 	flag.BoolVar(&refreshProviders, "refresh-providers", false, "force a live re-fetch of the models.dev catalog right now, bypassing the cache, and hard-fail if it can't be reached (every startup already does this sync against the cached catalog — see the provider-sync block in run() — so this flag is only for forcing it to happen immediately with fresh data instead of waiting out modelsDevCacheMaxAge)")
+	flag.BoolVar(&refreshDefaults, "refresh-defaults", false, "fill in any of Canopy's default agents/skills that are missing from ~/.canopy/agents or ~/.canopy/skills, even if those directories already have other files in them — additive only, like --refresh-providers: never overwrites a file that already exists, so a hand-edit is never touched. Use this after upgrading canopy, when a new version ships a default agent/skill your existing ~/.canopy didn't have yet (that directory is otherwise only ever seeded once, on the very first run)")
 	flag.BoolVar(&continueLatest, "continue", false, "resume the most recently updated chat session (across any agent) instead of starting a new one or auto-resuming the last-used agent — Design §5 addendum")
 	flag.Parse()
 
@@ -121,29 +123,34 @@ func run() error {
 	// not a reason to silently proceed with zero agents.
 	//
 	// The trigger is ~/.canopy/agents itself being missing or empty
-	// (dirMissingOrEmpty), not the total agent count across all
-	// three sources: a user with agents only in project/personal
-	// .claude/agents still gets Canopy's own defaults seeded into
-	// ~/.canopy/agents the first time it's missing/empty, and — since
-	// WriteDefaults is per-file idempotent — deleting one of the eight files
-	// later (e.g. `execute.md`) regenerates just that file on the next run
-	// that finds the directory in that missing/empty state again. Once the
-	// directory has at least one file, this branch is skipped entirely, so
-	// a user's own edits or additions there are never touched.
+	// (dirMissingOrEmpty), not the total agent count across all three
+	// sources: a user with agents only in project/personal .claude/agents
+	// still gets Canopy's own defaults seeded into ~/.canopy/agents the
+	// first time it's missing/empty. Once the directory has at least one
+	// file, this first-run branch is skipped for good on every later
+	// startup — WriteDefaults' own per-file idempotency only matters while
+	// this branch actually runs, so a directory that's missing just one of
+	// the eight files (not all of them) does NOT get that file
+	// regenerated on an ordinary run, contrary to what an earlier revision
+	// of this comment claimed. That gap is exactly what --refresh-defaults
+	// (below) is for: --global notwithstanding, a user's own edits or
+	// additions here are still never touched by either path, since
+	// WriteDefaults never overwrites a file that already exists.
 	defaultAgentsDir := filepath.Join(homeDir, ".canopy", "agents")
 	needsDefaultAgents, err := dirMissingOrEmpty(defaultAgentsDir)
 	if err != nil {
 		return fmt.Errorf("checking default agent directory %s: %w", defaultAgentsDir, err)
 	}
-	if needsDefaultAgents {
-		if err := agentsource.WriteDefaults(defaultAgentsDir); err != nil {
+	if needsDefaultAgents || refreshDefaults {
+		added, err := writeMissingDefaults(defaultAgentsDir, agentsource.WriteDefaults)
+		if err != nil {
 			return fmt.Errorf("creating default agents: %w", err)
 		}
 		agents, err = agentsource.Load(projectRoot, homeDir)
 		if err != nil {
 			return fmt.Errorf("loading agent definitions: %w", err)
 		}
-		fmt.Fprintf(os.Stderr, "canopy: %s is missing or empty; created default agents (general, explore, review, debug, research, design, plan, execute) there\n", defaultAgentsDir)
+		reportDefaultsRefresh(needsDefaultAgents, defaultAgentsDir, "agent", added)
 	}
 
 	// Same zero-config posture, for skills (post-v0.1.0 addendum): Canopy
@@ -153,21 +160,24 @@ func run() error {
 	// default agents above. ~/.canopy/skills is a new third source
 	// skillsource.Load now scans (lowest precedence, mirroring
 	// ~/.canopy/agents), so this never shadows a project's or a user's own
-	// same-named skill.
+	// same-named skill. Same --refresh-defaults handling as agents above,
+	// for the same reason: this directory is otherwise only ever seeded
+	// once, on the very first run.
 	defaultSkillsDir := filepath.Join(homeDir, ".canopy", "skills")
 	needsDefaultSkills, err := dirMissingOrEmpty(defaultSkillsDir)
 	if err != nil {
 		return fmt.Errorf("checking default skills directory %s: %w", defaultSkillsDir, err)
 	}
-	if needsDefaultSkills {
-		if err := skillsource.WriteDefaults(defaultSkillsDir); err != nil {
+	if needsDefaultSkills || refreshDefaults {
+		added, err := writeMissingDefaults(defaultSkillsDir, skillsource.WriteDefaults)
+		if err != nil {
 			return fmt.Errorf("creating default skills: %w", err)
 		}
 		skills, err = skillsource.Load(projectRoot, homeDir)
 		if err != nil {
 			return fmt.Errorf("loading skills: %w", err)
 		}
-		fmt.Fprintf(os.Stderr, "canopy: %s is missing or empty; created default skill(s) (mcp-server-setup) there\n", defaultSkillsDir)
+		reportDefaultsRefresh(needsDefaultSkills, defaultSkillsDir, "skill", added)
 	}
 
 	// --- Canopy's own provider/model config (Design §4) ---
@@ -607,6 +617,73 @@ func dirMissingOrEmpty(dir string) (bool, error) {
 		return false, fmt.Errorf("failed to read %s: %w", dir, err)
 	}
 	return len(entries) == 0, nil
+}
+
+// writeMissingDefaults calls writeFn(dir) — agentsource.WriteDefaults or
+// skillsource.WriteDefaults — and reports which filenames it actually
+// created, by snapshotting dir's entries before and after. Needed because
+// neither WriteDefaults function reports what it wrote (they're
+// per-file-idempotent and silent about which files were already there), and
+// --refresh-defaults' messaging (reportDefaultsRefresh) needs to tell "added
+// N files" apart from "found nothing to add" without guessing.
+func writeMissingDefaults(dir string, writeFn func(string) error) ([]string, error) {
+	before, err := direntNames(dir)
+	if err != nil {
+		return nil, err
+	}
+	if err := writeFn(dir); err != nil {
+		return nil, err
+	}
+	after, err := direntNames(dir)
+	if err != nil {
+		return nil, err
+	}
+	var added []string
+	for name := range after {
+		if !before[name] {
+			added = append(added, name)
+		}
+	}
+	sort.Strings(added)
+	return added, nil
+}
+
+// direntNames returns dir's entry names as a set. A missing directory is
+// not an error — it simply has no entries yet, matching dirMissingOrEmpty's
+// own "missing is a kind of empty" treatment.
+func direntNames(dir string) (map[string]bool, error) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return map[string]bool{}, nil
+		}
+		return nil, fmt.Errorf("failed to read %s: %w", dir, err)
+	}
+	names := make(map[string]bool, len(entries))
+	for _, e := range entries {
+		names[e.Name()] = true
+	}
+	return names, nil
+}
+
+// reportDefaultsRefresh prints the one-line stderr notice for either
+// trigger that can reach writeMissingDefaults: wasFirstRun (dir was missing
+// or empty — the original zero-config first-run case) always printed
+// "created," regardless of --refresh-defaults also being set; otherwise
+// (dir already had content, so only --refresh-defaults itself could have
+// triggered this call) prints what --refresh-defaults actually added, or
+// that it found nothing to add — mirroring --refresh-providers' own
+// "found nothing to add" message for the same "explicit ask, nothing new"
+// case.
+func reportDefaultsRefresh(wasFirstRun bool, dir, kind string, added []string) {
+	switch {
+	case wasFirstRun:
+		fmt.Fprintf(os.Stderr, "canopy: %s is missing or empty; created default %s(s) (%s) there\n", dir, kind, strings.Join(added, ", "))
+	case len(added) > 0:
+		fmt.Fprintf(os.Stderr, "canopy: --refresh-defaults added missing default %s(s) (%s) to %s\n", kind, strings.Join(added, ", "), dir)
+	default:
+		fmt.Fprintf(os.Stderr, "canopy: --refresh-defaults found no missing default %ss in %s (already up to date)\n", kind, dir)
+	}
 }
 
 // computeStartAgent decides which agent (if any) this run should
