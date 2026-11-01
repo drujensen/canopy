@@ -750,10 +750,14 @@ func mergeNewProviders(dst *config.ProvidersFile, detected config.ProvidersFile)
 	for _, p := range dst.Providers {
 		existing[p.Name] = true
 	}
+	ignored := make(map[string]bool, len(dst.IgnoredProviders))
+	for _, name := range dst.IgnoredProviders {
+		ignored[name] = true
+	}
 
 	var added []string
 	for _, p := range detected.Providers {
-		if existing[p.Name] {
+		if existing[p.Name] || ignored[p.Name] {
 			continue
 		}
 		dst.Providers = append(dst.Providers, p)

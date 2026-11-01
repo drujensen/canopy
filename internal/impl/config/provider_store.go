@@ -41,6 +41,19 @@ type ProvidersFile struct {
 	// default, and one teammate's missing local model shouldn't break
 	// every other agent for them.
 	AgentModels map[string]string `json:"agent_models,omitempty"`
+
+	// IgnoredProviders lists provider Names (matching the catalog id
+	// DetectProviders assigns as a non-native provider's display name, e.g.
+	// "opencode-go") that must never be auto-(re)added by the startup
+	// provider-sync or --refresh-providers merge, even though the matching
+	// API-key env var is still set and the catalog still lists it. Without
+	// this, removing an unwanted auto-detected provider by hand-editing
+	// Providers/Models is not durable: the very next startup's sync against
+	// the models.dev catalog (see cmd/canopy's mergeNewProviders) treats it
+	// as newly detected again, since nothing distinguishes "never seen
+	// before" from "deliberately removed" — see cmd/canopy's
+	// mergeNewProviders doc comment.
+	IgnoredProviders []string `json:"ignored_providers,omitempty"`
 }
 
 // ProviderStore reads and writes the flat provider/model config file

@@ -274,6 +274,37 @@ func TestMergeNewProviders_NothingNewIsANoOp(t *testing.T) {
 	assert.Equal(t, "gpt-4o", dst.Models[0].ModelName)
 }
 
+// TestMergeNewProviders_IgnoredProviderNeverComesBack covers removing an
+// unwanted auto-detected provider (e.g. one sharing an API-key env var with
+// a provider the user does want, so unsetting the env var isn't an option)
+// by hand-editing it out of Providers/Models: without IgnoredProviders, the
+// very next sync against the catalog would re-add it, since nothing
+// distinguishes "never seen before" from "deliberately removed."
+func TestMergeNewProviders_IgnoredProviderNeverComesBack(t *testing.T) {
+	dst := &config.ProvidersFile{
+		Providers:        []entities.ProviderConfig{{Name: "opencode", Type: entities.ProviderType("opencode")}},
+		Models:           []entities.ModelConfig{{Name: "opencode/beam-free", Provider: "opencode", ModelName: "beam-free"}},
+		IgnoredProviders: []string{"opencode-go"},
+	}
+	detected := config.ProvidersFile{
+		Providers: []entities.ProviderConfig{
+			{Name: "opencode", Type: entities.ProviderType("opencode"), APIKeyEnv: "OPENCODE_API_KEY"},
+			{Name: "opencode-go", Type: entities.ProviderType("opencode-go"), APIKeyEnv: "OPENCODE_API_KEY"},
+		},
+		Models: []entities.ModelConfig{
+			{Name: "opencode/beam-free", Provider: "opencode", ModelName: "beam-free"},
+			{Name: "opencode-go/beam-free", Provider: "opencode-go", ModelName: "beam-free"},
+		},
+	}
+
+	added := mergeNewProviders(dst, detected)
+
+	assert.Empty(t, added)
+	require.Len(t, dst.Providers, 1)
+	require.Len(t, dst.Models, 1)
+	assert.Equal(t, "opencode", dst.Providers[0].Name)
+}
+
 // TestMergeNewModelsForExistingProviders_AddsMissingModelsForKnownProvider
 // is the specific bug this function exists to fix: a provider configured
 // with only one model (e.g. an early "deepseek" entry predating
