@@ -60,7 +60,7 @@ type BuildParams struct {
 func Build(ctx context.Context, params BuildParams) (*agent.Agent, error) {
 	cfg := WireLoopQuality(params)
 	cfg.HistoryProvider = NewChatHistoryProvider(params.Chat.ID, params.Repository)
-	return providers.New(ctx, params.Provider, params.Model, cfg)
+	return providers.New(providers.WithChatID(ctx, params.Chat.ID), params.Provider, params.Model, cfg)
 }
 
 // WireLoopQuality attaches the loop-quality context providers to

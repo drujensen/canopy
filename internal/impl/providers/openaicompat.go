@@ -123,7 +123,9 @@ func openaiRetryableStatusOption() option.RequestOption {
 			}
 		}
 
-		notifyRetry(req, res, forced413)
+		if !forceNoRetryOnExcessiveRetryAfter(res) {
+			notifyRetry(req, res, forced413)
+		}
 		return res, nil
 	})
 }
@@ -135,6 +137,15 @@ func openaiRetryableStatusOption() option.RequestOption {
 // Responses API, which is why every OpenAI-compatible provider shares this
 // one path instead of getting its own adapter.
 func newOpenAICompatible(cfg entities.ProviderConfig, model entities.ModelConfig, agentCfg agent.Config) (*agent.Agent, error) {
+	return newOpenAICompatibleWithOptions(cfg, model, agentCfg)
+}
+
+// newOpenAICompatibleWithOptions is newOpenAICompatible plus any extra
+// client-level request options appended after this path's own (so a caller
+// like newOpenCode, opencode.go, can add a header without duplicating the
+// BaseURL/APIKey/retry/timeout wiring every OpenAI-compatible provider
+// needs regardless).
+func newOpenAICompatibleWithOptions(cfg entities.ProviderConfig, model entities.ModelConfig, agentCfg agent.Config, extra ...option.RequestOption) (*agent.Agent, error) {
 	if cfg.BaseURL == "" {
 		return nil, fmt.Errorf("providers: provider %q (%s) requires base_url", cfg.Name, cfg.Type)
 	}
@@ -146,6 +157,7 @@ func newOpenAICompatible(cfg entities.ProviderConfig, model entities.ModelConfig
 	}
 	opts = append(opts, openaiTimeoutOptions(cfg)...)
 	opts = append(opts, openaiStallTimeoutOption(cfg)...)
+	opts = append(opts, extra...)
 	client := openai.NewClient(opts...)
 	return openaiprovider.NewChatCompletionsAgent(client, openaiprovider.AgentConfig{
 		Config: agentCfg,

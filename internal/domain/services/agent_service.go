@@ -1014,7 +1014,7 @@ func (s *AgentService) generateChatTitle(ctx context.Context, chatID string) (st
 		return "", fmt.Errorf("agent service: chat %q has no messages to generate a title from yet", chatID)
 	}
 
-	titleAgent, err := providers.New(ctx, provider, model, agent.Config{Name: "canopy-title-generator", Logger: s.logger})
+	titleAgent, err := providers.New(providers.WithChatID(ctx, chatID), provider, model, agent.Config{Name: "canopy-title-generator", Logger: s.logger})
 	if err != nil {
 		return "", fmt.Errorf("agent service: building title-generation agent for chat %q: %w", chatID, err)
 	}
@@ -1290,7 +1290,15 @@ func (s *AgentService) buildSubagentAgent(ctx context.Context, def agentsource.A
 		Logger:      s.logger,
 		Middlewares: s.middlewares,
 	}
-	a, err := providers.New(ctx, provider, model, cfg)
+	// A subagent dispatch has no persisted Chat to take a session id from
+	// (Design §3.4's own context isolation — see this function's doc
+	// comment), but it's still exactly one self-contained "conversation"
+	// from newOpenCode's perspective: a fresh, one-shot id per dispatch
+	// satisfies "stable per conversation" the same way a real chat ID
+	// would, just scoped to this one subagent run instead of a persisted
+	// chat.
+	subagentSessionID := fmt.Sprintf("subagent-%s-%d", def.Name, time.Now().UnixNano())
+	a, err := providers.New(providers.WithChatID(ctx, subagentSessionID), provider, model, cfg)
 	if err != nil {
 		return nil, "", err
 	}

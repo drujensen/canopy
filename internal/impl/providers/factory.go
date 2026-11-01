@@ -74,6 +74,9 @@ func New(ctx context.Context, cfg entities.ProviderConfig, model entities.ModelC
 		return newOpenAICompatible(cfg, model, agentCfg)
 
 	default:
+		if isOpenCodeProviderType(cfg.Type) {
+			return newOpenCode(cfg, model, agentCfg, chatIDFromContext(ctx))
+		}
 		if cfg.BaseURL != "" {
 			return newOpenAICompatible(cfg, model, agentCfg)
 		}

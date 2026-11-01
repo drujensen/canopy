@@ -139,3 +139,82 @@ func TestOpenAIRetryableStatusOption_NoNotifierNoPanic(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, "ok", resp.String())
 }
+
+// TestOpenAIRetryableStatusOption_GivesUpImmediatelyOnExcessiveRetryAfter is
+// the real incident this was added for: OpenCode's free-tier models return
+// 429 with a Retry-After header giving the literal time until the
+// account's daily free quota resets (confirmed live at 20681 seconds,
+// ~5h45m) once that quota is exhausted. Left to the openai-go SDK's own
+// retry loop, which honors Retry-After with no cap at all, a turn would
+// wait out that entire window — indistinguishable from Canopy hanging
+// forever, with no error, no log entry, and nothing left running that
+// "esc" could even cancel. This asserts the call instead fails fast (one
+// attempt, no retry) and reports no "retrying" notice — a notice promising
+// a retry that was just refused would be actively wrong.
+func TestOpenAIRetryableStatusOption_GivesUpImmediatelyOnExcessiveRetryAfter(t *testing.T) {
+	var attempts int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attempts++
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Retry-After", "20681")
+		w.WriteHeader(http.StatusTooManyRequests)
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"type": "error",
+			"error": map[string]any{
+				"type":    "FreeUsageLimitError",
+				"message": "Free usage limit reached. Free models work in OpenCode (https://opencode.ai); subscribe to OpenCode Go to keep going: https://opencode.ai/go",
+			},
+		})
+	}))
+	defer server.Close()
+
+	cfg := entities.ProviderConfig{Name: "test-opencode", Type: entities.ProviderType("opencode"), APIKey: "k", BaseURL: server.URL + "/v1"}
+	model := entities.ModelConfig{Name: "m", Provider: cfg.Name, ModelName: "beam-free"}
+	a, err := New(context.Background(), cfg, model, agent.Config{Name: "test-agent"})
+	require.NoError(t, err)
+
+	ctx, notices := collectNotices(context.Background())
+	start := time.Now()
+	_, err = a.RunText(ctx, "hi").Collect()
+	elapsed := time.Since(start)
+
+	require.Error(t, err)
+	assert.Less(t, elapsed, 5*time.Second, "must fail fast, not wait out Retry-After")
+	assert.Equal(t, 1, attempts, "must not retry at all once Retry-After exceeds the sane cap")
+	assert.Empty(t, notices(), "must not report a retry notice for a retry that was refused")
+}
+
+// TestOpenAIRetryableStatusOption_StillRetriesSaneRetryAfter guards against
+// an over-eager fix: a short, genuinely-worth-waiting-out Retry-After (well
+// under maxSaneRetryAfter) must still retry and succeed exactly as before.
+func TestOpenAIRetryableStatusOption_StillRetriesSaneRetryAfter(t *testing.T) {
+	var attempts int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attempts++
+		w.Header().Set("Content-Type", "application/json")
+		if attempts < 2 {
+			w.Header().Set("Retry-After", "1")
+			w.WriteHeader(http.StatusTooManyRequests)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"error": map[string]any{"message": "slow down", "type": "requests", "code": "rate_limit_exceeded"},
+			})
+			return
+		}
+		_ = json.NewEncoder(w).Encode(chatCompletionResponse("hello after short wait"))
+	}))
+	defer server.Close()
+
+	cfg := entities.ProviderConfig{Name: "test-opencode", Type: entities.ProviderType("opencode"), APIKey: "k", BaseURL: server.URL + "/v1"}
+	model := entities.ModelConfig{Name: "m", Provider: cfg.Name, ModelName: "beam-free"}
+	a, err := New(context.Background(), cfg, model, agent.Config{Name: "test-agent"})
+	require.NoError(t, err)
+
+	ctx, notices := collectNotices(context.Background())
+	resp, err := a.RunText(ctx, "hi").Collect()
+	require.NoError(t, err)
+	assert.Equal(t, "hello after short wait", resp.String())
+
+	got := notices()
+	require.Len(t, got, 1)
+	assert.Equal(t, 1*time.Second, got[0].Delay)
+}

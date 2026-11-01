@@ -8,6 +8,67 @@ import (
 	"time"
 )
 
+// maxSaneRetryAfter bounds how long a server-provided Retry-After is ever
+// worth actually waiting out automatically. Real incident (post-v0.1.0
+// addendum): OpenCode's free-tier models return 429 with
+// {"type":"error","error":{"type":"FreeUsageLimitError",...}} once the
+// account's daily free quota is exhausted, and its Retry-After header gives
+// the literal time until that quota resets — confirmed live at 20681
+// seconds (~5h45m). The openai-go SDK's own retry loop
+// (internal/requestconfig/requestconfig.go's retryDelay) honors Retry-After
+// with no cap at all, so left alone it waits out the *entire* quota window
+// before trying again — indistinguishable from Canopy hanging forever, with
+// no error, no log entry, and nothing left running that "esc" could even
+// cancel (the wait only races against ctx.Done(), which a merely-idle user
+// never fires). A rate limit worth silently waiting out is seconds, maybe a
+// couple minutes; anything beyond that means the resource genuinely won't
+// be back soon, and the honest move is a clean, visible failure now rather
+// than a silent multi-hour stall. See forceNoRetryOnExcessiveRetryAfter,
+// which this bounds.
+const maxSaneRetryAfter = 2 * time.Minute
+
+// forceNoRetryOnExcessiveRetryAfter sets the "x-should-retry" response
+// header to "false" when res carries a Retry-After (or Retry-After-Ms)
+// beyond maxSaneRetryAfter, overriding the openai-go SDK's own
+// default-retryable status-code check (shouldRetry honors an explicit
+// "x-should-retry" ahead of status code, exactly the mechanism
+// openaiRetryableStatusOption already uses to force retries *on* for
+// Groq's 413 case — this is that same lever pulled the other way).
+// Reports whether it fired, so the caller (openaiRetryableStatusOption)
+// knows to skip notifyRetry — a "retrying X/Y in ~20681s" notice would be
+// actively wrong once this has already told the SDK not to retry at all.
+func forceNoRetryOnExcessiveRetryAfter(res *http.Response) bool {
+	d, ok := parseRetryAfterHeader(res)
+	if !ok || d <= maxSaneRetryAfter {
+		return false
+	}
+	res.Header.Set("x-should-retry", "false")
+	return true
+}
+
+// parseRetryAfterHeader mirrors the openai-go SDK's own unexported
+// parseRetryAfterHeader (internal/requestconfig/requestconfig.go): checks
+// Retry-After-Ms (milliseconds) first, then Retry-After (seconds, or an
+// RFC1123 HTTP-date), the same order and formats the SDK's real retry delay
+// computation reads — duplicated here so forceNoRetryOnExcessiveRetryAfter
+// can see the same delay the SDK is about to commit to, before it does.
+func parseRetryAfterHeader(res *http.Response) (time.Duration, bool) {
+	if v := res.Header.Get("Retry-After-Ms"); v != "" {
+		if ms, err := strconv.ParseFloat(v, 64); err == nil && ms >= 0 {
+			return time.Duration(ms * float64(time.Millisecond)), true
+		}
+	}
+	if v := res.Header.Get("Retry-After"); v != "" {
+		if secs, err := strconv.ParseFloat(v, 64); err == nil && secs >= 0 {
+			return time.Duration(secs * float64(time.Second)), true
+		}
+		if t, err := time.Parse(time.RFC1123, v); err == nil {
+			return time.Until(t), true
+		}
+	}
+	return 0, false
+}
+
 // RetryNotice describes one HTTP response an openai-go-based provider
 // client (newOpenAINative/newOpenAICompatible/newOllama — all three install
 // openaiRetryableStatusOption) is about to retry. It exists so a caller
@@ -95,15 +156,17 @@ func retryReason(statusCode int, forced413 bool) string {
 
 // estimateRetryDelay approximates how long the SDK's own retry loop
 // (requestconfig.go's retryDelay) will wait before the next attempt: the
-// response's Retry-After header (seconds) when the server sent one,
-// otherwise the same 0.5s*2^attempt exponential curve capped at 8s —
+// response's Retry-After/Retry-After-Ms header when the server sent one
+// (via parseRetryAfterHeader, the same parse forceNoRetryOnExcessiveRetryAfter
+// uses), otherwise the same 0.5s*2^attempt exponential curve capped at 8s —
 // without the real implementation's random jitter, since this is only for
-// display.
+// display. Only ever called for a response forceNoRetryOnExcessiveRetryAfter
+// has already let through (notifyRetry runs after it in
+// openaiRetryableStatusOption), so a Retry-After this sees is always within
+// maxSaneRetryAfter.
 func estimateRetryDelay(res *http.Response, attempt int) time.Duration {
-	if v := res.Header.Get("Retry-After"); v != "" {
-		if secs, err := strconv.ParseFloat(v, 64); err == nil && secs >= 0 {
-			return time.Duration(secs * float64(time.Second))
-		}
+	if d, ok := parseRetryAfterHeader(res); ok {
+		return d
 	}
 	delay := time.Duration(0.5 * float64(time.Second) * math.Pow(2, float64(attempt)))
 	if delay > 8*time.Second {

@@ -2277,7 +2277,7 @@ func (c *chatModel) sidebarHeight() int {
 // View's layout already visually allots it next to the composer/approval
 // prompt.
 func (c *chatModel) renderStatusErrLine() string {
-	text := "error: " + strings.ReplaceAll(strings.ReplaceAll(c.statusErr.Error(), "\r\n", " "), "\n", " ")
+	text := "error: " + strings.ReplaceAll(strings.ReplaceAll(providers.FormatError(c.statusErr), "\r\n", " "), "\n", " ")
 
 	maxWidth := c.mainWidth()
 	if maxWidth <= 0 {
