@@ -994,11 +994,11 @@ func newSkillsTestService(t *testing.T) *services.AgentService {
 	})
 }
 
-// TestChatModel_CtrlS_OpensSkillsBrowser_SelectingShowsRealBody drives the
+// TestChatModel_CtrlS_OpensSkillsBrowser_SelectingFillsComposer drives the
 // real ctrl+s keybinding path end to end: opens the overlay, selects the
-// only loaded skill, and asserts the skill's actual Body (not a
-// placeholder) lands in the transcript as a system-style entry.
-func TestChatModel_CtrlS_OpensSkillsBrowser_SelectingShowsRealBody(t *testing.T) {
+// only loaded skill, and asserts the composer is pre-filled with the skill
+// invocation prefix and nothing is sent.
+func TestChatModel_CtrlS_OpensSkillsBrowser_SelectingFillsComposer(t *testing.T) {
 	svc := newSkillsTestService(t)
 	ctx := context.Background()
 	_, err := svc.StartChat(ctx, "chat-1", "assistant")
@@ -1012,15 +1012,40 @@ func TestChatModel_CtrlS_OpensSkillsBrowser_SelectingShowsRealBody(t *testing.T)
 	assert.Equal(t, pickerSkill, c.pickerKind)
 
 	selectCmd := c.handleKey(tea.KeyMsg{Type: tea.KeyEnter}, svc, ctx)
-	assert.Nil(t, selectCmd, "selecting a skill is also synchronous — GetSkillBody is a pure in-memory lookup")
+	assert.Nil(t, selectCmd, "selecting a skill must not send anything — it only fills the composer")
 	assert.Nil(t, c.picker, "selecting an entry must close the overlay")
 
-	require.Len(t, c.transcript, 1, "the skill's body must be folded into the transcript")
-	assert.True(t, c.transcript[0].system, "the skill-detail entry must be marked system, not a real user/assistant message")
-	assert.Contains(t, c.transcript[0].text, "Distinctive real skill body content, marker XYZZY", "the real Body must be shown, not a hallucination or placeholder")
+	assert.Empty(t, c.transcript, "selecting a skill must not add anything to the transcript or send a turn")
+	assert.Equal(t, "Use the pdf-processing skill: ", c.composer.Value(), "selecting a skill must fill the composer with its invocation prefix")
+}
 
-	view := c.View(80, 24)
-	assert.Contains(t, view, "XYZZY", "the shown skill content must actually be visible in the rendered view")
+// TestChatModel_CtrlS_SelectionKeepsExistingComposerText asserts that
+// selecting a skill keeps whatever the user had already typed, after the
+// prefix, so the user can write the parameters in front of or after it.
+func TestChatModel_CtrlS_SelectionKeepsExistingComposerText(t *testing.T) {
+	svc := newSkillsTestService(t)
+	ctx := context.Background()
+	_, err := svc.StartChat(ctx, "chat-1", "assistant")
+	require.NoError(t, err)
+
+	c := newChatModel("chat-1", "assistant", nil, "m1", 80, 24)
+	c.composer.SetValue("diagram the tool layer")
+
+	c.handleKey(tea.KeyMsg{Type: tea.KeyCtrlS}, svc, ctx)
+	c.handleKey(tea.KeyMsg{Type: tea.KeyEnter}, svc, ctx)
+
+	assert.Equal(t, "Use the pdf-processing skill: diagram the tool layer", c.composer.Value())
+}
+
+// TestToolResultSegment_SkillShowsLoadedSize asserts a successful Skill tool
+// call produces a visible transcript line reporting how much content loaded
+// into context, so a skill load is observable without asking the model.
+func TestToolResultSegment_SkillShowsLoadedSize(t *testing.T) {
+	seg := toolResultSegmentFor("Skill", &message.FunctionResultContent{
+		Result: tools.SkillOutput{Content: "hello skill"},
+	})
+	assert.Equal(t, segmentToolResult, seg.kind)
+	assert.Equal(t, "loaded skill content (11 bytes) into context", seg.text)
 }
 
 // TestChatModel_CtrlS_NoSkillsConfigured_ShowsSensibleMessage asserts ctrl+s

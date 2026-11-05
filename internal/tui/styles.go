@@ -52,9 +52,8 @@ var (
 	toolErrorStyle = errorStyle
 
 	// systemLabelStyle labels a system-style informational transcript entry
-	// (post-v0.1.0 addendum: the ctrl+s skills-browser folding a skill's Body
-	// into the transcript — see chatModel.showSkill) distinctly from a real
-	// user/assistant message.
+	// (e.g. ctrl+t's tool details, or a notice like "No skills configured.")
+	// distinctly from a real user/assistant message.
 	systemLabelStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("5"))
 
 	errorStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("1")).Bold(true)

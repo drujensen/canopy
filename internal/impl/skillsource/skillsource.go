@@ -105,7 +105,11 @@ func loadDir(dir string) (map[string]SkillDefinition, error) {
 
 	var names []string
 	for _, e := range entries {
-		if e.IsDir() {
+		isDir, err := entryIsDir(dir, e)
+		if err != nil {
+			return nil, err
+		}
+		if isDir {
 			names = append(names, e.Name())
 		}
 	}
@@ -135,6 +139,25 @@ func loadDir(dir string) (map[string]SkillDefinition, error) {
 	}
 
 	return result, nil
+}
+
+// entryIsDir reports whether a directory entry is a directory, following
+// symlinks. DirEntry.IsDir does not follow symlinks, so a skill installed as a
+// symlink (e.g. ~/.claude/skills/archify -> a repo checkout) would otherwise be
+// silently skipped. A dangling symlink is reported as not-a-directory so the
+// loader skips it instead of failing the whole scan.
+func entryIsDir(dir string, e os.DirEntry) (bool, error) {
+	if e.Type()&os.ModeSymlink == 0 {
+		return e.IsDir(), nil
+	}
+	info, err := os.Stat(filepath.Join(dir, e.Name()))
+	if err != nil {
+		if os.IsNotExist(err) {
+			return false, nil
+		}
+		return false, fmt.Errorf("failed to stat skill entry %s: %w", filepath.Join(dir, e.Name()), err)
+	}
+	return info.IsDir(), nil
 }
 
 func parseSkillFile(path, dir string) (SkillDefinition, error) {

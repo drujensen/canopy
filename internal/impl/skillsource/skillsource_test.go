@@ -205,6 +205,39 @@ Project body.
 	assert.Equal(t, "Project version.", defs["shared-name"].Description)
 }
 
+// TestLoad_FollowsSymlinkedSkillDir covers the case where a skill directory is
+// a symlink to a checkout elsewhere (e.g. ~/.claude/skills/archify ->
+// ~/workspace/.../archify). DirEntry.IsDir does not follow symlinks, so the
+// loader must resolve them explicitly. A dangling symlink must be skipped
+// without failing the scan.
+func TestLoad_FollowsSymlinkedSkillDir(t *testing.T) {
+	projectRoot := t.TempDir()
+	homeDir := t.TempDir()
+
+	// Real skill lives outside the skills directory.
+	checkout := filepath.Join(t.TempDir(), "archify-checkout")
+	writeFile(t, filepath.Join(checkout, "SKILL.md"), `---
+name: archify
+description: Architecture diagrams.
+---
+Archify body.
+`)
+
+	skillsDir := filepath.Join(homeDir, ".claude", "skills")
+	require.NoError(t, os.MkdirAll(skillsDir, 0o755))
+	require.NoError(t, os.Symlink(checkout, filepath.Join(skillsDir, "archify")))
+	require.NoError(t, os.Symlink(filepath.Join(t.TempDir(), "gone"), filepath.Join(skillsDir, "dangling")))
+
+	defs, err := Load(projectRoot, homeDir)
+	require.NoError(t, err)
+	require.Len(t, defs, 1)
+
+	def, ok := defs["archify"]
+	require.True(t, ok)
+	assert.Equal(t, "Archify body.", def.Body)
+	assert.Equal(t, filepath.Join(skillsDir, "archify"), def.Dir)
+}
+
 // TestWriteDefaults_WritesLoadableSkill asserts the generated
 // mcp-server-setup skill is well-formed enough for Load to parse it
 // successfully, with a non-empty description (level-1 catalog entry) and

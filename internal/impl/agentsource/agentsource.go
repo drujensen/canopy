@@ -85,6 +85,58 @@ func Load(projectRoot, homeDir string) (map[string]AgentDefinition, error) {
 	return result, nil
 }
 
+// collectMarkdownPaths returns every *.md file under root, recursively. Unlike
+// filepath.Walk, it follows symlinks to directories (and a symlinked root), so
+// agents shared via symlink — e.g. a checkout linked into .claude/agents — are
+// found. Directories are tracked by their resolved real path so a symlink cycle
+// is visited only once. Dangling symlinks are skipped.
+func collectMarkdownPaths(root string) ([]string, error) {
+	var paths []string
+	visited := make(map[string]bool)
+
+	var walk func(dir string) error
+	walk = func(dir string) error {
+		real, err := filepath.EvalSymlinks(dir)
+		if err != nil {
+			return err
+		}
+		if visited[real] {
+			return nil
+		}
+		visited[real] = true
+
+		entries, err := os.ReadDir(dir)
+		if err != nil {
+			return err
+		}
+		for _, e := range entries {
+			path := filepath.Join(dir, e.Name())
+			info, err := os.Stat(path) // follows symlinks
+			if err != nil {
+				if os.IsNotExist(err) {
+					continue // dangling symlink
+				}
+				return err
+			}
+			if info.IsDir() {
+				if err := walk(path); err != nil {
+					return err
+				}
+				continue
+			}
+			if strings.HasSuffix(strings.ToLower(info.Name()), ".md") {
+				paths = append(paths, path)
+			}
+		}
+		return nil
+	}
+
+	if err := walk(root); err != nil {
+		return nil, err
+	}
+	return paths, nil
+}
+
 // loadDir scans dir recursively for *.md files and parses each into an
 // AgentDefinition, keyed by name. A missing dir returns an empty map, not an
 // error.
@@ -102,19 +154,7 @@ func loadDir(dir string) (map[string]AgentDefinition, error) {
 		return result, nil
 	}
 
-	var paths []string
-	walkErr := filepath.Walk(dir, func(path string, fi os.FileInfo, err error) error {
-		if err != nil {
-			return err
-		}
-		if fi.IsDir() {
-			return nil
-		}
-		if strings.HasSuffix(strings.ToLower(fi.Name()), ".md") {
-			paths = append(paths, path)
-		}
-		return nil
-	})
+	paths, walkErr := collectMarkdownPaths(dir)
 	if walkErr != nil {
 		return nil, fmt.Errorf("failed to walk agent directory %s: %w", dir, walkErr)
 	}

@@ -91,6 +91,48 @@ Personal body.
 	assert.Equal(t, "Project body.", defs["shared"].Instructions)
 }
 
+// TestLoad_FollowsSymlinks covers a symlinked agents root, a symlinked
+// subdirectory, a symlinked file, a dangling symlink, and a directory cycle.
+// filepath.Walk skipped the first two silently; the loader must find them all
+// and must not loop on the cycle.
+func TestLoad_FollowsSymlinks(t *testing.T) {
+	agent := func(name string) string {
+		return "---\nname: " + name + "\ndescription: d\n---\nbody\n"
+	}
+	base := t.TempDir()
+
+	// Symlinked agents root (e.g. .claude/agents -> shared checkout).
+	realRoot := filepath.Join(base, "real-agents")
+	writeFile(t, filepath.Join(realRoot, "root-agent.md"), agent("root-agent"))
+	projectRoot := filepath.Join(base, "project")
+	require.NoError(t, os.MkdirAll(filepath.Join(projectRoot, ".claude"), 0o755))
+	require.NoError(t, os.Symlink(realRoot, filepath.Join(projectRoot, ".claude", "agents")))
+
+	// Symlinked subdirectory inside a real root, a symlinked file, a dangling
+	// link, and a cycle back to the root.
+	subReal := filepath.Join(base, "sub-real")
+	writeFile(t, filepath.Join(subReal, "sub-agent.md"), agent("sub-agent"))
+	fileReal := filepath.Join(base, "file-agent.md")
+	writeFile(t, fileReal, agent("file-agent"))
+
+	mixedRoot := filepath.Join(base, "mixed")
+	require.NoError(t, os.MkdirAll(mixedRoot, 0o755))
+	require.NoError(t, os.Symlink(subReal, filepath.Join(mixedRoot, "sub")))
+	require.NoError(t, os.Symlink(fileReal, filepath.Join(mixedRoot, "file.md")))
+	require.NoError(t, os.Symlink(filepath.Join(base, "gone"), filepath.Join(mixedRoot, "dangling.md")))
+	require.NoError(t, os.Symlink(mixedRoot, filepath.Join(mixedRoot, "loop")))
+
+	defs, err := loadDir(filepath.Join(projectRoot, ".claude", "agents"))
+	require.NoError(t, err)
+	assert.Contains(t, defs, "root-agent")
+
+	defs, err = loadDir(mixedRoot)
+	require.NoError(t, err)
+	assert.Contains(t, defs, "sub-agent")
+	assert.Contains(t, defs, "file-agent")
+	assert.Len(t, defs, 2)
+}
+
 func TestLoad_MissingDirectories(t *testing.T) {
 	projectRoot := t.TempDir()
 	homeDir := t.TempDir()

@@ -50,8 +50,9 @@ const (
 	pickerFiles
 	// pickerSkill identifies the ctrl+s read-only skills browser (post-v0.1.0
 	// addendum, Design §3.11/FR19) — unlike pickerAgent/pickerModel, selecting
-	// an entry never calls an AgentService mutator; it shows the skill's real
-	// Body in the transcript instead (see chatModel.showSkill).
+	// an entry never calls an AgentService mutator; it pre-fills the composer
+	// with a "Use the <name> skill: " prefix instead (see
+	// chatModel.insertSkillInvocation).
 	pickerSkill
 	// pickerTool identifies the ctrl+t read-only tools browser: like
 	// pickerSkill, selecting an entry never calls an AgentService mutator —
@@ -72,9 +73,8 @@ const (
 // either something the user sent (text), a completed assistant reply
 // (segments — built up from streamed chunks, see chatModel.streaming), or
 // a system-style informational entry (text, system: true — post-v0.1.0
-// addendum: the ctrl+s skills browser folding a skill's real Body into the
-// transcript so a user can see it without asking the model — see
-// showSkill).
+// addendum: system notices such as ctrl+s's "No skills configured." or a
+// ctrl+t tool's details).
 type transcriptEntry struct {
 	role     message.Role
 	text     string
@@ -793,8 +793,8 @@ func (c *chatModel) openToolPicker(svc *services.AgentService, ctx context.Conte
 // handlePickerKey routes a key press to whichever in-chat overlay picker is
 // currently open (see openPicker/openSkillPicker): "enter" selects the
 // highlighted item — dispatching to SetAgent/SetModel for the ctrl+a/ctrl+o
-// overlays, or displaying the chosen skill's body (showSkill) for the
-// ctrl+s browser, which never mutates the chat — "esc" cancels back to the
+// overlays, or pre-filling the composer with the skill invocation prefix
+// (insertSkillInvocation) for the ctrl+s browser, which never mutates the chat — "esc" cancels back to the
 // chat screen with no change, and any other key is forwarded to the
 // underlying bubbles/list.Model for navigation/filtering — mirroring
 // model.go's own screenAgentPicker case, reused here for the chat-scoped
@@ -811,7 +811,7 @@ func (c *chatModel) handlePickerKey(msg tea.KeyMsg, svc *services.AgentService, 
 				if !ok {
 					return nil
 				}
-				c.showSkill(svc, item.name)
+				c.insertSkillInvocation(item.name)
 				return nil
 			}
 			if kind == pickerTool {
@@ -882,29 +882,24 @@ func (c *chatModel) handlePickerKey(msg tea.KeyMsg, svc *services.AgentService, 
 	return cmd
 }
 
-// showSkill folds skillName's full Body into the transcript as a
-// system-style informational entry (post-v0.1.0 addendum, Design
-// §3.11/FR19's ctrl+s browser) — the same content the model-facing Skill
-// tool (level 2) returns, shown here directly to the user so they don't
-// need to ask the model to find out what a skill does. GetSkillBody is a
-// pure in-memory map lookup (no I/O), so — like openPicker/openSkillPicker
-// — this runs synchronously rather than round-tripping through a tea.Cmd.
-func (c *chatModel) showSkill(svc *services.AgentService, skillName string) {
-	body, err := svc.GetSkillBody(skillName)
-	if err != nil {
-		c.transcript = append(c.transcript, transcriptEntry{system: true, text: fmt.Sprintf("error: %v", err)})
-		c.refreshViewport()
-		return
-	}
-	c.transcript = append(c.transcript, transcriptEntry{system: true, text: fmt.Sprintf("Skill: %s\n\n%s", skillName, body)})
-	c.refreshViewport()
+// insertSkillInvocation is ctrl+s's "enter" action (post-v0.1.0 addendum,
+// Design §3.11/FR19): it puts "Use the <name> skill: " at the start of the
+// composer, leaving the cursor at the end so the user can type the skill's
+// parameters and send the message. Nothing is sent or launched here — the
+// model decides to load the skill's body via the Skill tool when it reads
+// the message. Any text already in the composer is kept after the prefix.
+func (c *chatModel) insertSkillInvocation(skillName string) {
+	prefix := fmt.Sprintf("Use the %s skill: ", skillName)
+	c.composer.SetValue(prefix + c.composer.Value())
+	c.composer.CursorEnd()
+	c.composer.Focus()
 }
 
 // showTool folds one selected ctrl+t tools-browser entry's full
 // name/source/description into the transcript as a system-style
 // informational entry — the picker list's own row can truncate a longer
 // tool description (the built-in Bash tool's, for one, runs several
-// sentences), so "enter" surfaces it in full the same way showSkill does
+// sentences), so "enter" surfaces it in full the same way a system entry does
 // for a skill's body.
 func (c *chatModel) showTool(name, description, source string) {
 	text := fmt.Sprintf("Tool: %s (%s)", name, source)
@@ -1580,6 +1575,14 @@ func toolResultSegmentFor(name string, frc *message.FunctionResultContent) textS
 	}
 
 	switch name {
+	case "Skill":
+		// Makes a skill load visible in the transcript (the model-facing
+		// Skill tool returns the body into context; this only reports its
+		// size so the user can see it happened). The call line above
+		// already names the skill (or file) requested.
+		if out, ok := decodeFunctionResult[tools.SkillOutput](frc.Result); ok {
+			return textSegment{kind: segmentToolResult, text: fmt.Sprintf("loaded skill content (%d bytes) into context", len(out.Content))}
+		}
 	case "run_shell":
 		if out, ok := decodeFunctionResult[string](frc.Result); ok {
 			if preview := truncatePreview(out, 400); preview != "" {
