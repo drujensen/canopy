@@ -702,7 +702,7 @@ func (s *AgentService) persistSession(ctx context.Context, chatID string, sessio
 		return nil, fmt.Errorf("agent service: reloading chat %q to persist session state: %w", chatID, err)
 	}
 	chat.SessionState = data
-	mergeUsage(chat, collector.snapshot(), s.models)
+	mergeUsage(chat, collector.snapshot(), s.models, s.providers)
 	chat.UpdatedAt = time.Now().UTC()
 	if err := s.repository.Update(ctx, chat); err != nil {
 		return nil, fmt.Errorf("agent service: persisting session state for chat %q: %w", chatID, err)

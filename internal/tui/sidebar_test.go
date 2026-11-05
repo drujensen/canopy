@@ -146,6 +146,23 @@ func TestRenderUsageLines_SingleModel_NoTotalLine(t *testing.T) {
 	assert.Equal(t, []string{"  m1", "    10 in / 5 out, $0.0010"}, lines)
 }
 
+// TestRenderUsageLines_ShowsCachedTokenBreakout asserts a model with a
+// nonzero CachedInputTokens gets an extra "(N cached)" line under its own
+// numbers (and under "total" once more than one model contributed) — the
+// post-v0.1.0 cache-aware cost addendum's visibility half: the CostUSD line
+// alone doesn't tell a user how much of InputTokens was actually billed at
+// the (usually much cheaper) cache_read rate.
+func TestRenderUsageLines_ShowsCachedTokenBreakout(t *testing.T) {
+	lines := renderUsageLines(map[string]entities.ModelUsage{
+		"m1": {InputTokens: 1000, OutputTokens: 200, CachedInputTokens: 900, CostUSD: 0.001},
+	})
+	assert.Equal(t, []string{
+		"  m1",
+		"    1000 in / 200 out, $0.0010",
+		"    (900 cached)",
+	}, lines)
+}
+
 // TestUsageCostLine_FreeModelWithRealTokens_ShowsZeroDollarsNotNoneYet
 // asserts a chat run entirely against a free/self-hosted model (e.g. an
 // Ollama model with no published per-million-token rate) — real, nonzero

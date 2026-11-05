@@ -227,12 +227,13 @@ func DetectProviders(catalog *modelsdev.Catalog, environ []string) (file Provide
 			// cost and everything else get different treatment), so a
 			// value corrected by hand here is permanent.
 			file.Models = append(file.Models, entities.ModelConfig{
-				Name:                       name + "/" + model.ID,
-				Provider:                   name,
-				ModelName:                  model.ID,
-				ContextWindowTokens:        model.Limit.Context,
-				InputCostPerMillionTokens:  model.Cost.Input,
-				OutputCostPerMillionTokens: model.Cost.Output,
+				Name:                          name + "/" + model.ID,
+				Provider:                      name,
+				ModelName:                     model.ID,
+				ContextWindowTokens:           model.Limit.Context,
+				InputCostPerMillionTokens:     model.Cost.Input,
+				OutputCostPerMillionTokens:    model.Cost.Output,
+				CacheReadCostPerMillionTokens: model.Cost.CacheRead,
 			})
 		}
 		detected = append(detected, name)

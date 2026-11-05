@@ -106,4 +106,14 @@ type ModelUsage struct {
 	InputTokens  int64   `json:"input_tokens"`
 	OutputTokens int64   `json:"output_tokens"`
 	CostUSD      float64 `json:"cost_usd"`
+
+	// CachedInputTokens is the subset of InputTokens served from the
+	// provider's prompt cache rather than processed fresh (post-v0.1.0
+	// addendum) — a breakout, not an addition: it's already included in
+	// InputTokens, matching how the providers that report it (OpenAI,
+	// OpenCode, Gemini) define their own "prompt tokens" total. Surfaced so
+	// ctrl+u's usage breakdown can show how much of a chat's reported input
+	// actually ran at the discounted cache_read rate; see mergeUsage for how
+	// that affects CostUSD.
+	CachedInputTokens int64 `json:"cached_input_tokens,omitempty"`
 }

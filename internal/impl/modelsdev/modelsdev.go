@@ -89,12 +89,17 @@ type LimitData struct {
 }
 
 // CostData describes a model's price in US dollars per million tokens
-// (post-v0.1.0 addendum), confirmed directly against a live fetch: the
-// catalog's "cost" object also carries "cache_read"/"cache_write", which
-// Canopy doesn't currently surface anywhere and so isn't captured here.
+// (post-v0.1.0 addendum), confirmed directly against a live fetch. CacheRead
+// is the price for a prompt token served from the provider's cache (e.g.
+// OpenCode's qwen3.8-flash: $0.016/M cache_read vs $0.15/M input — about 9x
+// cheaper), omitted entirely by the catalog for models/providers with no
+// caching support rather than sent as zero. CacheWrite (the catalog's
+// "cache_write") isn't captured: no provider adapter Canopy uses reports a
+// cache-write token count, so there'd be nothing to multiply it by.
 type CostData struct {
-	Input  float64 `json:"input"`
-	Output float64 `json:"output"`
+	Input     float64 `json:"input"`
+	Output    float64 `json:"output"`
+	CacheRead float64 `json:"cache_read,omitempty"`
 }
 
 // Fetch performs a live, unauthenticated HTTP GET against the real

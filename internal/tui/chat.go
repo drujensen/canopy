@@ -2231,17 +2231,24 @@ func renderUsageLines(usage map[string]entities.ModelUsage) []string {
 	// own line keeps them from wrapping mid-number the way jamming
 	// everything onto one line would.
 	lines := make([]string, 0, (len(names)+1)*2)
-	var totalIn, totalOut int64
+	var totalIn, totalOut, totalCached int64
 	var totalCost float64
 	for _, name := range names {
 		mu := usage[name]
 		totalIn += mu.InputTokens
 		totalOut += mu.OutputTokens
+		totalCached += mu.CachedInputTokens
 		totalCost += mu.CostUSD
 		lines = append(lines, "  "+name, fmt.Sprintf("    %d in / %d out, $%.4f", mu.InputTokens, mu.OutputTokens, mu.CostUSD))
+		if mu.CachedInputTokens > 0 {
+			lines = append(lines, fmt.Sprintf("    (%d cached)", mu.CachedInputTokens))
+		}
 	}
 	if len(names) > 1 {
 		lines = append(lines, "  total", fmt.Sprintf("    %d in / %d out, $%.4f", totalIn, totalOut, totalCost))
+		if totalCached > 0 {
+			lines = append(lines, fmt.Sprintf("    (%d cached)", totalCached))
+		}
 	}
 	return lines
 }

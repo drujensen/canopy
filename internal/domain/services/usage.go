@@ -89,7 +89,27 @@ func usageCollectorFromContext(ctx context.Context) *usageCollector {
 // since this chat last ran — still accumulates its tokens at zero
 // additional cost rather than being dropped, so a historical total never
 // silently loses tokens over a config change.
-func mergeUsage(chat *entities.Chat, entries []usageEntry, models map[string]entities.ModelConfig) {
+//
+// Cache-aware cost (post-v0.1.0 addendum): a provider that serves part of
+// the prompt from cache (OpenCode/OpenAI/Gemini via the "x-opencode-session"
+// header or equivalent) bills that part at CacheReadCostPerMillionTokens
+// instead of the full input rate — e.g. OpenCode's qwen3.8-flash charges
+// $0.016/M for a cache hit vs $0.15/M fresh, a ~9x difference. Billing every
+// reported input token at the full rate, as this function used to do,
+// overcounts cost dramatically on a long chat whose growing history is
+// mostly cache hits turn over turn. providers resolves each entry's model
+// to its ProviderConfig so the right convention applies: OpenAI/OpenCode/
+// Gemini report InputTokenCount *inclusive* of the cached portion (so the
+// fresh share is InputTokenCount-CachedInputTokenCount), but Anthropic
+// reports them as disjoint counters (InputTokenCount is already fresh-only,
+// cached is added on top) — see isCacheInclusive's doc comment for the
+// source citations. A model with InputCostPerMillionTokens published but no
+// CacheReadCostPerMillionTokens (the catalog hasn't published a cache rate
+// for it) bills its cached tokens at the full input rate rather than at a
+// misleading $0 — same "don't invent a discount that isn't confirmed"
+// reasoning as the overall "unknown means free" convention would otherwise
+// invert.
+func mergeUsage(chat *entities.Chat, entries []usageEntry, models map[string]entities.ModelConfig, providers map[string]entities.ProviderConfig) {
 	if len(entries) == 0 {
 		return
 	}
@@ -108,10 +128,55 @@ func mergeUsage(chat *entities.Chat, entries []usageEntry, models map[string]ent
 		mu := chat.Usage[e.modelName]
 		mu.InputTokens += e.usage.InputTokenCount
 		mu.OutputTokens += e.usage.OutputTokenCount
+		mu.CachedInputTokens += e.usage.CachedInputTokenCount
 		if model, ok := models[e.modelName]; ok {
-			mu.CostUSD += float64(e.usage.InputTokenCount) / 1_000_000 * model.InputCostPerMillionTokens
+			cached := e.usage.CachedInputTokenCount
+			fresh := e.usage.InputTokenCount
+			if isCacheInclusive(providers, model) {
+				fresh -= cached
+				if fresh < 0 {
+					fresh = 0
+				}
+			}
+			cacheRate := model.CacheReadCostPerMillionTokens
+			if cacheRate == 0 {
+				cacheRate = model.InputCostPerMillionTokens
+			}
+			mu.CostUSD += float64(fresh) / 1_000_000 * model.InputCostPerMillionTokens
+			mu.CostUSD += float64(cached) / 1_000_000 * cacheRate
 			mu.CostUSD += float64(e.usage.OutputTokenCount) / 1_000_000 * model.OutputCostPerMillionTokens
 		}
 		chat.Usage[e.modelName] = mu
 	}
+}
+
+// isCacheInclusive reports whether model's provider reports
+// UsageDetails.InputTokenCount *inclusive* of CachedInputTokenCount (true —
+// the cached share must be subtracted back out to get the fresh share) as
+// opposed to the two counters being disjoint (false — InputTokenCount is
+// already fresh-only, and cached cost is purely additive on top).
+//
+// Confirmed directly against agent-framework-go's per-provider usage
+// mapping: OpenAI (chat.go/responses.go: InputTokenCount=usage.PromptTokens/
+// usage.InputTokens, the API's own prompt-token *total*, which OpenAI's docs
+// define as inclusive of any cached portion) and Gemini (agent.go:
+// InputTokenCount=PromptTokenCount, likewise documented as the full
+// effective prompt size including cached content) are inclusive — and so is
+// every OpenAI-Chat-Completions-compatible provider Canopy talks to through
+// the same openaiprovider code path (DeepSeek, Groq, Mistral, Together, xAI,
+// Ollama, OpenCode, and the generic auto-detected fallback). Anthropic
+// (anthropicprovider/agent.go: TotalTokenCount computed in-library as plain
+// InputTokens+OutputTokens, with CachedInputTokenCount/
+// CacheCreationInputTokens tracked as separate additions never folded into
+// InputTokens) is the one exclusive case — confirmed against Anthropic's own
+// API docs, where input_tokens never includes cache_read_input_tokens.
+// providers[model.Provider] not resolving (e.g. a model whose provider was
+// since removed from providers.json) defaults to inclusive, matching every
+// real provider Canopy supports except the one named exception.
+func isCacheInclusive(providers map[string]entities.ProviderConfig, model entities.ModelConfig) bool {
+	provider, ok := providers[model.Provider]
+	if !ok {
+		return true
+	}
+	return provider.Type != entities.ProviderTypeAnthropic
 }

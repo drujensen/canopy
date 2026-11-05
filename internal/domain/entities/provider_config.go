@@ -136,4 +136,13 @@ type ModelConfig struct {
 	// same way.
 	InputCostPerMillionTokens  float64 `json:"input_cost_per_million_tokens,omitempty"`
 	OutputCostPerMillionTokens float64 `json:"output_cost_per_million_tokens,omitempty"`
+
+	// CacheReadCostPerMillionTokens is the price for a prompt token served
+	// from the provider's cache instead of processed fresh (post-v0.1.0
+	// addendum) — populated the same way as the two fields above, from the
+	// models.dev catalog's "cost.cache_read". Zero/unset means "unknown or
+	// this model/provider doesn't support caching," same convention as
+	// InputCostPerMillionTokens: services.mergeUsage then bills any reported
+	// cached tokens at the full input rate rather than at a bogus $0.
+	CacheReadCostPerMillionTokens float64 `json:"cache_read_cost_per_million_tokens,omitempty"`
 }

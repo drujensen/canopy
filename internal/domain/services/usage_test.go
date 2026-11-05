@@ -8,6 +8,7 @@ import (
 	"sync/atomic"
 	"testing"
 
+	"github.com/microsoft/agent-framework-go/message"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -27,6 +28,24 @@ func chatCompletionResponseWithUsage(text string, promptTokens, completionTokens
 		"prompt_tokens":     promptTokens,
 		"completion_tokens": completionTokens,
 		"total_tokens":      promptTokens + completionTokens,
+	}
+	return resp
+}
+
+// chatCompletionResponseWithCachedUsage is chatCompletionResponseWithUsage
+// plus OpenAI's own "prompt_tokens_details.cached_tokens" breakout —
+// promptTokens is the inclusive total (cachedTokens is a subset of it, not
+// additional), matching the real wire shape OpenCode/OpenAI-compatible
+// endpoints send.
+func chatCompletionResponseWithCachedUsage(text string, promptTokens, cachedTokens, completionTokens int) map[string]any {
+	resp := chatCompletionResponse(text)
+	resp["usage"] = map[string]any{
+		"prompt_tokens":     promptTokens,
+		"completion_tokens": completionTokens,
+		"total_tokens":      promptTokens + completionTokens,
+		"prompt_tokens_details": map[string]any{
+			"cached_tokens": cachedTokens,
+		},
 	}
 	return resp
 }
@@ -87,6 +106,91 @@ func TestAgentService_RunMessages_PersistsUsageAndCost(t *testing.T) {
 	chat, err := repo.Get(ctx, "chat-1")
 	require.NoError(t, err)
 	assert.Equal(t, result2.Usage, chat.Usage, "RunResult.Usage must match what's actually persisted")
+}
+
+// TestAgentService_RunMessages_BillsCachedTokensAtCacheReadRate is the
+// regression test for the bug this addendum fixes: Canopy used to bill every
+// reported input token at the full input rate, even the portion a provider
+// (OpenCode, via its "x-opencode-session" prompt-caching header) served from
+// cache at a steep discount — on a long chat whose growing history is mostly
+// cache hits, that overcounted cost by several times what the provider
+// actually billed. promptTokens here is the OpenAI-style *inclusive* total
+// (900 of the 1000 were cache hits), so the fresh share billed at the full
+// input rate is only 100.
+func TestAgentService_RunMessages_BillsCachedTokensAtCacheReadRate(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(chatCompletionResponseWithCachedUsage("ok", 1000, 900, 50))
+	}))
+	t.Cleanup(server.Close)
+
+	provider := entities.ProviderConfig{Name: "p", Type: entities.ProviderType("opencode"), APIKey: "sk-test", BaseURL: server.URL + "/v1"}
+	model := entities.ModelConfig{
+		Name: "m", Provider: provider.Name, ModelName: "gpt-test",
+		InputCostPerMillionTokens: 10, OutputCostPerMillionTokens: 10, CacheReadCostPerMillionTokens: 1,
+	}
+
+	repo, err := jsonrepo.NewChatRepository(t.TempDir())
+	require.NoError(t, err)
+
+	svc := NewAgentService(AgentServiceConfig{
+		Definitions: Definitions{
+			Agents: map[string]agentsource.AgentDefinition{"assistant": {Name: "assistant", Description: "test agent"}},
+		},
+		Providers:    []entities.ProviderConfig{provider},
+		Models:       []entities.ModelConfig{model},
+		DefaultModel: model.Name,
+		Repository:   repo,
+		Tools:        ToolsConfig{WorkingRoot: t.TempDir()},
+	})
+
+	ctx := context.Background()
+	_, err = svc.StartChat(ctx, "chat-1", "assistant")
+	require.NoError(t, err)
+
+	result, err := svc.RunText(ctx, "chat-1", "hi")
+	require.NoError(t, err)
+	require.Contains(t, result.Usage, "m")
+	assert.Equal(t, int64(1000), result.Usage["m"].InputTokens)
+	assert.Equal(t, int64(900), result.Usage["m"].CachedInputTokens)
+	assert.Equal(t, int64(50), result.Usage["m"].OutputTokens)
+	// 100 fresh @ $10/M + 900 cached @ $1/M + 50 out @ $10/M
+	// = 0.001 + 0.0009 + 0.0005 = 0.0024
+	assert.InDelta(t, 0.0024, result.Usage["m"].CostUSD, 1e-9)
+}
+
+// TestAgentService_RunMessages_AnthropicCachedTokensAreAdditiveNotInclusive
+// asserts the inverse convention for Anthropic: its API reports
+// input_tokens *excluding* any cache_read_input_tokens (the two are disjoint
+// counters), unlike OpenAI/OpenCode/Gemini's inclusive "prompt tokens"
+// total. Billing this the "subtract cached back out of input" way a
+// non-Anthropic provider needs would undercount cost; mergeUsage must bill
+// the full reported input_tokens at the input rate and add the cached
+// portion on top instead.
+func TestAgentService_RunMessages_AnthropicCachedTokensAreAdditiveNotInclusive(t *testing.T) {
+	provider := entities.ProviderConfig{Name: "p", Type: entities.ProviderTypeAnthropic}
+	model := entities.ModelConfig{
+		Name: "m", Provider: provider.Name, ModelName: "claude-test",
+		InputCostPerMillionTokens: 10, OutputCostPerMillionTokens: 10, CacheReadCostPerMillionTokens: 1,
+	}
+	chat := &entities.Chat{}
+	entries := []usageEntry{{
+		modelName: "m",
+		usage: message.UsageDetails{
+			InputTokenCount:       100,
+			CachedInputTokenCount: 900,
+			OutputTokenCount:      50,
+		},
+	}}
+
+	mergeUsage(chat, entries, map[string]entities.ModelConfig{"m": model}, map[string]entities.ProviderConfig{"p": provider})
+
+	require.Contains(t, chat.Usage, "m")
+	assert.Equal(t, int64(100), chat.Usage["m"].InputTokens)
+	assert.Equal(t, int64(900), chat.Usage["m"].CachedInputTokens)
+	// 100 input @ $10/M (no subtraction) + 900 cached @ $1/M + 50 out @ $10/M
+	// = 0.001 + 0.0009 + 0.0005 = 0.0024
+	assert.InDelta(t, 0.0024, chat.Usage["m"].CostUSD, 1e-9)
 }
 
 // TestAgentService_RunMessages_PersistsSubagentUsage proves subagent

@@ -910,10 +910,10 @@ type modelKey struct{ provider, modelName string }
 // of new data. Returns the count of models whose cost genuinely changed, for
 // the refresh summary message.
 func updateExistingModelCosts(dst *config.ProvidersFile, detected config.ProvidersFile) int {
-	type cost struct{ input, output float64 }
+	type cost struct{ input, output, cacheRead float64 }
 	costByKey := make(map[modelKey]cost, len(detected.Models))
 	for _, m := range detected.Models {
-		costByKey[modelKey{m.Provider, m.ModelName}] = cost{m.InputCostPerMillionTokens, m.OutputCostPerMillionTokens}
+		costByKey[modelKey{m.Provider, m.ModelName}] = cost{m.InputCostPerMillionTokens, m.OutputCostPerMillionTokens, m.CacheReadCostPerMillionTokens}
 	}
 
 	updated := 0
@@ -923,11 +923,12 @@ func updateExistingModelCosts(dst *config.ProvidersFile, detected config.Provide
 		if !ok {
 			continue
 		}
-		if m.InputCostPerMillionTokens == c.input && m.OutputCostPerMillionTokens == c.output {
+		if m.InputCostPerMillionTokens == c.input && m.OutputCostPerMillionTokens == c.output && m.CacheReadCostPerMillionTokens == c.cacheRead {
 			continue
 		}
 		m.InputCostPerMillionTokens = c.input
 		m.OutputCostPerMillionTokens = c.output
+		m.CacheReadCostPerMillionTokens = c.cacheRead
 		updated++
 	}
 	return updated
