@@ -1,0 +1,250 @@
+{
+  "schema_version": 1,
+  "diagram_type": "architecture",
+  "meta": {
+    "title": "Canopy — Architecture",
+    "quality_profile": "showcase"
+  },
+  "components": [
+    {
+      "id": "user",
+      "type": "external",
+      "label": "Developer",
+      "sublabel": "terminal",
+      "pos": [
+        40,
+        240
+      ],
+      "size": [
+        130,
+        60
+      ]
+    },
+    {
+      "id": "tui",
+      "type": "frontend",
+      "label": "TUI",
+      "sublabel": "Bubble Tea chat",
+      "pos": [
+        240,
+        240
+      ],
+      "size": [
+        140,
+        60
+      ]
+    },
+    {
+      "id": "cmd",
+      "type": "backend",
+      "label": "cmd/canopy",
+      "sublabel": "flags + wiring",
+      "pos": [
+        460,
+        60
+      ],
+      "size": [
+        150,
+        60
+      ]
+    },
+    {
+      "id": "svc",
+      "type": "backend",
+      "label": "AgentService",
+      "sublabel": "domain/services",
+      "pos": [
+        460,
+        240
+      ],
+      "size": [
+        150,
+        60
+      ]
+    },
+    {
+      "id": "harness",
+      "type": "backend",
+      "label": "MAF-Go harness",
+      "sublabel": "loop · todo · compaction",
+      "pos": [
+        700,
+        240
+      ],
+      "size": [
+        170,
+        60
+      ]
+    },
+    {
+      "id": "providers",
+      "type": "backend",
+      "label": "impl/providers",
+      "sublabel": "per-provider agents",
+      "pos": [
+        940,
+        60
+      ],
+      "size": [
+        170,
+        60
+      ]
+    },
+    {
+      "id": "llm",
+      "type": "external",
+      "label": "LLM APIs",
+      "sublabel": "OpenAI · Anthropic · Gemini",
+      "pos": [
+        940,
+        240
+      ],
+      "size": [
+        170,
+        60
+      ]
+    },
+    {
+      "id": "tools",
+      "type": "backend",
+      "label": "impl/tools",
+      "sublabel": "shell · file · web · Skill",
+      "pos": [
+        700,
+        420
+      ],
+      "size": [
+        170,
+        60
+      ]
+    },
+    {
+      "id": "mcp",
+      "type": "external",
+      "label": "MCP servers",
+      "sublabel": "via mcpclient",
+      "pos": [
+        940,
+        420
+      ],
+      "size": [
+        170,
+        60
+      ]
+    },
+    {
+      "id": "loaders",
+      "type": "backend",
+      "label": "File loaders",
+      "sublabel": "agents · skills · mcp",
+      "pos": [
+        460,
+        420
+      ],
+      "size": [
+        150,
+        60
+      ]
+    },
+    {
+      "id": "disk",
+      "type": "database",
+      "label": "Config files",
+      "sublabel": ".claude/ · ~/.canopy",
+      "pos": [
+        240,
+        420
+      ],
+      "size": [
+        150,
+        60
+      ]
+    },
+    {
+      "id": "repo",
+      "type": "database",
+      "label": "Chat repository",
+      "sublabel": "JSON history",
+      "pos": [
+        240,
+        60
+      ],
+      "size": [
+        150,
+        60
+      ]
+    }
+  ],
+  "connections": [
+    {
+      "id": "user-tui",
+      "from": "user",
+      "to": "tui",
+      "label": "keys",
+      "variant": "emphasis"
+    },
+    {
+      "id": "tui-svc",
+      "from": "tui",
+      "to": "svc",
+      "label": "turns"
+    },
+    {
+      "id": "cmd-svc",
+      "from": "cmd",
+      "to": "svc",
+      "label": "wires",
+      "variant": "dashed"
+    },
+    {
+      "id": "svc-harness",
+      "from": "svc",
+      "to": "harness",
+      "label": "run"
+    },
+    {
+      "id": "harness-providers",
+      "from": "harness",
+      "to": "providers"
+    },
+    {
+      "id": "providers-llm",
+      "from": "providers",
+      "to": "llm",
+      "label": "HTTPS",
+      "variant": "security"
+    },
+    {
+      "id": "harness-tools",
+      "from": "harness",
+      "to": "tools",
+      "label": "tool calls"
+    },
+    {
+      "id": "tools-mcp",
+      "from": "tools",
+      "to": "mcp",
+      "label": "MCP",
+      "variant": "security"
+    },
+    {
+      "id": "svc-loaders",
+      "from": "svc",
+      "to": "loaders",
+      "label": "load"
+    },
+    {
+      "id": "loaders-disk",
+      "from": "loaders",
+      "to": "disk",
+      "label": "read"
+    },
+    {
+      "id": "svc-repo",
+      "from": "svc",
+      "to": "repo",
+      "label": "persist",
+      "variant": "dashed"
+    }
+  ]
+}
