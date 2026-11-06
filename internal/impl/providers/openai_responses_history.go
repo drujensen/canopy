@@ -2,6 +2,8 @@ package providers
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -49,13 +51,24 @@ func pruneUnreplayableReasoning(body []byte) []byte {
 	}
 
 	kept := make([]map[string]json.RawMessage, 0, len(items))
+	changed := false
 	for i, it := range items {
 		if itemString(it, "type") == "reasoning" && !reasoningReplayable(items, i) {
+			changed = true
 			continue
+		}
+		if itemString(it, "type") == "message" && !strings.HasPrefix(itemString(it, "id"), "msg_") && itemString(it, "id") != "" {
+			// Another provider's output-message id (e.g. chatcmpl-*) reached the
+			// Responses API, which requires a msg_ prefix. Replace it with a
+			// deterministic msg_ id so identical history yields identical bytes.
+			id := msgIDFor(itemString(it, "id"))
+			raw, _ := json.Marshal(id)
+			it["id"] = raw
+			changed = true
 		}
 		kept = append(kept, it)
 	}
-	if len(kept) == len(items) {
+	if !changed {
 		return body
 	}
 
@@ -94,4 +107,12 @@ func itemString(it map[string]json.RawMessage, key string) string {
 		_ = json.Unmarshal(raw, &s)
 	}
 	return s
+}
+
+// msgIDFor maps a foreign output-message id to a stable msg_-prefixed id. The
+// hash keeps it deterministic across requests, so the same reloaded history
+// produces the same bytes (and any provider-side prompt cache still hits).
+func msgIDFor(foreign string) string {
+	sum := sha256.Sum256([]byte(foreign))
+	return "msg_" + hex.EncodeToString(sum[:])[:24]
 }

@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/microsoft/agent-framework-go/agent"
@@ -31,6 +32,30 @@ func inputTypes(t *testing.T, body []byte) []string {
 		out = append(out, typ)
 	}
 	return out
+}
+
+// Assistant output messages replayed from another provider's history carry ids
+// the Responses API rejects (it requires a "msg" prefix). Those ids must be
+// rewritten to valid ones, while valid msg_ ids are preserved.
+func TestPruneForeignOutputMessageIDs(t *testing.T) {
+	in := `{"input":[{"role":"user","content":"hi"},{"type":"message","role":"assistant","id":"chatcmpl-97ad4192","status":"completed","content":[{"type":"output_text","text":"a","annotations":[]}]},{"type":"message","role":"assistant","id":"msg_keep","status":"completed","content":[{"type":"output_text","text":"b","annotations":[]}]}]}`
+	out := pruneUnreplayableReasoning([]byte(in))
+	var payload struct {
+		Input []map[string]any `json:"input"`
+	}
+	require.NoError(t, json.Unmarshal(out, &payload))
+	require.Len(t, payload.Input, 3)
+	foreign, _ := payload.Input[1]["id"].(string)
+	assert.True(t, strings.HasPrefix(foreign, "msg_"), "rewritten id %q must start with msg_", foreign)
+	assert.NotEqual(t, "chatcmpl-97ad4192", foreign)
+	assert.Equal(t, "msg_keep", payload.Input[2]["id"])
+	// Rewriting must be deterministic so identical history yields identical requests.
+	assert.Equal(t, string(out), string(pruneUnreplayableReasoning([]byte(in))))
+}
+
+func TestPruneForeignOutputMessageIDs_IgnoresWhenNoItemIDs(t *testing.T) {
+	body := `{"input":[{"role":"user","content":"hi"}]}`
+	assert.Equal(t, body, string(pruneUnreplayableReasoning([]byte(body))))
 }
 
 func TestPruneUnreplayableReasoning(t *testing.T) {
