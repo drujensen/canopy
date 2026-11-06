@@ -115,8 +115,8 @@ func TestChatModel_TodoPanelReflectsRunResult(t *testing.T) {
 	c.handleStreamMsg(streamDoneMsg{result: &services.RunResult{
 		Response: &agent.Response{},
 		Todos: []todo.Item{
-			{ID: 1, Title: "Write the report", IsComplete: false},
-			{ID: 2, Title: "Send the email", IsComplete: true},
+			{ID: 1, Title: "Write the report", Description: "Draft findings and recommendations", IsComplete: false},
+			{ID: 2, Title: "Send the email", Description: "Include the final report", IsComplete: true},
 		},
 	}}, nil, nil)
 
@@ -125,6 +125,73 @@ func TestChatModel_TodoPanelReflectsRunResult(t *testing.T) {
 	assert.Contains(t, view, "Write the report")
 	assert.Contains(t, view, "Send the email")
 	assert.Contains(t, view, "[ ] Write the report")
+	assert.Contains(t, view, "Draft", "todo descriptions must be visible beneath their titles")
+	assert.Contains(t, view, "recommendations", "long todo descriptions should wrap rather than disappear")
+	assert.Contains(t, view, "Include")
+	assert.Contains(t, view, "final report", "completed todos must also show their descriptions")
+}
+
+func TestChatModel_TodoToolResultsUpdatePanelDuringStreaming(t *testing.T) {
+	c := newChatModel("chat-1", "assistant", nil, "m1", 80, 24)
+	c.streamActive = true
+
+	c.applyUpdate(&agent.ResponseUpdate{Contents: message.Contents{
+		&message.FunctionCallContent{
+			CallID:    "todo-add-1",
+			Name:      "todos_add",
+			Arguments: `[{"title":"Run tests","description":"Check the full suite"}]`,
+		},
+	}})
+	assert.Empty(t, c.todos, "a todo should not appear before the tool succeeds")
+
+	c.applyUpdate(&agent.ResponseUpdate{Contents: message.Contents{
+		&message.FunctionResultContent{
+			CallID: "todo-add-1",
+			Result: []todo.Item{{ID: 1, Title: "Run tests", Description: "Check the full suite"}},
+		},
+	}})
+
+	require.Len(t, c.todos, 1)
+	view := c.View(80, 24)
+	assert.Contains(t, view, "Run tests")
+	assert.Contains(t, view, "Check the full")
+	assert.Contains(t, view, "suite")
+	assert.True(t, c.streamActive, "the live list updates before the agent turn finishes")
+
+	c.todos = append(c.todos, todo.Item{ID: 2, Title: "Remove this"})
+	c.applyUpdate(&agent.ResponseUpdate{Contents: message.Contents{
+		&message.FunctionCallContent{
+			CallID:    "todo-complete-1",
+			Name:      "todos_complete",
+			Arguments: `{"Arg0":[{"id":1,"reason":"finished"}]}`,
+		},
+		&message.FunctionResultContent{CallID: "todo-complete-1", Result: 1},
+		&message.FunctionCallContent{
+			CallID:    "todo-remove-1",
+			Name:      "todos_remove",
+			Arguments: `{"Arg0":[2]}`,
+		},
+		&message.FunctionResultContent{CallID: "todo-remove-1", Result: 1},
+	}})
+	assert.True(t, c.todos[0].IsComplete, "complete tool arguments use the framework's Arg0 envelope")
+	require.Len(t, c.todos, 1, "remove tool arguments use the framework's Arg0 envelope")
+}
+
+func TestChatModel_TodoPanelCanScrollIndependently(t *testing.T) {
+	c := newChatModel("chat-1", "assistant", nil, "m1", 80, 24)
+	for i := 1; i <= 30; i++ {
+		c.todos = append(c.todos, todo.Item{ID: i, Title: fmt.Sprintf("Task %02d", i)})
+	}
+	c.refreshTodoViewport()
+
+	bottomOffset := c.todoViewport.YOffset
+	require.Greater(t, bottomOffset, 0, "the sidebar should have more todos than fit in its visible region")
+	c.handleKey(tea.KeyMsg{Type: tea.KeyUp, Alt: true}, nil, nil)
+	assert.Less(t, c.todoViewport.YOffset, bottomOffset, "alt+up scrolls the todo panel without moving the transcript")
+	assert.Equal(t, 0, c.viewport.YOffset)
+
+	c.handleKey(tea.KeyMsg{Type: tea.KeyDown, Alt: true}, nil, nil)
+	assert.Equal(t, bottomOffset, c.todoViewport.YOffset, "alt+down returns toward the latest todo")
 }
 
 // TestChatModel_View_LongMultilineError_StaysOneLineAndKeepsSidebarVisible

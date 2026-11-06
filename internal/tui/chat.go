@@ -106,6 +106,11 @@ type textSegment struct {
 	text string
 }
 
+type todoToolCall struct {
+	name      string
+	arguments string
+}
+
 // renderedLine is one physical row of the rendered transcript — already
 // word-wrapped and padded to the viewport's content width, tagged with the
 // lipgloss style that applies to it (post-v0.1.0 addendum: mouse-driven
@@ -211,6 +216,10 @@ type chatModel struct {
 	composer textarea.Model
 	viewport viewport.Model
 
+	// todoViewport scrolls the todo list independently from the transcript,
+	// so a long plan remains navigable in the fixed-height sidebar.
+	todoViewport viewport.Model
+
 	// sidebarHidden toggles the agent/model/todo sidebar off (ctrl+b) for
 	// anyone who just wants the extra width — the transcript/composer
 	// simply take the full width while hidden; see mainWidth. Originally
@@ -229,6 +238,10 @@ type chatModel struct {
 	// a Name) needs this to know which tool it's reporting on. Cleared per
 	// entry as each result arrives; never grows unbounded across a turn.
 	pendingToolCalls map[string]string
+
+	// pendingTodoCalls records todo-tool arguments until their results arrive,
+	// allowing the sidebar to mirror successful mutations before the turn ends.
+	pendingTodoCalls map[string]todoToolCall
 
 	todos []todo.Item
 
@@ -407,6 +420,7 @@ func newChatModel(chatID, agentName string, todos []todo.Item, model string, wid
 		spinner:         sp,
 		composer:        composer,
 		viewport:        viewport.New(width, height),
+		todoViewport:    viewport.New(sidebarContentWidth, 1),
 		copyToClipboard: defaultCopyToClipboard,
 	}
 	c.resize(width, height)
@@ -545,6 +559,7 @@ func (c *chatModel) resize(width, height int) {
 	c.viewport.Height = c.viewportHeight()
 	c.composer.SetWidth(mainWidth - 2)
 	c.composer.SetHeight(composerLines)
+	c.refreshTodoViewport()
 	c.refreshViewport()
 }
 
@@ -584,6 +599,18 @@ func (c *chatModel) handleKey(msg tea.KeyMsg, svc *services.AgentService, ctx co
 		return nil
 	case "pgdown", "ctrl+down":
 		c.viewport.PageDown()
+		return nil
+	case "alt+up":
+		c.todoViewport.ScrollUp(1)
+		return nil
+	case "alt+down":
+		c.todoViewport.ScrollDown(1)
+		return nil
+	case "alt+pgup":
+		c.todoViewport.PageUp()
+		return nil
+	case "alt+pgdown":
+		c.todoViewport.PageDown()
 		return nil
 	case "ctrl+b":
 		// Toggles the sidebar (post-v0.1.0 addendum), for anyone who just
@@ -1416,6 +1443,7 @@ func (c *chatModel) handleStreamMsg(msg tea.Msg, svc *services.AgentService, ctx
 		c.finishStreaming()
 		if msg.result != nil {
 			c.todos = msg.result.Todos
+			c.refreshTodoViewport()
 			c.model = msg.result.Model
 			c.usage = msg.result.Usage
 		}
@@ -1469,6 +1497,12 @@ func (c *chatModel) applyUpdate(update *agent.ResponseUpdate) {
 		case *message.TextContent:
 			c.appendStreamingText(t.Text)
 		case *message.FunctionCallContent:
+			if strings.HasPrefix(t.Name, "todos_") {
+				if c.pendingTodoCalls == nil {
+					c.pendingTodoCalls = make(map[string]todoToolCall)
+				}
+				c.pendingTodoCalls[t.CallID] = todoToolCall{name: t.Name, arguments: t.Arguments}
+			}
 			if t.Name != "" {
 				if c.pendingToolCalls == nil {
 					c.pendingToolCalls = make(map[string]string)
@@ -1477,10 +1511,93 @@ func (c *chatModel) applyUpdate(update *agent.ResponseUpdate) {
 				c.streaming = append(c.streaming, textSegment{kind: segmentToolCall, text: toolCallHeadline(t.Name, t.Arguments)})
 			}
 		case *message.FunctionResultContent:
+			c.applyTodoToolResult(t)
 			if seg := c.toolResultSegment(t); seg.text != "" {
 				c.streaming = append(c.streaming, seg)
 			}
 		}
+	}
+}
+
+// applyTodoToolResult mirrors successful todo-tool mutations into the TUI
+// as soon as the tool result streams back, instead of waiting for the whole
+// agent turn's final RunResult snapshot.
+func (c *chatModel) applyTodoToolResult(result *message.FunctionResultContent) {
+	call, ok := c.pendingTodoCalls[result.CallID]
+	if !ok {
+		return
+	}
+	delete(c.pendingTodoCalls, result.CallID)
+	if result.Error != nil {
+		return
+	}
+
+	changed := false
+	switch call.name {
+	case "todos_add":
+		if created, ok := decodeFunctionResult[[]todo.Item](result.Result); ok {
+			for _, item := range created {
+				found := false
+				for i := range c.todos {
+					if c.todos[i].ID == item.ID {
+						c.todos[i] = item
+						found = true
+						break
+					}
+				}
+				if !found {
+					c.todos = append(c.todos, item)
+				}
+			}
+			changed = true
+		}
+	case "todos_get_all", "todos_get_remaining":
+		if items, ok := decodeFunctionResult[[]todo.Item](result.Result); ok {
+			c.todos = items
+			changed = true
+		}
+	case "todos_complete":
+		var args struct {
+			Arg0 []struct {
+				ID int `json:"id"`
+			} `json:"Arg0"`
+		}
+		if json.Unmarshal([]byte(call.arguments), &args) == nil {
+			ids := make(map[int]struct{}, len(args.Arg0))
+			for _, input := range args.Arg0 {
+				ids[input.ID] = struct{}{}
+			}
+			for i := range c.todos {
+				if _, exists := ids[c.todos[i].ID]; exists {
+					c.todos[i].IsComplete = true
+				}
+			}
+			changed = len(ids) > 0
+		}
+	case "todos_remove":
+		var args struct {
+			Arg0 []int `json:"Arg0"`
+		}
+		if json.Unmarshal([]byte(call.arguments), &args) == nil {
+			remove := make(map[int]struct{}, len(args.Arg0))
+			for _, id := range args.Arg0 {
+				remove[id] = struct{}{}
+			}
+			remaining := c.todos[:0]
+			for _, item := range c.todos {
+				if _, exists := remove[item.ID]; !exists {
+					remaining = append(remaining, item)
+				}
+			}
+			c.todos = remaining
+			changed = len(remove) > 0
+		}
+	case "todos_clear":
+		c.todos = nil
+		changed = true
+	}
+	if changed {
+		c.refreshTodoViewport()
 	}
 }
 
@@ -2090,20 +2207,57 @@ func (c *chatModel) renderSidebar() string {
 	b.WriteString("\n")
 	b.WriteString(sidebarSettingLine("Hide", "^B"))
 	b.WriteString("\n")
-	b.WriteString("Todos:\n")
-	if len(c.todos) == 0 {
-		b.WriteString("  (none yet)\n")
+	b.WriteString("Todos: alt+up/down\n")
+	b.WriteString(c.todoViewport.View())
+	return sidebarStyle.Width(sidebarWidth - 2).Height(c.sidebarHeight()).Render(b.String())
+}
+
+// refreshTodoViewport updates the sidebar's independently scrollable todo
+// region while keeping it pinned to the bottom when the user was already
+// following the newest items. The fixed sidebar header, including the Todos
+// label, occupies 13 rows.
+func (c *chatModel) refreshTodoViewport() {
+	wasAtBottom := c.todoViewport.AtBottom()
+	height := c.sidebarHeight() - 13
+	if height < 1 {
+		height = 1
 	}
-	for _, item := range c.todos {
+	c.todoViewport.Width = sidebarContentWidth
+	c.todoViewport.Height = height
+	c.todoViewport.SetContent(renderTodoItems(c.todos, sidebarContentWidth))
+	if wasAtBottom {
+		c.todoViewport.GotoBottom()
+	}
+}
+
+// renderTodoItems formats checkbox, title, and optional description as one
+// wrapped paragraph per item. Continuation lines stay indented beneath the
+// item, and completed titles retain their subdued strikethrough style.
+func renderTodoItems(items []todo.Item, width int) string {
+	if len(items) == 0 {
+		return "  (none yet)"
+	}
+	wrapWidth := width - 2
+	if wrapWidth < 1 {
+		wrapWidth = 1
+	}
+	var lines []string
+	for _, item := range items {
 		mark := "[ ]"
 		title := item.Title
 		if item.IsComplete {
 			mark = "[x]"
 			title = todoDoneStyle.Render(title)
 		}
-		fmt.Fprintf(&b, "  %s %s\n", mark, title)
+		text := mark + " " + title
+		if description := strings.Join(strings.Fields(item.Description), " "); description != "" {
+			text += ": " + description
+		}
+		for _, line := range strings.Split(lipgloss.NewStyle().Width(wrapWidth).Render(text), "\n") {
+			lines = append(lines, "  "+line)
+		}
 	}
-	return sidebarStyle.Width(sidebarWidth - 2).Height(c.sidebarHeight()).Render(b.String())
+	return strings.Join(lines, "\n")
 }
 
 // sidebarSettingLine keeps the sidebar readable at a glance: the value is

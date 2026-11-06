@@ -223,7 +223,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		switch msg.Button {
 		case tea.MouseButtonWheelUp, tea.MouseButtonWheelDown, tea.MouseButtonWheelLeft, tea.MouseButtonWheelRight:
 			var cmd tea.Cmd
-			m.chat.viewport, cmd = m.chat.viewport.Update(msg)
+			if !m.chat.sidebarHidden && msg.X < sidebarWidth {
+				m.chat.todoViewport, cmd = m.chat.todoViewport.Update(msg)
+			} else {
+				m.chat.viewport, cmd = m.chat.viewport.Update(msg)
+			}
 			return m, cmd
 		default:
 			return m, m.chat.handleMouse(msg)
